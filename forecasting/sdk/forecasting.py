@@ -13,115 +13,15 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-try:
-    from huggingface_hub import hf_hub_download
-    HF_HUB_AVAILABLE = True
-except ImportError:
-    HF_HUB_AVAILABLE = False
-
-# Clean absolute imports - package is installed in editable mode
-from dataset_longhorizon import (
+sys.path.append(str(Path(__file__).parent.parent.parent))
+from forecasting.dataset_longhorizon import (
     CSVLongHorizonSimpleDataset,
     Standardizer,
 )
-from model import build_model
+from forecasting.model import build_model
 from momentfm.utils.utils import control_randomness
 
-# Define DEVICE here to avoid import complexity
-import torch
-
-def _has_mps():
-    try:
-        return torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False
-    except:
-        return False
-
-DEVICE = (
-    torch.device("cuda") if torch.cuda.is_available() 
-    else torch.device("mps") if _has_mps() 
-    else torch.device("cpu")
-)
-
-
-def download_model_weights(
-    standardizer_pkl: str = "standardizer.pkl",
-    ckpt: str = "moment_head_512_6hr.pt",
-    repo_id: str = "nvidia/nv-tesseract-forecasting",
-    force_download: bool = False
-) -> tuple[str, str]:
-    """
-    Auto-download model weights from Hugging Face if they don't exist locally.
-    
-    Args:
-        standardizer_pkl: Local path for standardizer pickle file
-        ckpt: Local path for model checkpoint
-        repo_id: Hugging Face repository ID
-        force_download: Force re-download even if files exist
-        
-    Returns:
-        Tuple of (standardizer_path, checkpoint_path)
-        
-    Raises:
-        ImportError: If huggingface_hub is not installed
-        Exception: If download fails
-    """
-    standardizer_path = Path(standardizer_pkl)
-    checkpoint_path = Path(ckpt)
-    
-    # Check if files already exist
-    if not force_download and standardizer_path.exists() and checkpoint_path.exists():
-        return str(standardizer_path), str(checkpoint_path)
-    
-    # Check if huggingface_hub is available
-    if not HF_HUB_AVAILABLE:
-        raise ImportError(
-            "huggingface_hub is required to download model weights. "
-            "Install it with: uv add huggingface_hub"
-        )
-    
-    print("Downloading model weights from Hugging Face...")
-    
-    # Create parent directories if they don't exist (in case user specifies subdirectories)
-    if standardizer_path.parent != Path("."):
-        standardizer_path.parent.mkdir(parents=True, exist_ok=True)
-    if checkpoint_path.parent != Path("."):
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    try:
-        # Download standardizer
-        if force_download or not standardizer_path.exists():
-            print(f"Downloading {standardizer_path.name}...")
-            downloaded_file = hf_hub_download(
-                repo_id=repo_id,
-                filename=standardizer_path.name,
-                local_dir=str(standardizer_path.parent) if standardizer_path.parent != Path(".") else ".",
-                local_dir_use_symlinks=False,
-            )
-            print(f"✓ Downloaded {standardizer_path}")
-        
-        # Download checkpoint
-        if force_download or not checkpoint_path.exists():
-            print(f"Downloading {checkpoint_path.name}...")
-            downloaded_file = hf_hub_download(
-                repo_id=repo_id,
-                filename=checkpoint_path.name,
-                local_dir=str(checkpoint_path.parent) if checkpoint_path.parent != Path(".") else ".",
-                local_dir_use_symlinks=False,
-            )
-            print(f"✓ Downloaded {checkpoint_path}")
-            
-    except Exception as e:
-        error_msg = f"Failed to download model weights: {e}"
-        if "401" in str(e) or "403" in str(e):
-            error_msg += (
-                "\n\nAuthentication required for private repository. Please:"
-                "\n1. Install huggingface-cli: uv add huggingface_hub[cli]"
-                "\n2. Login: huggingface-cli login"
-                "\n3. Or set token: export HUGGINGFACE_HUB_TOKEN='your_token'"
-            )
-        raise Exception(error_msg) from e
-    
-    return str(standardizer_path), str(checkpoint_path)
+from forecasting import DEVICE
 
 
 class InferenceOnlyDataset(Dataset):
@@ -418,8 +318,8 @@ def perform_forecasting(
     target_column: str = "target",
     context_df: pd.DataFrame | None = None,  # Optional context DataFrame for DARR mode
     # Model configuration - Replace with your own paths for the weights and standardizer
-    standardizer_pkl: str = "standardizer.pkl",
-    ckpt: str = "moment_head_512_6hr.pt",
+    standardizer_pkl: str = "artifacts_512_72/standardizer.pkl",
+    ckpt: str = "artifacts_512_72/moment_head_512_6hr.pt",
     seq_len: int = 512,
     forecast_horizon: int = 72,
     model_horizon: int = 72,  # Override with other weights' values if needed
@@ -527,16 +427,6 @@ def perform_forecasting(
 
     # Set random seed
     control_randomness(seed=seed)
-
-    # Auto-download model weights if they don't exist
-    try:
-        standardizer_pkl, ckpt = download_model_weights(
-            standardizer_pkl=standardizer_pkl,
-            ckpt=ckpt
-        )
-    except Exception as e:
-        print(f"Warning: Could not auto-download weights: {e}")
-        print("Using provided paths as-is. Make sure the files exist locally.")
 
     # Determine mode
     if context_df is not None:

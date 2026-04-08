@@ -1,14 +1,6 @@
 #!/usr/bin/env python
 """
-Quick example showing how to load a CSV file and perform forecasting.
-
-This example demonstrates:
-1. Auto-downloading model weights from Hugging Face (on first run)
-2. Standard forecasting mode
-3. DARR mode (context-enhanced forecasting)
-
-Make sure you're authenticated with Hugging Face for the private repo:
-    huggingface-cli login
+Quick example showing how to load a CSV file and perform forecasting
 """
 
 import os
@@ -16,26 +8,19 @@ from pathlib import Path
 
 import pandas as pd
 
-from forecasting import perform_forecasting
+from forecasting.sdk.forecasting import perform_forecasting
 
 # Load your CSV file
 csv_path = (
     Path(__file__).resolve().parent / "tests" / "datasets" / "ETTh_single_feature.csv"
 )  # Replace with your file path
-
 if __name__ == "__main__":
     if not os.path.exists(csv_path):
-        print(f"CSV file not found at {csv_path}")
-        print("Please supply your own data with 'timestamp' and target columns.")
-        print("Example CSV format:")
-        print("timestamp,target")
-        print("2024-01-01 00:00:00,1.5")
-        print("2024-01-01 01:00:00,1.7")
-        print("...")
-        raise SystemExit("Data file required")
+        raise SystemExit(f"CSV file not found at {csv_path}, please supply your own data.")
         
-    # Model weights will be auto-downloaded from Hugging Face on first run
-    # You can also specify custom paths if you have the files locally
+    # Replace with your own paths for the weights and standardizer
+    ckpt = "moment_head_512_6hr.pt"
+    standardizer_pkl = "standardizer.pkl"
     df = pd.read_csv(csv_path)
     timestamp_col = "timestamp"
     target_col = "LULL"
@@ -43,17 +28,15 @@ if __name__ == "__main__":
     forecast_horizon = 100
 
     # Standard forecasting (no external memory)
-    # Model weights will be auto-downloaded if not present
     forecast_df = perform_forecasting(
+        ckpt=ckpt,
+        standardizer_pkl=standardizer_pkl,
         df=df,
         seq_len=seq_len,
         forecast_horizon=forecast_horizon,
         timestamp_column=timestamp_col,
         target_column=target_col,
         save_preds="forecast_ETTh_seq_len_100.csv",
-        # Optional: specify custom paths
-        # ckpt="artifacts_512_72/moment_head_512_6hr.pt",
-        # standardizer_pkl="artifacts_512_72/standardizer.pkl",
     )
     print(f"\nStandard forecast (only predicted rows with '{target_col}_forecast' column):")
     print(forecast_df.to_csv())
@@ -67,14 +50,15 @@ if __name__ == "__main__":
 
     context_df = pd.read_csv(context_csv_path)
     darr_df = perform_forecasting(
+        ckpt=ckpt,
+        standardizer_pkl=standardizer_pkl,
         df=df,
         seq_len=seq_len,
         forecast_horizon=forecast_horizon,
-        context_df=context_df,  # This enables DARR mode
+        context_df=context_df,
         timestamp_column=timestamp_col,
         target_column=target_col,
         save_preds="forecast_ETTh_darr_100.csv",
-        # Model weights auto-downloaded if needed
     )
     print(f"\nDARR forecast (hybrid prediction in '{target_col}_forecast' column):")
     print(darr_df.to_csv())
