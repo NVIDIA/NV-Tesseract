@@ -111,6 +111,16 @@ def perform_anomaly_analysis_with_diffusion(
     # Get target data for advanced thresholding methods
     target_data = results["target"]
 
+    # Model evaluation works on fixed-size windows and may append padded rows to
+    # the final window. Align outputs before threshold calibration so synthetic
+    # padding cannot change the thresholds used for real input rows.
+    original_length = len(df)
+    if len(residual_scores) != original_length:
+        logger.info(f"Aligning lengths: residual_scores={len(residual_scores)}, original_data={original_length}")
+        residual_scores = residual_scores[:original_length]
+    if len(target_data) != original_length:
+        target_data = target_data[:original_length]
+
     # Apply thresholding strategy
     if threshold_strategy == "scs":
         # Use actual target data from the model results
@@ -121,19 +131,10 @@ def perform_anomaly_analysis_with_diffusion(
     else:
         raise ValueError(f"Unknown threshold strategy: {threshold_strategy}")
 
-    # Create result dataframe
+    # Create result dataframe. A thresholder may return a longer mask than the
+    # score array, so keep assignment aligned with the input rows as well.
     result_df = df.copy()
-
-    # Ensure consistent lengths - model outputs may be padded
-    original_length = len(df)
-    if len(residual_scores) != original_length:
-        logger.info(f"Aligning lengths: residual_scores={len(residual_scores)}, original_data={original_length}")
-        # Truncate all arrays to match original dataframe length
-        residual_scores = residual_scores[:original_length]
-        anomalies = anomalies[:original_length]
-        # Also truncate target_data if it's used later
-        if len(target_data) > original_length:
-            target_data = target_data[:original_length]
+    anomalies = anomalies[:original_length]
 
     result_df["Anomaly"] = anomalies
     result_df["MAE"] = residual_scores  # Using residual (MAE) as anomaly score

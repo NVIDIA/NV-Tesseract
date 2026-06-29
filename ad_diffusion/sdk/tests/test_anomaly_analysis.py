@@ -149,3 +149,6 @@ def test_perform_anomaly_analysis_truncates_long_model_outputs(monkeypatch, nume
 
     assert len(result) == len(numeric_df)
     assert result["MAE"].tolist() == [0.1, 0.2, 0.3, 0.4, 0.5]
+    threshold_args, _ = mock_thresholder.detect_anomalies.call_args
+    assert len(threshold_args[0]) == len(numeric_df)
+    assert len(threshold_args[1]) == len(numeric_df)

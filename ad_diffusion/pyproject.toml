@@ -42,3 +42,12 @@ ignore = ["E501"]  # line too long (handled by line-length)
 [tool.pytest.ini_options]
 addopts = "--disable-warnings -v"
 python_files = ["test*.py", "*_test.py"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sdk*", "models*", "utils*"]
+namespaces = true

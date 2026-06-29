@@ -96,6 +96,7 @@ def create_synthetic_dataset(n_samples: int = 1000, n_features: int = 5, anomaly
     # Add anomalies
     n_anomalies = int(n_samples * anomaly_rate)
     anomaly_indices = np.random.choice(n_samples, n_anomalies, replace=False)
+    ground_truth = np.zeros(n_samples)
 
     # Create different types of anomalies
     for idx in anomaly_indices:
@@ -104,18 +105,22 @@ def create_synthetic_dataset(n_samples: int = 1000, n_features: int = 5, anomaly
         if anomaly_type == "spike":
             # Sharp spike anomaly
             data[idx] += np.random.uniform(3, 5, n_features) * np.sign(np.random.randn(n_features))
+            ground_truth[idx] = 1
         elif anomaly_type == "dip":
             # Sharp dip anomaly
             data[idx] -= np.random.uniform(2, 4, n_features)
+            ground_truth[idx] = 1
         elif anomaly_type == "shift":
             # Level shift anomaly
             shift_duration = min(10, n_samples - idx)
             shift_magnitude = np.random.uniform(1.5, 3, n_features)
             data[idx : idx + shift_duration] += shift_magnitude
+            ground_truth[idx : idx + shift_duration] = 1
         elif anomaly_type == "noise":
             # High noise anomaly
             noise_duration = min(5, n_samples - idx)
             data[idx : idx + noise_duration] += np.random.randn(noise_duration, n_features) * 2
+            ground_truth[idx : idx + noise_duration] = 1
 
     # Create DataFrame with meaningful column names
     columns = [f"sensor_{i + 1}" for i in range(n_features)]
@@ -125,8 +130,6 @@ def create_synthetic_dataset(n_samples: int = 1000, n_features: int = 5, anomaly
     df["timestamp"] = pd.date_range("2024-01-01", periods=n_samples, freq="1H")
 
     # Add ground truth anomaly labels for evaluation
-    ground_truth = np.zeros(n_samples)
-    ground_truth[anomaly_indices] = 1
     df["is_anomaly"] = ground_truth
 
     return df
