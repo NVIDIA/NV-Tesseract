@@ -32,7 +32,6 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
-from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -40,6 +39,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.main_model import TSDiffuser_Generic
+from sdk.feature_adapter import FeatureAdapter
 from sdk.inference_ad import (
     DEFAULT_CONFIG_FILENAME,
     DEFAULT_MODEL_FILENAME,
@@ -49,64 +49,6 @@ from sdk.inference_ad import (
 )
 
 LOGGER = logging.getLogger("ad_diffusion_finetune")
-
-
-class FeatureAdapter:
-    """Fit train-time dimensionality adaptation and min-max scaling."""
-
-    def __init__(self, target_dim: int, scale_factor: float, seed: int) -> None:
-        self.target_dim = target_dim
-        self.scale_factor = scale_factor
-        self.seed = seed
-        self.pca: PCA | None = None
-        self.min_: np.ndarray | None = None
-        self.max_: np.ndarray | None = None
-        self.input_dim: int | None = None
-
-    def fit(self, data: np.ndarray) -> None:
-        self.input_dim = int(data.shape[1])
-        if data.shape[1] > self.target_dim:
-            if data.shape[0] < self.target_dim:
-                raise ValueError(
-                    f"PCA needs at least target_dim rows; got {data.shape[0]} rows for target_dim={self.target_dim}."
-                )
-            self.pca = PCA(n_components=self.target_dim, random_state=self.seed)
-            data = self.pca.fit_transform(data)
-        elif data.shape[1] < self.target_dim:
-            data = self._pad(data)
-
-        self.min_ = data.min(axis=0)
-        self.max_ = data.max(axis=0)
-
-    def transform(self, data: np.ndarray) -> torch.Tensor:
-        if self.min_ is None or self.max_ is None:
-            raise RuntimeError("FeatureAdapter.fit must be called before transform.")
-
-        if self.pca is not None:
-            data = self.pca.transform(data)
-        elif data.shape[1] < self.target_dim:
-            data = self._pad(data)
-        elif data.shape[1] > self.target_dim:
-            data = data[:, : self.target_dim]
-
-        denom = np.where((self.max_ - self.min_) == 0, 1.0, self.max_ - self.min_)
-        data = (data - self.min_) / denom
-        data = np.nan_to_num(data, nan=0.0, posinf=1.0, neginf=0.0)
-        return torch.tensor(data, dtype=torch.float32) * self.scale_factor
-
-    def metadata(self) -> dict[str, Any]:
-        return {
-            "target_dim": self.target_dim,
-            "input_dim": self.input_dim,
-            "scale_factor": self.scale_factor,
-            "uses_pca": self.pca is not None,
-            "min": self.min_.tolist() if self.min_ is not None else None,
-            "max": self.max_.tolist() if self.max_ is not None else None,
-        }
-
-    def _pad(self, data: np.ndarray) -> np.ndarray:
-        pad_width = self.target_dim - data.shape[1]
-        return np.pad(data, ((0, 0), (0, pad_width)), mode="constant", constant_values=0.0)
 
 
 class MaskedWindowDataset(Dataset):
@@ -359,10 +301,13 @@ def main() -> None:
     model_path, config_path = resolve_model_assets(args)
     checkpoint, config = load_checkpoint_and_config(model_path, config_path)
     target_dim = int(config.get("model", {}).get("target_dim", 40))
-    dataset_config = config.get("dataset", {})
+    dataset_config = config.setdefault("dataset", {})
     window_length = args.window_length or int(dataset_config.get("window_length", 100))
     split = args.split or int(dataset_config.get("split", 4))
     scale_factor = args.scale_factor or float(dataset_config.get("scale_factor", 20))
+    dataset_config["window_length"] = window_length
+    dataset_config["split"] = split
+    dataset_config["scale_factor"] = scale_factor
 
     train_raw, val_raw, columns = split_arrays(args)
     adapter = FeatureAdapter(target_dim=target_dim, scale_factor=scale_factor, seed=args.seed)
@@ -400,6 +345,9 @@ def main() -> None:
     preprocessing = adapter.metadata()
     preprocessing["columns"] = columns
     preprocessing["dropped_columns"] = parse_column_list(args.drop_cols)
+    preprocessing["window_length"] = window_length
+    preprocessing["window_stride"] = args.window_stride
+    preprocessing["split"] = split
 
     best_val = float("inf")
     metrics: list[dict[str, float]] = []

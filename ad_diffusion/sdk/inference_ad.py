@@ -79,6 +79,7 @@ except ImportError:
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.main_model import TSDiffuser_Generic
 from models.utils import evaluate
+from sdk.feature_adapter import transform_dataframe_from_metadata
 from utils.tsb_ad_preprocessor import preprocess_for_inference
 
 # DEVICE configuration - simplified for standalone use
@@ -591,6 +592,64 @@ def preprocess_dataframe(
     return torch.tensor(data, dtype=torch.float32) * scale_factor
 
 
+def _get_checkpoint_preprocessing(checkpoint: object) -> dict | None:
+    if not isinstance(checkpoint, dict):
+        return None
+    preprocessing = checkpoint.get("preprocessing")
+    return preprocessing if isinstance(preprocessing, dict) and preprocessing else None
+
+
+def _get_finetune_window_settings(
+    preprocessing: dict,
+    checkpoint: dict,
+    config: dict,
+) -> tuple[int, int]:
+    checkpoint_args = checkpoint.get("args", {})
+    if not isinstance(checkpoint_args, dict):
+        checkpoint_args = {}
+    dataset_config = config.get("dataset", {})
+    if not isinstance(dataset_config, dict):
+        dataset_config = {}
+
+    window_length = (
+        preprocessing.get("window_length")
+        or checkpoint_args.get("window_length")
+        or dataset_config.get("window_length", 100)
+    )
+    split = preprocessing.get("split") or checkpoint_args.get("split") or dataset_config.get("split", 4)
+    window_length = int(window_length)
+    split = int(split)
+    if window_length <= 0 or split <= 0:
+        raise ValueError("Checkpoint preprocessing window_length and split must be positive.")
+    if window_length % split != 0:
+        raise ValueError("Checkpoint preprocessing window_length must be divisible by split.")
+    return window_length, split
+
+
+def _apply_checkpoint_preprocessing(
+    data: pd.DataFrame,
+    checkpoint: object,
+    config: dict,
+    target_dim: int,
+    preprocess_model_dir: str | None,
+) -> tuple[torch.Tensor, int, int, float] | None:
+    """Replay fine-tuning preprocessing unless the caller explicitly supplied another preprocessor."""
+    preprocessing = _get_checkpoint_preprocessing(checkpoint)
+    if preprocessing is None or preprocess_model_dir is not None:
+        return None
+
+    metadata_target_dim = int(preprocessing.get("target_dim", target_dim))
+    if metadata_target_dim != target_dim:
+        raise ValueError(
+            f"Checkpoint preprocessing target_dim={metadata_target_dim} does not match model target_dim={target_dim}."
+        )
+
+    preprocessed = transform_dataframe_from_metadata(data, preprocessing)
+    window_length, split = _get_finetune_window_settings(preprocessing, checkpoint, config)
+    scale_factor = float(preprocessing.get("scale_factor", config.get("dataset", {}).get("scale_factor", 1.0)))
+    return preprocessed, window_length, split, scale_factor
+
+
 def _build_window_indexes(total_rows: int, window_length: int, window_split: int) -> list[int]:
     step = max(1, window_length // max(1, window_split))
     if total_rows < window_length:
@@ -1042,7 +1101,8 @@ def inference_ad_tesseract2(
         config_path: Path to config file. Optional if the config is embedded in the
             checkpoint; otherwise ``curriculum_medium.yaml`` is downloaded from HF.
         nsample: Number of samples for diffusion model inference
-        preprocess_model_dir: Directory containing preprocessing model (optional)
+        preprocess_model_dir: Directory containing an external preprocessing model (optional). When omitted,
+            fitted preprocessing embedded in a fine-tuned checkpoint is replayed automatically.
         use_dpm_solver: If True, use DPM-Solver for 50-100x faster inference
         dpm_steps: Number of DPM-Solver steps (10-50, default: 20)
 
@@ -1084,10 +1144,25 @@ def inference_ad_tesseract2(
     model.eval()
 
     scale_factor = config.get("dataset", {}).get("scale_factor", 1.0)
-
-    test_loader1, test_loader2 = get_dataloader(
-        data, target_dim, scale_factor=scale_factor, model_dir=preprocess_model_dir
+    checkpoint_data = _apply_checkpoint_preprocessing(
+        data,
+        checkpoint,
+        config,
+        target_dim,
+        preprocess_model_dir,
     )
+
+    if checkpoint_data is not None:
+        preprocessed, window_length, split, _ = checkpoint_data
+        test_loader1, test_loader2 = get_dataloader_from_array(
+            preprocessed,
+            window_length=window_length,
+            split=split,
+        )
+    else:
+        test_loader1, test_loader2 = get_dataloader(
+            data, target_dim, scale_factor=scale_factor, model_dir=preprocess_model_dir
+        )
 
     # Run inference with DPM support
     results = evaluate_ad_tesseract2(
@@ -1132,7 +1207,8 @@ def inference_ad_tesseract2_mp(
         config_path: Path to config file. Optional if the config is embedded in the
             checkpoint; otherwise ``curriculum_medium.yaml`` is downloaded from HF.
         nsample: Number of diffusion samples per window.
-        preprocess_model_dir: Directory containing preprocessing model (optional).
+        preprocess_model_dir: Directory containing an external preprocessing model (optional). When omitted,
+            fitted preprocessing embedded in a fine-tuned checkpoint is replayed automatically.
         num_processes: Number of GPU worker processes (defaults to len(gpu_ids)).
         gpu_ids: List of GPU ids to use (defaults to all visible GPUs).
         seed: Random seed for reproducibility.
@@ -1199,13 +1275,23 @@ def inference_ad_tesseract2_mp(
     window_length = config.get("dataset", {}).get("window_length", 100)
     window_split = 1
     split = config.get("dataset", {}).get("split", 4)
-
-    preprocessed = preprocess_dataframe(
+    checkpoint_data = _apply_checkpoint_preprocessing(
         data,
+        checkpoint,
+        config,
         target_dim,
-        scale_factor=scale_factor,
-        model_dir=preprocess_model_dir,
+        preprocess_model_dir,
     )
+
+    if checkpoint_data is not None:
+        preprocessed, window_length, split, scale_factor = checkpoint_data
+    else:
+        preprocessed = preprocess_dataframe(
+            data,
+            target_dim,
+            scale_factor=scale_factor,
+            model_dir=preprocess_model_dir,
+        )
     num_rows = len(preprocessed)
     begin_indexes = _build_window_indexes(num_rows, window_length, window_split)
     window_tensor = _build_window_tensor(preprocessed.cpu().numpy(), begin_indexes, window_length)
