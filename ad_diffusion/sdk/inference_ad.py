@@ -1296,13 +1296,23 @@ def inference_ad_tesseract2_mp(
         _cleanup_shared_memory(shm_info)
 
 
-class NVTesseractADDiffusion(ModelHubMixin):
+class NVTesseractADDiffusion(
+    ModelHubMixin,
+    library_name="nv-tesseract",
+    tags=["time-series", "anomaly-detection"],
+    repo_url="https://github.com/NVIDIA/NV-Tesseract",
+    docs_url="https://huggingface.co/nvidia/nv-tesseract-ad-diffusion",
+):
     """NV-Tesseract AD Diffusion anomaly detection model with HuggingFace Hub integration.
 
-    Usage::
+    Example::
 
         model = NVTesseractADDiffusion.from_pretrained("nvidia/nv-tesseract-ad-diffusion")
         results = model.detect(data, nsample=30)
+
+        # Save weights locally or push to Hub
+        model.save_pretrained("./my-ad-model")
+        model.push_to_hub("username/my-ad-model")
     """
 
     def __init__(self, *, model_path: str, config_path: str) -> None:
@@ -1314,13 +1324,11 @@ class NVTesseractADDiffusion(ModelHubMixin):
         cls,
         *,
         model_id: str,
-        _revision,
-        _cache_dir,
+        revision: str | None,  # noqa: ARG003
+        cache_dir: str | Path | None,  # noqa: ARG003
         force_download: bool,
-        _proxies,
-        _resume_download,
-        _local_files_only: bool,
-        _token,
+        local_files_only: bool,  # noqa: ARG003
+        token: str | bool | None,  # noqa: ARG003
         **model_kwargs,
     ) -> "NVTesseractADDiffusion":
         model_path, config_path = download_model_weights(
@@ -1340,4 +1348,5 @@ class NVTesseractADDiffusion(ModelHubMixin):
         shutil.copy2(self.config_path, save_directory / Path(self.config_path).name)
 
     def detect(self, data: "pd.DataFrame", **kwargs) -> dict:
+        """Run anomaly detection. All keyword args are forwarded to ``inference_ad_tesseract2``."""
         return inference_ad_tesseract2(data, model_path=self.model_path, config_path=self.config_path, **kwargs)
