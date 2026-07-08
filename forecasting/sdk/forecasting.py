@@ -18,11 +18,12 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import ModelHubMixin, hf_hub_download
 
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
+    ModelHubMixin = object  # fallback so class definition doesn't crash
 
 # Clean absolute imports - package is installed in editable mode
 from backbone.utils.utils import control_randomness
@@ -220,6 +221,7 @@ def download_model_weights(
                 filename=standardizer_path.name,
                 local_dir=str(standardizer_path.parent) if standardizer_path.parent != Path() else ".",
                 local_dir_use_symlinks=False,
+                library_name="nv-tesseract",
             )
             logger.info("Downloaded %s", standardizer_path)
 
@@ -231,6 +233,7 @@ def download_model_weights(
                 filename=checkpoint_path.name,
                 local_dir=str(checkpoint_path.parent) if checkpoint_path.parent != Path() else ".",
                 local_dir_use_symlinks=False,
+                library_name="nv-tesseract",
             )
             logger.info("Downloaded %s", checkpoint_path)
 
@@ -2197,3 +2200,59 @@ def perform_forecasting(
         for temp_csv in (temp_test_csv, temp_context_csv):
             if temp_csv:
                 Path(temp_csv).unlink(missing_ok=True)
+
+
+class NVTesseractForecasting(
+    ModelHubMixin,
+    library_name="nv-tesseract",
+    tags=["time-series", "forecasting"],
+    repo_url="https://github.com/NVIDIA/NV-Tesseract",
+    docs_url="https://huggingface.co/nvidia/nv-tesseract-forecasting",
+):
+    """NV-Tesseract Forecasting model with HuggingFace Hub integration.
+
+    Example::
+
+        model = NVTesseractForecasting.from_pretrained("nvidia/nv-tesseract-forecasting")
+        predictions = model.forecast(df, forecast_horizon=72)
+
+        # Save weights locally or push to Hub
+        model.save_pretrained("./my-forecasting-model")
+        model.push_to_hub("username/my-forecasting-model")
+    """
+
+    def __init__(self, *, standardizer_pkl: str, ckpt: str) -> None:
+        self.standardizer_pkl = standardizer_pkl
+        self.ckpt = ckpt
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        *,
+        model_id: str,
+        revision: str | None,  # noqa: ARG003
+        cache_dir: str | Path | None,  # noqa: ARG003
+        force_download: bool,
+        local_files_only: bool,  # noqa: ARG003
+        token: str | bool | None,  # noqa: ARG003
+        **model_kwargs,
+    ) -> "NVTesseractForecasting":
+        standardizer_pkl, ckpt = download_model_weights(
+            standardizer_pkl=model_kwargs.get("standardizer_pkl", "standardizer.pkl"),
+            ckpt=model_kwargs.get("ckpt", DEFAULT_CHECKPOINT_NAME),
+            repo_id=model_id,
+            force_download=force_download,
+        )
+        return cls(standardizer_pkl=standardizer_pkl, ckpt=ckpt)
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        import shutil
+
+        save_directory = Path(save_directory)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.standardizer_pkl, save_directory / Path(self.standardizer_pkl).name)
+        shutil.copy2(self.ckpt, save_directory / Path(self.ckpt).name)
+
+    def forecast(self, df: "pd.DataFrame", **kwargs) -> "pd.DataFrame":
+        """Run forecasting. All keyword args are forwarded to ``perform_forecasting``."""
+        return perform_forecasting(df, standardizer_pkl=self.standardizer_pkl, ckpt=self.ckpt, **kwargs)

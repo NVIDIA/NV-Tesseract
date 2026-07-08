@@ -70,11 +70,12 @@ from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader, Dataset
 
 try:
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import ModelHubMixin, hf_hub_download
 
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
+    ModelHubMixin = object  # fallback so class definition doesn't crash
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.main_model import TSDiffuser_Generic
@@ -933,6 +934,7 @@ def download_model_weights(
                 local_dir=str(model_file.parent) if model_file.parent != Path() else ".",
                 local_dir_use_symlinks=False,
                 force_download=force_download,
+                library_name="nv-tesseract",
             )
             logger.info("Downloaded %s", model_file)
 
@@ -944,6 +946,7 @@ def download_model_weights(
                 local_dir=str(config_file.parent) if config_file.parent != Path() else ".",
                 local_dir_use_symlinks=False,
                 force_download=force_download,
+                library_name="nv-tesseract",
             )
             logger.info("Downloaded %s", config_file)
 
@@ -1291,3 +1294,50 @@ def inference_ad_tesseract2_mp(
         return _merge_chunked_results(results_per_chunk, target_dim)
     finally:
         _cleanup_shared_memory(shm_info)
+
+
+class NVTesseractADDiffusion(ModelHubMixin):
+    """NV-Tesseract AD Diffusion anomaly detection model with HuggingFace Hub integration.
+
+    Usage::
+
+        model = NVTesseractADDiffusion.from_pretrained("nvidia/nv-tesseract-ad-diffusion")
+        results = model.detect(data, nsample=30)
+    """
+
+    def __init__(self, *, model_path: str, config_path: str) -> None:
+        self.model_path = model_path
+        self.config_path = config_path
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        *,
+        model_id: str,
+        revision,
+        cache_dir,
+        force_download: bool,
+        proxies,
+        resume_download,
+        local_files_only: bool,
+        token,
+        **model_kwargs,
+    ) -> "NVTesseractADDiffusion":
+        model_path, config_path = download_model_weights(
+            model_path=model_kwargs.get("model_path", DEFAULT_MODEL_FILENAME),
+            config_path=model_kwargs.get("config_path", DEFAULT_CONFIG_FILENAME),
+            repo_id=model_id,
+            force_download=force_download,
+        )
+        return cls(model_path=model_path, config_path=config_path)
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        import shutil
+
+        save_directory = Path(save_directory)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.model_path, save_directory / Path(self.model_path).name)
+        shutil.copy2(self.config_path, save_directory / Path(self.config_path).name)
+
+    def detect(self, data: "pd.DataFrame", **kwargs) -> dict:
+        return inference_ad_tesseract2(data, model_path=self.model_path, config_path=self.config_path, **kwargs)
