@@ -220,7 +220,6 @@ def download_model_weights(
                 repo_id=repo_id,
                 filename=standardizer_path.name,
                 local_dir=str(standardizer_path.parent) if standardizer_path.parent != Path() else ".",
-                local_dir_use_symlinks=False,
                 library_name="nv-tesseract",
             )
             logger.info("Downloaded %s", standardizer_path)
@@ -232,7 +231,6 @@ def download_model_weights(
                 repo_id=repo_id,
                 filename=checkpoint_path.name,
                 local_dir=str(checkpoint_path.parent) if checkpoint_path.parent != Path() else ".",
-                local_dir_use_symlinks=False,
                 library_name="nv-tesseract",
             )
             logger.info("Downloaded %s", checkpoint_path)

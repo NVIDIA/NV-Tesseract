@@ -932,7 +932,6 @@ def download_model_weights(
                 repo_id=repo_id,
                 filename=model_file.name,
                 local_dir=str(model_file.parent) if model_file.parent != Path() else ".",
-                local_dir_use_symlinks=False,
                 force_download=force_download,
                 library_name="nv-tesseract",
             )
@@ -944,7 +943,6 @@ def download_model_weights(
                 repo_id=repo_id,
                 filename=config_file.name,
                 local_dir=str(config_file.parent) if config_file.parent != Path() else ".",
-                local_dir_use_symlinks=False,
                 force_download=force_download,
                 library_name="nv-tesseract",
             )
