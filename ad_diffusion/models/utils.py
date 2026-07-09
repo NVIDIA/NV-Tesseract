@@ -96,17 +96,20 @@ def estimate_training_time(start_time, end_time, epochs_run, total_epochs, save_
         "estimated_total_hours": round(est_hours, 2),
     }
 
-    print("\n===== Training Time Estimation =====")
-    print(f"Average epoch time: {results['avg_epoch_time_sec']} seconds")
-    print(
-        f"Estimated time for {total_epochs} epochs: {results['estimated_total_minutes']} minutes (~{results['estimated_total_hours']:.2f} hours)"
+    logger.info("===== Training Time Estimation =====")
+    logger.info("Average epoch time: %s seconds", results["avg_epoch_time_sec"])
+    logger.info(
+        "Estimated time for %s epochs: %s minutes (~%.2f hours)",
+        total_epochs,
+        results["estimated_total_minutes"],
+        results["estimated_total_hours"],
     )
 
     if save_dir is not None:
         save_path = Path(save_dir) / "training_time_estimate.json"
         with open(save_path, "w") as f:
             json.dump(results, f, indent=4)
-        print(f"\nTiming estimation saved to {save_path}")
+        logger.info("Timing estimation saved to %s", save_path)
 
     return results
 
@@ -315,7 +318,7 @@ def evaluate(
                 target_mask1_expanded = eval_points.unsqueeze(1)
                 target_mask2_expanded = eval_points2.unsqueeze(1)
                 # Combine samples based on expanded target masks
-                samples = target_mask1_expanded * samples2_old + target_mask2_expanded * samples1_old
+                samples = target_mask1_expanded * samples1_old + target_mask2_expanded * samples2_old
 
                 samples_median = samples.median(dim=1)
                 all_target.append(c_target)
@@ -623,11 +626,11 @@ def ensemble(
             h5.create_dataset("target", data=all_target)
             h5.create_dataset("generated", data=all_generated)
 
-        print(f"Ensemble results saved to {data_path}")
+        logger.info("Ensemble results saved to %s", data_path)
     elif save_results and not HAS_H5PY:
         logger.warning("h5py not available, skipping HDF5 file save for ensemble results")
 
-    print(f"RMSE: {rmse:.4f}")
-    print(f"MAE: {mae:.4f}")
+    logger.info("RMSE: %.4f", rmse)
+    logger.info("MAE: %.4f", mae)
 
     return eval_outputs

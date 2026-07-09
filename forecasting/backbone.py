@@ -18,6 +18,7 @@ Requires: torch, transformers, huggingface_hub, numpy
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import random
@@ -28,6 +29,8 @@ from argparse import Namespace
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import numpy.typing as npt
@@ -132,7 +135,7 @@ class EarlyStopping:
         elif score < self.best_score + self.delta:
             self.counter += 1
             if self.verbose:
-                print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+                logger.info("EarlyStopping counter: %s out of %s", self.counter, self.patience)
             if self.counter >= self.patience:
                 self.early_stop = True
         else:

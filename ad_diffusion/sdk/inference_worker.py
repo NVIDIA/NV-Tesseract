@@ -12,6 +12,7 @@ Usage:
 """
 
 import json
+import logging
 import os
 import sys
 import time
@@ -20,10 +21,22 @@ from multiprocessing import shared_memory
 # Log start time before any heavy imports
 start_time = time.time()
 
+logger = logging.getLogger(__name__)
+
+
+def configure_worker_logging(gpu_id: int) -> logging.Logger:
+    worker_logger = logging.getLogger(f"{__name__}.gpu{gpu_id}")
+    if not worker_logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("[GPU %(name)s] %(levelname)s: %(message)s"))
+        worker_logger.addHandler(handler)
+        worker_logger.setLevel(logging.DEBUG)
+    return worker_logger
+
 
 def main():
     if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <args_json_path> <result_json_path>", file=sys.stderr)
+        logger.error("Usage: %s <args_json_path> <result_json_path>", sys.argv[0])
         sys.exit(1)
 
     args_path = sys.argv[1]
@@ -57,11 +70,6 @@ def main():
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
         from models.main_model import TSDiffuser_Generic
-
-        # GPU logging is not available in this standalone package; provide a no-op fallback.
-        def configure_worker_logging(*args: object, **kwargs: object) -> None:
-            pass
-
         from sdk.inference_ad import (
             evaluate_ad_tesseract2,
             get_dataloader,
@@ -69,12 +77,12 @@ def main():
         )
 
         # Configure logging for this worker
-        logger = configure_worker_logging(gpu_id)
-        logger.debug("Worker STARTED at %.2f", start_time)
+        worker_logger = configure_worker_logging(gpu_id)
+        worker_logger.debug("Worker STARTED at %.2f", start_time)
 
         # NEW: Log DPM usage
         if use_dpm_solver:
-            logger.debug("Using DPM-Solver with %d steps", dpm_steps)
+            worker_logger.debug("Using DPM-Solver with %d steps", dpm_steps)
 
         if deterministic:
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -139,7 +147,7 @@ def main():
         )
 
         end_time = time.time()
-        logger.debug("Worker FINISHED at %.2f (took %.2fs)", end_time, end_time - start_time)
+        worker_logger.debug("Worker FINISHED at %.2f (took %.2fs)", end_time, end_time - start_time)
 
         # Save results as JSON (convert numpy arrays to lists)
         serializable_results = {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in results.items()}
@@ -148,12 +156,10 @@ def main():
 
     except Exception as e:
         end_time = time.time()
-        # Log error if logger was initialized, otherwise print to stderr
         try:
-            logger.error("Worker FAILED at %.2f: %s", end_time, e)
+            worker_logger.error("Worker FAILED at %.2f: %s", end_time, e)
         except NameError:
-            # Logger wasn't configured yet, use stderr
-            print(f"[GPU {gpu_id}] Worker FAILED at {end_time:.2f}: {e}", file=sys.stderr)
+            logger.error("[GPU %s] Worker FAILED at %.2f: %s", gpu_id, end_time, e)
 
         # Save error as JSON
         with open(result_path, "w") as f:

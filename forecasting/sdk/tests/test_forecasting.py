@@ -413,6 +413,50 @@ def test_perform_forecasting_darr_mode_forecast_horizon_larger_than_model_horizo
     assert result["target_forecast"].notna().all()
 
 
+def test_perform_forecasting_darr_mode_retrieves_full_requested_horizon():
+    """DARR retrieval keeps the historical continuation beyond the model's native horizon."""
+    df = make_timeseries(num_rows=12)
+    context_df = make_timeseries(num_rows=12)
+
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=6,
+        model_horizon=2,
+        context_df=context_df,
+        alpha=0.0,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        seed=42,
+    )
+
+    # There is exactly one six-step context continuation: target values 5..10.
+    # The old implementation retrieved only 5..6, then repeated 6 for steps 3..6.
+    np.testing.assert_allclose(result["target_forecast"], np.arange(5, 11, dtype=np.float32))
+
+
+def test_perform_forecasting_darr_mode_blends_full_retrieval_horizon():
+    """The hybrid output uses the complete retrieval trajectory for long forecasts."""
+    df = make_timeseries(num_rows=12)
+    context_df = make_timeseries(num_rows=12)
+
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=6,
+        model_horizon=2,
+        context_df=context_df,
+        alpha=0.25,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        seed=42,
+    )
+
+    # DummyModel forecasts ones, while the retrieved continuation is 5..10.
+    expected = 0.25 + 0.75 * np.arange(5, 11, dtype=np.float32)
+    np.testing.assert_allclose(result["target_forecast"], expected)
+
+
 def test_perform_forecasting_darr_mode_forecast_horizon_much_larger_than_model_horizon():
     """DARR mode works with many autoregressive iterations."""
     df = make_timeseries(num_rows=15)
@@ -633,7 +677,7 @@ def test_perform_forecasting_darr_mode_custom_target_column():
 
 
 def test_perform_forecasting_darr_mode_context_df_insufficient_rows():
-    """DARR mode raises error when context_df has fewer than seq_len + model_horizon rows."""
+    """DARR mode raises when context_df cannot provide its required continuation."""
     df = make_timeseries(num_rows=10)
     # context_df with 6 rows, but seq_len=5 + model_horizon=3 = 8 rows needed
     context_df = make_timeseries(num_rows=6)
@@ -644,6 +688,24 @@ def test_perform_forecasting_darr_mode_context_df_insufficient_rows():
             seq_len=5,
             forecast_horizon=2,
             model_horizon=3,
+            context_df=context_df,
+            standardizer_pkl="fake_std.pkl",
+            ckpt="fake_ckpt.pt",
+            seed=42,
+        )
+
+
+def test_perform_forecasting_darr_mode_requires_full_retrieval_horizon():
+    """Long DARR forecasts require context through the requested retrieval horizon."""
+    df = make_timeseries(num_rows=12)
+    context_df = make_timeseries(num_rows=10)
+
+    with pytest.raises(ValueError, match=r"seq_len=5 \+ context_horizon=6"):
+        forecasting.perform_forecasting(
+            df,
+            seq_len=5,
+            forecast_horizon=6,
+            model_horizon=2,
             context_df=context_df,
             standardizer_pkl="fake_std.pkl",
             ckpt="fake_ckpt.pt",

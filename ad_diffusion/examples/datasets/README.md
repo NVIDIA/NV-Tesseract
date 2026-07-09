@@ -62,7 +62,7 @@ uv run python quick_example.py --dataset-path /absolute/path/to/your/data.csv
 uv run python quick_example.py --dataset-path data.csv --model-path model.pth
 ```
 
-If the Hugging Face repository is gated/private, authenticate first:
+Weights download automatically from the public Hugging Face repository. If a download fails with `401`/`403`, authenticate first:
 
 ```bash
 uv add "huggingface_hub[cli]"

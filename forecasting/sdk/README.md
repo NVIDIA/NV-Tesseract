@@ -101,7 +101,7 @@ result = perform_forecasting(df=df, context_df=context_df, ...)
 **Requirements**:
 - Both datasets must have the same `timestamp_column` and `target_column`
 - At least one common feature column must exist (besides the target)
-- Context dataset must have at least `seq_len + model_horizon` rows
+- Context dataset must have at least `seq_len + max(model_horizon, forecast_horizon)` rows so DARR can retrieve the full requested continuation
 
 For this release, the blending weight `alpha` defaults to `0.01` and can be adjusted via the `alpha` parameter—the hybrid forecast uses that value to combine direct predictions with context-derived neighbors (`alpha * direct + (1 - alpha) * kNN`).
 
@@ -281,7 +281,7 @@ Warning: Column mismatch detected between input and context datasets
 | `ValueError: No common numeric columns found between input and context datasets` | Datasets share no feature columns (only target) | Ensure context dataset has at least one feature column in common with input |
 | `ValueError: Shape mismatch between direct and kNN predictions` | Column alignment failed internally | Check that both datasets have valid numeric columns |
 | `ValueError: DataFrame has X rows but seq_len requires at least Y rows` | Insufficient data points | Provide more data or reduce `seq_len` |
-| `ValueError: Context DataFrame has X rows but requires at least Y rows` | Context dataset too small | Context needs `seq_len + model_horizon` rows minimum |
+| `ValueError: Context DataFrame has X rows but requires at least Y rows` | Context dataset too small | Context needs `seq_len + max(model_horizon, forecast_horizon)` rows minimum |
 | `ValueError: forecast_horizon must be <= 512` | Forecast horizon too large | Reduce `forecast_horizon` or make multiple calls |
 | `ValueError: Target column 'X' not found in DataFrame` | Missing target column | Verify column name or use `target_column` parameter |
 | `ValueError: interpretability_output must be one of None, 'json', 'pdf'` | Bad value for the artifact selector | Use `None`, `"json"`, or `"pdf"` |

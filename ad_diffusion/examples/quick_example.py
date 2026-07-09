@@ -29,7 +29,7 @@ Usage:
     # Or run directly (after setting up dependencies):
     cd examples && python quick_example.py
 
-Hugging Face authentication (only needed if the repo is gated/private):
+Hugging Face authentication (only needed if a download fails with 401/403):
     1. Install the CLI:  uv add "huggingface_hub[cli]"
     2. Login:            huggingface-cli login
     3. Or export a token: export HUGGINGFACE_HUB_TOKEN="hf_..."
@@ -208,7 +208,7 @@ def run_anomaly_detection_example(
             except Exception as e:
                 logger.error(f"Could not download weights from Hugging Face: {e}")
                 logger.info(
-                    "If the repository is gated, run `huggingface-cli login` or "
+                    "If the download failed with 401/403, accept the model license on Hugging Face or run `huggingface-cli login` or "
                     "`export HUGGINGFACE_HUB_TOKEN='hf_...'` and try again."
                 )
                 resolved_model_path = model_path  # fall back to whatever the user passed

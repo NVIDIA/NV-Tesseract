@@ -87,7 +87,7 @@ uv run python examples/quick_example.py --download-weights
 
 ### Hugging Face authentication
 
-If the repository is gated/private, authenticate **before** running inference:
+Weights are published on the public [`nvidia/nv-tesseract-ad-diffusion`](https://huggingface.co/nvidia/nv-tesseract-ad-diffusion) repository and download without authentication. If a download fails with `401`/`403`, accept the model license on the repo page or authenticate before retrying:
 
 ```bash
 # Option A: interactive login (writes ~/.cache/huggingface/token)
@@ -101,9 +101,8 @@ export HUGGINGFACE_HUB_TOKEN="hf_xxx_your_token_here"
 You can create a token at <https://huggingface.co/settings/tokens>. A read-only
 token is sufficient for downloading weights.
 
-If you see a `401`/`403` error from `download_model_weights`, it almost always
-means you either haven't accepted the model's terms on the repo page or haven't
-logged in with a token that has access.
+If you see a `401`/`403` error from `download_model_weights`, accept the model
+license on the repo page and, if needed, log in with a Hugging Face token:
 
 ## Installation
 
@@ -264,7 +263,7 @@ results = perform_anomaly_analysis_with_diffusion(
 ## Python Dependencies
 
 Core dependencies (see `pyproject.toml` for exact versions):
-- PyTorch (with CUDA support if GPU available)
+- `torch>=2.7.0` - Deep learning framework (with CUDA support if GPU available)
 - NumPy, Pandas, SciPy
 - scikit-learn (for PCA and normalization)
 - PyYAML (for configuration files)
@@ -386,10 +385,10 @@ For large datasets:
 - Use DPM-Solver for reduced memory usage
 
 ### Hugging Face Download Issues
-If `download_model_weights` raises a `401` / `403` / "gated" error:
+If `download_model_weights` raises a `401` / `403` error:
 
 ```bash
-# Make sure you're logged in with a token that has access to the repo
+# Accept the model license on the repo page, then log in if needed
 uv add "huggingface_hub[cli]"
 huggingface-cli login
 

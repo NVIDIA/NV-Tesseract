@@ -10,19 +10,10 @@ dependencies = [
     "pandas>=2.1.0",
     "pytest-xdist>=3.8.0",
     "numpy>=1.24.0",
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
-    "torchaudio>=2.0.0",
+    "torch>=2.7.0",
     "tqdm>=4.65.0",
     "huggingface_hub>=0.17.0",
     "transformers>=4.36.0",
-]
-
-[project.optional-dependencies]
-mac-mps = [
-    "torch==2.4.0",
-    "torchvision==0.19.0",
-    "torchaudio==2.4.0",
 ]
 
 [tool.uv]

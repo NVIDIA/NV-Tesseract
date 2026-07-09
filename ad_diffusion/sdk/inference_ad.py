@@ -292,7 +292,7 @@ class InferenceData(Dataset):
                 self.data = min_max_normalize(self.data)
                 self.data = torch.Tensor(self.data) * scale_factor
         else:
-            print("No preprocessing applied")
+            logger.info("No preprocessing applied")
 
         self.window_length = window_length
         self.strategy = strategy
@@ -890,7 +890,9 @@ def download_model_weights(
         Exception: If the download fails (e.g., due to missing authentication).
 
     Note:
-        If the repository is gated or private you must authenticate first:
+        Weights are published on the Hugging Face repository and download
+        without authentication. If a download fails with 401/403, accept the
+        model license on the repo page or authenticate first:
             1. Install the CLI:  `uv add huggingface_hub[cli]`  (or `pip install huggingface_hub[cli]`)
             2. Login:            `huggingface-cli login`
             3. Or set a token:   `export HUGGINGFACE_HUB_TOKEN='your_token'`
@@ -908,7 +910,7 @@ def download_model_weights(
             "Install it with: `uv add huggingface_hub` or `pip install huggingface_hub`."
         )
 
-    print(f"Downloading AD Diffusion weights from Hugging Face ({repo_id})...")
+    logger.info("Downloading AD Diffusion weights from Hugging Face (%s)...", repo_id)
 
     # Create parent directories if the user specified a subdirectory.
     if model_file.parent != Path():
@@ -918,7 +920,7 @@ def download_model_weights(
 
     try:
         if force_download or not model_file.exists():
-            print(f"Downloading {model_file.name}...")
+            logger.info("Downloading %s...", model_file.name)
             hf_hub_download(
                 repo_id=repo_id,
                 filename=model_file.name,
@@ -926,10 +928,10 @@ def download_model_weights(
                 local_dir_use_symlinks=False,
                 force_download=force_download,
             )
-            print(f"✓ Downloaded {model_file}")
+            logger.info("Downloaded %s", model_file)
 
         if force_download or not config_file.exists():
-            print(f"Downloading {config_file.name}...")
+            logger.info("Downloading %s...", config_file.name)
             hf_hub_download(
                 repo_id=repo_id,
                 filename=config_file.name,
@@ -937,13 +939,13 @@ def download_model_weights(
                 local_dir_use_symlinks=False,
                 force_download=force_download,
             )
-            print(f"✓ Downloaded {config_file}")
+            logger.info("Downloaded %s", config_file)
 
     except Exception as e:
         error_msg = f"Failed to download model weights from {repo_id}: {e}"
-        if "401" in str(e) or "403" in str(e) or "gated" in str(e).lower():
+        if "401" in str(e) or "403" in str(e):
             error_msg += (
-                "\n\nAuthentication required for this repository. Please:"
+                "\n\nDownload failed. Accept the model license on Hugging Face or authenticate:"
                 "\n  1. Install huggingface-cli: `uv add huggingface_hub[cli]`"
                 "\n  2. Login:                  `huggingface-cli login`"
                 "\n  3. Or set a token:         `export HUGGINGFACE_HUB_TOKEN='your_token'`"
@@ -1174,17 +1176,17 @@ def inference_ad_tesseract2_mp(
 
     # Log multiprocessing + DPM strategy
     method_str = f"DPM-Solver ({dpm_steps} steps)" if use_dpm_solver else "Standard Diffusion"
-    print(f"\n{'=' * 60}")
-    print(f"MULTI-GPU INFERENCE with {method_str}")
-    print(f"{'=' * 60}")
-    print(f"Processes: {num_processes}")
-    print(f"GPU IDs: {gpu_ids}")
+    logger.info("%s", "\n" + "=" * 60)
+    logger.info("MULTI-GPU INFERENCE with %s", method_str)
+    logger.info("%s", "=" * 60)
+    logger.info("Processes: %s", num_processes)
+    logger.info("GPU IDs: %s", gpu_ids)
     if use_dpm_solver:
         per_process_speedup = 1000 / dpm_steps
         total_speedup = per_process_speedup * num_processes
-        print(f"Per-GPU speedup: ~{per_process_speedup:.0f}x")
-        print(f"Total estimated speedup: ~{total_speedup:.0f}x vs single-GPU standard")
-    print(f"{'=' * 60}\n")
+        logger.info("Per-GPU speedup: ~%.0fx", per_process_speedup)
+        logger.info("Total estimated speedup: ~%.0fx vs single-GPU standard", total_speedup)
+    logger.info("%s\n", "=" * 60)
 
     model_path = Path(resolved_model)
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)

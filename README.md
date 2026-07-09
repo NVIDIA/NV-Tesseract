@@ -101,7 +101,7 @@ results = perform_anomaly_analysis_with_diffusion(
 ## Requirements
 
 - Python 3.12+
-- PyTorch 2.0+
+- PyTorch 2.7+
 - pandas, numpy
 - Pretrained model weights (auto-downloaded from Hugging Face)
 - GPU recommended (CUDA or Apple MPS); falls back to CPU automatically

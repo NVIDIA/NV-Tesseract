@@ -13,10 +13,11 @@ Edit HEADER_LINES below to change the inserted text project-wide.
 from __future__ import annotations
 
 import argparse
-import sys
+import logging
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+logger = logging.getLogger(__name__)
 
 # SPDX tags (Python '#' comments). License must match repo LICENSE (Apache-2.0 here).
 HEADER_LINES = [
@@ -54,6 +55,7 @@ def insert_header(content: str) -> str:
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="Add SPDX headers to Python files.")
     parser.add_argument(
         "--roots",
@@ -91,24 +93,30 @@ def main() -> int:
             continue
         if args.dry_run:
             changed.append(path.relative_to(REPO_ROOT))
-            print(path.relative_to(REPO_ROOT))
+            logger.info("%s", path.relative_to(REPO_ROOT))
             continue
         path.write_text(new_text, encoding="utf-8", newline="\n")
         changed.append(path.relative_to(REPO_ROOT))
 
     if args.check:
         if missing:
-            print("Missing SPDX-License-Identifier in:", file=sys.stderr)
+            logger.error("Missing SPDX-License-Identifier in:")
             for m in missing:
-                print(f"  {m}", file=sys.stderr)
+                logger.error("  %s", m)
             return 1
         return 0
 
     if args.dry_run:
-        print(f"Would update {len(changed)} file(s)" if changed else "Nothing to do")
+        if changed:
+            logger.info("Would update %s file(s)", len(changed))
+        else:
+            logger.info("Nothing to do")
         return 0
 
-    print(f"Updated {len(changed)} file(s)" if changed else "Nothing to do (all files already tagged)")
+    if changed:
+        logger.info("Updated %s file(s)", len(changed))
+    else:
+        logger.info("Nothing to do (all files already tagged)")
     return 0
 
 

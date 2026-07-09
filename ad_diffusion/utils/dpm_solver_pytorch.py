@@ -38,7 +38,11 @@
 # license text.
 # -----------------------------------------------------------------------------
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class NoiseScheduleVP:
@@ -1076,7 +1080,7 @@ class DPM_Solver:
                 lambda_s = ns.marginal_lambda(s)
             h = torch.min(theta * h * torch.float_power(E, -1.0 / order).float(), lambda_0 - lambda_s)
             nfe += order
-        print("adaptive solver nfe", nfe)
+        logger.debug("adaptive solver nfe %s", nfe)
         return x
 
     def add_noise(self, x, t, noise=None):

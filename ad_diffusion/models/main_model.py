@@ -45,6 +45,7 @@ This module is used in conjunction with `diff_models.py` (which contains the dif
 For fast inference, use dpm_solver_impute() with num_steps=20 for ~50x speedup.
 """
 
+import logging
 import os
 import sys
 
@@ -55,6 +56,8 @@ from torch.nn import functional as F
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.diff_models import diff_TSDiffuser
+
+logger = logging.getLogger(__name__)
 
 
 class TSDiffuser_base(nn.Module):
@@ -76,13 +79,15 @@ class TSDiffuser_base(nn.Module):
             self.aux_weight_order2 = config["model"].get("aux_weight_order2", 0.4)
             self.aux_loss_normalize = config["model"].get("aux_loss_normalize", False)
             self.aux_loss_max_value = config["model"].get("aux_loss_max_value", None)
-            print(
-                f"Using aux loss with weight:  Order 1: {self.aux_weight_order1} and Order 2: {self.aux_weight_order2}"
+            logger.info(
+                "Using aux loss with weight: Order 1: %s and Order 2: %s",
+                self.aux_weight_order1,
+                self.aux_weight_order2,
             )
             if self.aux_loss_normalize:
-                print("Auxiliary loss normalization is enabled")
+                logger.info("Auxiliary loss normalization is enabled")
             if self.aux_loss_max_value is not None:
-                print(f"Auxiliary loss clipping enabled at max value: {self.aux_loss_max_value}")
+                logger.info("Auxiliary loss clipping enabled at max value: %s", self.aux_loss_max_value)
         else:
             self.aux_weight_order1 = 0.0
             self.aux_weight_order2 = 0.0
@@ -126,7 +131,7 @@ class TSDiffuser_base(nn.Module):
         # Log warning if alpha approaches dangerous values
         min_alpha = np.min(self.alpha)
         if min_alpha < 1e-5:
-            print(f"WARNING: Minimum alpha value is very small: {min_alpha}")
+            logger.warning("Minimum alpha value is very small: %s", min_alpha)
 
         self.alpha_torch = torch.tensor(self.alpha).float().to(self.device).unsqueeze(1).unsqueeze(1)
 
@@ -309,7 +314,7 @@ class TSDiffuser_base(nn.Module):
 
         # Add input validation and normalization
         if torch.isnan(observed_data).any():
-            print("WARNING: NaN detected in observed_data!")
+            logger.warning("NaN detected in observed_data!")
             observed_data = torch.nan_to_num(observed_data, nan=0.0)
 
         # Normalize input data to prevent extreme values
@@ -332,7 +337,7 @@ class TSDiffuser_base(nn.Module):
 
         # Check for extreme values in noisy_data
         if torch.isnan(noisy_data).any() or torch.isinf(noisy_data).any():
-            print(f"WARNING: NaN/Inf detected in noisy_data at timesteps {t.cpu().numpy()}")
+            logger.warning("NaN/Inf detected in noisy_data at timesteps %s", t.cpu().numpy())
             noisy_data = torch.nan_to_num(noisy_data, nan=0.0, posinf=50.0, neginf=-50.0)
             # Additional clamping for safety
             noisy_data = torch.clamp(noisy_data, min=-200.0, max=200.0)
@@ -343,7 +348,7 @@ class TSDiffuser_base(nn.Module):
         # Check for NaN in predictions
         if torch.isnan(predicted).any():
             t_values = t.cpu().numpy()
-            print(f"WARNING: NaN detected in model predictions at timesteps {t_values}")
+            logger.warning("NaN detected in model predictions at timesteps %s", t_values)
             # Replace NaN with zeros to prevent propagation
             predicted = torch.nan_to_num(predicted, nan=0.0)
 

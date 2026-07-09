@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime, timezone
@@ -36,6 +37,8 @@ from interpretability import (
     explain_forecast,
 )
 from model import build_model
+
+logger = logging.getLogger(__name__)
 
 # Define DEVICE here to avoid import complexity
 
@@ -118,10 +121,10 @@ def _load_cached_model(
     )
 
     if cache_key in _MODEL_CACHE:
-        print(f"Using cached model for {ckpt}")
+        logger.info("Using cached model for %s", ckpt)
         return _MODEL_CACHE[cache_key]
 
-    print(f"Loading model from checkpoint: {ckpt}")
+    logger.info("Loading model from checkpoint: %s", ckpt)
 
     model = build_model(
         model_name=model_name,
@@ -148,13 +151,13 @@ def _load_cached_model(
             raise RuntimeError(f"Missing non-cross-channel checkpoint keys: {non_cr_missing}")
     model.eval()
     _MODEL_CACHE[cache_key] = model
-    print(f"Model cached with key: {cache_key[:8]}...")
+    logger.info("Model cached with key: %s...", cache_key[:8])
     return model
 
 
 def clear_model_cache():
     _MODEL_CACHE.clear()
-    print("Model cache cleared")
+    logger.info("Model cache cleared")
 
 
 def download_model_weights(
@@ -178,6 +181,14 @@ def download_model_weights(
     Raises:
         ImportError: If huggingface_hub is not installed
         Exception: If download fails
+
+    Note:
+        Weights are published on the Hugging Face repository and download
+        without authentication. If a download fails with 401/403, accept the
+        model license on the repo page or authenticate first:
+            1. Install the CLI:  `uv add huggingface_hub[cli]`
+            2. Login:            `huggingface-cli login`
+            3. Or set a token:   `export HUGGINGFACE_HUB_TOKEN='your_token'`
     """
     standardizer_path = Path(standardizer_pkl)
     checkpoint_path = Path(ckpt)
@@ -192,7 +203,7 @@ def download_model_weights(
             "huggingface_hub is required to download model weights. Install it with: uv add huggingface_hub"
         )
 
-    print("Downloading model weights from Hugging Face...")
+    logger.info("Downloading model weights from Hugging Face...")
 
     # Create parent directories if they don't exist (in case user specifies subdirectories)
     if standardizer_path.parent != Path():
@@ -203,31 +214,31 @@ def download_model_weights(
     try:
         # Download standardizer
         if force_download or not standardizer_path.exists():
-            print(f"Downloading {standardizer_path.name}...")
+            logger.info("Downloading %s...", standardizer_path.name)
             downloaded_file = hf_hub_download(
                 repo_id=repo_id,
                 filename=standardizer_path.name,
                 local_dir=str(standardizer_path.parent) if standardizer_path.parent != Path() else ".",
                 local_dir_use_symlinks=False,
             )
-            print(f"✓ Downloaded {standardizer_path}")
+            logger.info("Downloaded %s", standardizer_path)
 
         # Download checkpoint
         if force_download or not checkpoint_path.exists():
-            print(f"Downloading {checkpoint_path.name}...")
+            logger.info("Downloading %s...", checkpoint_path.name)
             downloaded_file = hf_hub_download(
                 repo_id=repo_id,
                 filename=checkpoint_path.name,
                 local_dir=str(checkpoint_path.parent) if checkpoint_path.parent != Path() else ".",
                 local_dir_use_symlinks=False,
             )
-            print(f"✓ Downloaded {checkpoint_path}")
+            logger.info("Downloaded %s", checkpoint_path)
 
     except Exception as e:
         error_msg = f"Failed to download model weights: {e}"
         if "401" in str(e) or "403" in str(e):
             error_msg += (
-                "\n\nAuthentication required for private repository. Please:"
+                "\n\nDownload failed. If you see a 401/403 error, accept the model license on Hugging Face or authenticate:"
                 "\n1. Install huggingface-cli: uv add huggingface_hub[cli]"
                 "\n2. Login: huggingface-cli login"
                 "\n3. Or set token: export HUGGINGFACE_HUB_TOKEN='your_token'"
@@ -1235,7 +1246,7 @@ def _build_pdf_report(
                     forecast_horizon=int(forecast_horizon),
                 )
             except Exception as e:
-                print(f"Semantic flow page skipped: {e}")
+                logger.warning("Semantic flow page skipped: %s", e)
 
         if trajectory_report is not None:
             r = trajectory_report
@@ -1346,7 +1357,7 @@ def _build_pdf_report(
                     channel_labels=channel_labels,
                 )
             except Exception as e:
-                print(f"Feature-axis page skipped: {e}")
+                logger.warning("Feature-axis page skipped: %s", e)
 
     return pdf_path
 
@@ -1628,7 +1639,7 @@ def _run_interpretability(
                     forecast_horizon=forecast_horizon,
                 )
             except Exception as e:
-                print(f"semantic_flow.csv skipped: {e}")
+                logger.warning("semantic_flow.csv skipped: %s", e)
         if getattr(explanation, "channel_horizon_attributions", None) is not None:
             try:
                 _save_channel_axis_artifacts(
@@ -1637,7 +1648,7 @@ def _run_interpretability(
                     channel_labels=columns_to_process,
                 )
             except Exception as e:
-                print(f"channel_horizon artifacts skipped: {e}")
+                logger.warning("channel_horizon artifacts skipped: %s", e)
 
     trajectory_report: TrajectoryStabilityReport | None = None
     try:
@@ -1649,7 +1660,7 @@ def _run_interpretability(
             batch_size=32,
         )
     except Exception as e:
-        print(f"Trajectory stability skipped: {e}")
+        logger.warning("Trajectory stability skipped: %s", e)
 
     if write_json:
         _save_explanation_json(
@@ -1661,7 +1672,7 @@ def _run_interpretability(
             dataset_name=dataset_name,
             trajectory_report=trajectory_report,
         )
-        print(f"Interpretability JSON written to: {run_dir / 'explanation.json'}")
+        logger.info("Interpretability JSON written to: %s", run_dir / "explanation.json")
 
     if write_pdf:
         pdf_path = run_dir / "explanation_report.pdf"
@@ -1681,9 +1692,9 @@ def _run_interpretability(
             channel_labels=columns_to_process,
         )
         if produced is None:
-            print("Interpretability PDF report skipped: matplotlib is not installed.")
+            logger.warning("Interpretability PDF report skipped: matplotlib is not installed.")
         else:
-            print(f"Interpretability PDF report written to: {pdf_path}")
+            logger.info("Interpretability PDF report written to: %s", pdf_path)
 
     return forecast_df, run_dir
 
@@ -1751,6 +1762,12 @@ def perform_forecasting(
     if forecast_horizon > MAX_FORECAST_HORIZON:
         raise ValueError(f"forecast_horizon must be <= {MAX_FORECAST_HORIZON}, got {forecast_horizon}")
 
+    # The model's native horizon limits direct predictions, but DARR retrieves
+    # observed continuations from context data. Keep the existing native-sized
+    # context windows for shorter requests while retaining the full retrieval
+    # trajectory whenever callers ask for a longer forecast.
+    darr_context_horizon = max(model_horizon, forecast_horizon)
+
     # Input validation
     if df is None or df.empty:
         raise ValueError("Input DataFrame is required and cannot be empty")
@@ -1784,7 +1801,7 @@ def perform_forecasting(
 
     # Handle NULL values in target column - fill with zeros
     if working_df[target_column].isnull().any():
-        print(f"Warning: Found NULL values in '{target_column}', filling with zeros")
+        logger.warning("Found NULL values in '%s', filling with zeros", target_column)
         working_df[target_column] = working_df[target_column].fillna(0)
 
     # Automatically detect all numeric columns to use as features
@@ -1798,7 +1815,7 @@ def perform_forecasting(
     # Fill NaN values with zeros for all numeric columns
     for col in columns_to_process:
         if working_df[col].isnull().any():
-            print(f"Warning: Found NULL values in '{col}', filling with zeros")
+            logger.warning("Found NULL values in '%s', filling with zeros", col)
             working_df[col] = working_df[col].fillna(0)
 
     # Set default values
@@ -1825,16 +1842,16 @@ def perform_forecasting(
     try:
         standardizer_pkl, ckpt = download_model_weights(standardizer_pkl=standardizer_pkl, ckpt=ckpt)
     except Exception as e:
-        print(f"Warning: Could not auto-download weights: {e}")
-        print("Using provided paths as-is. Make sure the files exist locally.")
+        logger.warning("Could not auto-download weights: %s", e)
+        logger.warning("Using provided paths as-is. Make sure the files exist locally.")
 
     # Determine mode
     if context_df is not None:
         mode = "darr"
-        print(f"Using DARR mode (Context-Enhanced Forecasting) with alpha={alpha}")
+        logger.info("Using DARR mode (Context-Enhanced Forecasting) with alpha=%s", alpha)
     else:
         mode = "standard"
-        print("Using standard forecasting mode (inference only)")
+        logger.info("Using standard forecasting mode (inference only)")
 
     # Temporary files for DataFrame conversion
     temp_test_csv = None
@@ -1863,11 +1880,12 @@ def perform_forecasting(
                 raise ValueError(f"Context DataFrame missing target column '{target_column}'")
 
             # Validate context DataFrame has enough rows for at least one window
-            min_context_rows = seq_len + model_horizon
+            min_context_rows = seq_len + darr_context_horizon
             if len(context_df) < min_context_rows:
                 raise ValueError(
                     f"Context DataFrame has {len(context_df)} rows but requires at least "
-                    f"{min_context_rows} rows (seq_len={seq_len} + model_horizon={model_horizon})"
+                    f"{min_context_rows} rows "
+                    f"(seq_len={seq_len} + context_horizon={darr_context_horizon})"
                 )
 
             # Process context DataFrame similarly to main DataFrame
@@ -1897,10 +1915,10 @@ def perform_forecasting(
 
             # Check if we have column compatibility issues
             if len(main_numeric_set) != len(context_numeric_set) or main_numeric_set != context_numeric_set:
-                print("Warning: Column mismatch detected between input and context datasets")
-                print(f"  Input dataset columns: {sorted(main_numeric_set)}")
-                print(f"  Context dataset columns: {sorted(context_numeric_set)}")
-                print(f"  Common columns: {sorted(common_columns)}")
+                logger.warning("Column mismatch detected between input and context datasets")
+                logger.warning("  Input dataset columns: %s", sorted(main_numeric_set))
+                logger.warning("  Context dataset columns: %s", sorted(context_numeric_set))
+                logger.warning("  Common columns: %s", sorted(common_columns))
 
                 if len(common_columns) == 0:
                     raise ValueError(
@@ -1910,7 +1928,7 @@ def perform_forecasting(
                         f"For DARR mode to work, both datasets must share at least some numeric columns."
                     )
 
-                print(f"  Using only common columns for consistent predictions: {sorted(common_columns)}")
+                logger.warning("  Using only common columns for consistent predictions: %s", sorted(common_columns))
 
                 # Update both datasets to use only common columns
                 columns_to_process = [target_column] + sorted(common_columns)
@@ -1930,7 +1948,7 @@ def perform_forecasting(
             # Fill NULLs in context data
             for col in context_csv_df.columns:
                 if col != "timestamp" and context_csv_df[col].isnull().any():
-                    print(f"Warning: Found NULL values in context DataFrame column '{col}', filling with zeros")
+                    logger.warning("Found NULL values in context DataFrame column '%s', filling with zeros", col)
                     context_csv_df[col] = context_csv_df[col].fillna(0)
 
             context_csv_df.to_csv(temp_context_csv, index=False)
@@ -1988,22 +2006,24 @@ def perform_forecasting(
                 dataset_name=interpretability_dataset_name,
                 channel_output_aware=channel_output_aware,
             )
-            print(f"\nInterpretability bundle written to: {run_dir}")
+            logger.info("Interpretability bundle written to: %s", run_dir)
             if save_preds:
                 result_df.to_csv(save_preds, index=False)
-                print(f"Saved predictions to {save_preds}")
+                logger.info("Saved predictions to %s", save_preds)
             return result_df
 
         # Perform inference based on mode
         if mode == "darr":
             # Context-Enhanced Forecasting (DARR Mode)
 
-            # Create context dataset with model_horizon (needs ground truth)
+            # Retrieve observed context continuations for the entire requested
+            # horizon. The native model horizon only constrains the direct
+            # component, which is extended autoregressively below.
             context_dataset = CSVLongHorizonSimpleDataset(
                 csv_path=context_csv_path,
                 data_split="train",
                 seq_len=seq_len,
-                forecast_horizon=model_horizon,  # Use model's native horizon
+                forecast_horizon=darr_context_horizon,
                 standardizer=None,
                 standardize=False,
                 stride=context_stride,
@@ -2015,9 +2035,9 @@ def perform_forecasting(
                 context_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
             )
 
-            # Build context memory (using model_horizon)
+            # Build context memory with observed continuations long enough for
+            # the requested retrieval forecast.
             DB_E, DB_Y = build_context_memory(model, context_loader, device, cosine=True)
-            # print(f"Context memory built: {DB_E.shape} embeddings, {DB_Y.shape} futures")
 
             # Embed test data and get direct predictions (with autoregressive if needed)
             Q_E_list = []
@@ -2044,18 +2064,8 @@ def perform_forecasting(
             preds_direct = np.concatenate(preds_direct, axis=0)
 
             # kNN retrieval forecast
-            preds_knn_base = knn_forecast(DB_E, DB_Y, Q_E, k=k, temperature=temperature)
-
-            # If forecast_horizon > model_horizon, extend kNN predictions
-            if forecast_horizon > model_horizon:
-                B, C, H = preds_knn_base.shape
-                preds_knn = np.zeros((B, C, forecast_horizon), dtype=np.float32)
-                preds_knn[:, :, :H] = preds_knn_base
-                # Extend with last value
-                for h in range(H, forecast_horizon):
-                    preds_knn[:, :, h] = preds_knn_base[:, :, -1]
-            else:
-                preds_knn = preds_knn_base[:, :, :forecast_horizon]
+            preds_knn = knn_forecast(DB_E, DB_Y, Q_E, k=k, temperature=temperature)
+            preds_knn = preds_knn[:, :, :forecast_horizon]
 
             # Validate shapes before combining predictions
             if preds_direct.shape != preds_knn.shape:
@@ -2128,18 +2138,18 @@ def perform_forecasting(
         # Save predictions if requested
         if save_preds:
             result_df.to_csv(save_preds, index=False)
-            print(f"Saved predictions to {save_preds}")
+            logger.info("Saved predictions to %s", save_preds)
 
         if mode == "darr":
-            print(f"\n{'=' * 60}")
-            print("DARR Mode Results")
-            print(f"{'=' * 60}")
-            print(f"Added column: {target_column}_forecast")
+            logger.info("%s", "\n" + "=" * 60)
+            logger.info("DARR Mode Results")
+            logger.info("%s", "=" * 60)
+            logger.info("Added column: %s_forecast", target_column)
         else:
-            print(f"\n{'=' * 60}")
-            print("Results")
-            print(f"{'=' * 60}")
-            print(f"Added column: {target_column}_forecast")
+            logger.info("%s", "\n" + "=" * 60)
+            logger.info("Results")
+            logger.info("%s", "=" * 60)
+            logger.info("Added column: %s_forecast", target_column)
 
         return result_df
 

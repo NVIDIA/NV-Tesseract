@@ -9,6 +9,7 @@ the format of the merged TSB-AD training data, using the original
 feature engineering methods for complete consistency.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -22,6 +23,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import utilities from utils directory
 from utils.json_utils import load_preprocessing_models
+
+logger = logging.getLogger(__name__)
 
 ORIGINAL_NORMALIZER_AVAILABLE = True
 
@@ -371,10 +374,10 @@ def preprocess_for_inference(data, domain=None, model_dir=None, target_dim=40, a
     if add_metadata:
         # Reserve 2 columns for domain and padding_mask
         target_features = target_dim - 2
-        print(f"Target dimensions: {target_dim} (features: {target_features} + domain: 1 + padding: 1)")
+        logger.info("Target dimensions: %s (features: %s + domain: 1 + padding: 1)", target_dim, target_features)
     else:
         target_features = target_dim
-        print(f"Target dimensions: {target_dim} (features only, no metadata)")
+        logger.info("Target dimensions: %s (features only, no metadata)", target_dim)
 
     # Convert DataFrame to numpy if needed
     if isinstance(data, pd.DataFrame):
@@ -382,9 +385,9 @@ def preprocess_for_inference(data, domain=None, model_dir=None, target_dim=40, a
 
     # Auto-detect domain if not provided
     if domain is None:
-        print("Domain not specified. Auto-detecting based on data characteristics...")
+        logger.info("Domain not specified. Auto-detecting based on data characteristics...")
         domain = detect_domain(data)
-        print(f"Detected domain: {domain}")
+        logger.info("Detected domain: %s", domain)
 
     # Load preprocessing models from JSON
     domain_normalizers = _load_normalizers(model_dir / "domain_normalizers.json")
@@ -454,13 +457,13 @@ def preprocess_for_inference(data, domain=None, model_dir=None, target_dim=40, a
             # Fallback: Apply normal PCA to the data
             pca = PCA(n_components=target_features)
             data = pca.fit_transform(data)
-            print(f"Applied PCA to {n_features} features to {target_features} features")
+            logger.info("Applied PCA to %s features to %s features", n_features, target_features)
 
     elif n_features < target_features:
         # Expand features using the original feature engineering methods
         if n_features == 1:
             # For univariate, create temporal features
-            print("Creating temporal features for univariate data...")
+            logger.info("Creating temporal features for univariate data...")
             expanded = np.zeros((n_samples, target_features))
 
             # Process each sample with history
@@ -478,7 +481,7 @@ def preprocess_for_inference(data, domain=None, model_dir=None, target_dim=40, a
             data = expanded
         else:
             # For multivariate, create interaction features
-            print(f"Creating interaction features for {n_features}-dimensional data...")
+            logger.info("Creating interaction features for %s-dimensional data...", n_features)
             data = bounded_multivariate_features(data, n_features, target_range=100)
 
     # Step 4: Add metadata columns if requested
@@ -551,5 +554,4 @@ if __name__ == "__main__":
     #     domain="Sensor",
     #     model_dir=model_dir
     # )
-    # print(f"Preprocessed shape: {preprocessed.shape}")
     pass

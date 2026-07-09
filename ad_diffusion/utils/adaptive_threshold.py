@@ -728,14 +728,14 @@ if __name__ == "__main__":
     # Test both methods
     results = compare_adaptive_methods(scores, time_series, ground_truth)
 
-    print("\n=== Adaptive Thresholding Results ===")
+    logger.info("=== Adaptive Thresholding Results ===")
     for method_name, method_results in results.items():
-        print(f"\n{method_name.upper()}:")
-        print(f"  Anomalies detected: {method_results['num_anomalies']}")
-        print(f"  Anomaly rate: {method_results['anomaly_rate']:.3f}")
+        logger.info("%s:", method_name.upper())
+        logger.info("  Anomalies detected: %s", method_results["num_anomalies"])
+        logger.info("  Anomaly rate: %.3f", method_results["anomaly_rate"])
 
         if "accuracy" in method_results:
-            print(f"  Accuracy: {method_results['accuracy']:.3f}")
-            print(f"  Precision: {method_results['precision']:.3f}")
-            print(f"  Recall: {method_results['recall']:.3f}")
-            print(f"  F1-Score: {method_results['f1_score']:.3f}")
+            logger.info("  Accuracy: %.3f", method_results["accuracy"])
+            logger.info("  Precision: %.3f", method_results["precision"])
+            logger.info("  Recall: %.3f", method_results["recall"])
+            logger.info("  F1-Score: %.3f", method_results["f1_score"])

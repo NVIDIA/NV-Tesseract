@@ -22,22 +22,9 @@ uv sync --group dev
 uv pip install -e .  # Install package in editable mode for clean imports
 ```
 
-### 3. Authenticate with Hugging Face
+### 3. Run Forecasting
 
-Since the model weights are in a private repository, you need to authenticate:
-
-```bash
-# Install huggingface-hub if not already installed
-uv add huggingface_hub
-
-# Authenticate (one-time setup)
-huggingface-cli login
-# Or set environment variable: export HUGGINGFACE_HUB_TOKEN="your_token"
-```
-
-### 4. Run Forecasting
-
-The model weights will be automatically downloaded on first use:
+The model weights are published on Hugging Face (`nvidia/nv-tesseract-forecasting`) and download automatically on first use — no authentication required:
 
 ```python
 import pandas as pd
@@ -173,7 +160,7 @@ forecasting/
 - vendored `backbone.py` - forecasting backbone implementation bundled in this package
 - `pandas>=2.1.0` - Data manipulation
 - `numpy>=1.24.0` - Numerical computing
-- `torch>=2.0.0` - Deep learning framework
+- `torch>=2.7.0` - Deep learning framework
 - `tqdm>=4.65.0` - Progress bars
 - `huggingface_hub>=0.17.0` - For downloading model weights
 
@@ -182,7 +169,6 @@ forecasting/
 - `ruff>=0.8.0` - Linting and formatting
 
 ### Optional Dependencies
-- `mac-mps` group: Optimized PyTorch for Apple Silicon
 - `matplotlib` - Required only for the interpretability PDF report and heatmap PNG; JSON-only interpretability output works without it
 
 ### Note on Dependencies
@@ -200,7 +186,7 @@ The project uses `pyproject.toml` for configuration:
 ## Model Weights
 
 The forecasting model requires pre-trained weights from the Hugging Face repository:
-- Repository: `nvidia/nv-tesseract-forecasting`
+- Repository: [`nvidia/nv-tesseract-forecasting`](https://huggingface.co/nvidia/nv-tesseract-forecasting) (auto-downloaded on first use; no authentication required)
 - Required files (auto-downloaded to current directory):
   - `standardizer.pkl` - Data normalization parameters
   - `moment_head_512_6hr.pt` - Model checkpoint for standard 6-hour forecasting (standard forecasting only)
@@ -346,9 +332,9 @@ If you see stale environment errors referring to an old backbone package:
 - Make sure `tool.hatch.metadata.allow-direct-references = true` is set
 
 ### Model Weight Download Issues
-1. Ensure you're authenticated: `huggingface-cli login`
-2. Verify repository access to `nvidia/nv-tesseract-forecasting`
-3. Check network connectivity
+1. Verify the repository is reachable: `nvidia/nv-tesseract-forecasting`
+2. Check network connectivity
+3. If you see a `401`/`403` error, accept the model license on the Hugging Face repo page or authenticate: `huggingface-cli login`
 
 ### Import Errors
 Make sure to run Python through UV to use the project environment:

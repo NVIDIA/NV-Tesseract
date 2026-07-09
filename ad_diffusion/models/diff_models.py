@@ -117,12 +117,8 @@ class diff_TSDiffuser(nn.Module):
         x = x.reshape(B, self.channels, K, L)
 
         diffusion_emb = self.diffusion_embedding(diffusion_step)
-        # print("strategy type is")
-        # print(strategy_type)
 
         strategy_emb = self.strategy_embedding(strategy_type)
-        # print("strategy emb is")
-        # print(strategy_emb.shape)
         skip = []
         for layer in self.residual_layers:
             x, skip_connection = layer(x, cond_info, diffusion_emb, strategy_emb)
@@ -205,9 +201,6 @@ class ResidualBlock(nn.Module):
         diffusion_emb = self.diffusion_projection(diffusion_emb).unsqueeze(-1)  # (B,channel,1)
         strategy_emb = self.strategy_projection(strategy_emb).unsqueeze(-1)
 
-        # print("strategy emb is")
-        # print(strategy_emb)
-        # print(strategy_emb.shape)
         y = x + diffusion_emb + strategy_emb
 
         y = self.forward_time(y, base_shape)

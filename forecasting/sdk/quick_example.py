@@ -12,10 +12,10 @@ This example demonstrates:
 4. Interpretability mode (temporal lag x horizon attributions plus, for
    multivariate inputs, feature-axis channel x horizon attributions; JSON + PDF)
 
-Make sure you're authenticated with Hugging Face for the private repo:
-    huggingface-cli login
+Model weights download automatically from the public Hugging Face repo on first run.
 """
 
+import logging
 import os
 from pathlib import Path
 
@@ -23,20 +23,23 @@ import pandas as pd
 
 from sdk.forecasting import perform_forecasting
 
+logger = logging.getLogger(__name__)
+
 # Load your CSV file
 csv_path = (
     Path(__file__).resolve().parent / "tests" / "datasets" / "ETTh_single_feature.csv"
 )  # Replace with your file path
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     if not os.path.exists(csv_path):
-        print(f"CSV file not found at {csv_path}")
-        print("Please supply your own data with 'timestamp' and target columns.")
-        print("Example CSV format:")
-        print("timestamp,target")
-        print("2024-01-01 00:00:00,1.5")
-        print("2024-01-01 01:00:00,1.7")
-        print("...")
+        logger.error("CSV file not found at %s", csv_path)
+        logger.error("Please supply your own data with 'timestamp' and target columns.")
+        logger.error("Example CSV format:")
+        logger.error("timestamp,target")
+        logger.error("2024-01-01 00:00:00,1.5")
+        logger.error("2024-01-01 01:00:00,1.7")
+        logger.error("...")
         raise SystemExit("Data file required")
 
     # Model weights will be auto-downloaded from Hugging Face on first run
@@ -57,8 +60,9 @@ if __name__ == "__main__":
         target_column=target_col,
         save_preds="forecast_ETTh_seq_len_100.csv",
     )
-    print(f"\nStandard forecast (only predicted rows with '{target_col}_forecast' column):")
-    print(forecast_df.to_csv())
+    logger.info(
+        "\nStandard forecast (only predicted rows with '%s_forecast' column):\n%s", target_col, forecast_df.to_csv()
+    )
 
     # DARR mode requires a user-provided context dataset that mirrors the input schema
     # but contains different data (e.g., historical slices, previously predicted values, etc.).
@@ -78,8 +82,7 @@ if __name__ == "__main__":
         save_preds="forecast_ETTh_darr_100.csv",
         # Model weights auto-downloaded if needed
     )
-    print(f"\nDARR forecast (hybrid prediction in '{target_col}_forecast' column):")
-    print(darr_df.to_csv())
+    logger.info("\nDARR forecast (hybrid prediction in '%s_forecast' column):\n%s", target_col, darr_df.to_csv())
 
     # Interpretability mode: produces a lag x horizon attribution heatmap and a
     # multi-page PDF report alongside the forecast. Set ``interpretability=True``
@@ -120,7 +123,12 @@ if __name__ == "__main__":
         softmax_tau=1.0,
         save_preds="forecast_ETTh_with_explanations.csv",
     )
-    print(f"\nInterpretability forecast (single-window baseline in '{target_col}_forecast' column):")
-    print(interp_df.head().to_string(index=False))
-    print(f"\nReport bundle written under: {interp_out_dir}")
-    print("Multivariate input -> the report includes a feature-axis (channel x horizon) page.")
+    logger.info(
+        "\nInterpretability forecast (single-window baseline in '%s_forecast' column):\n%s",
+        target_col,
+        interp_df.head().to_string(index=False),
+    )
+    logger.info("\nReport bundle written under: %s", interp_out_dir)
+    logger.info(
+        "Multivariate input -> the report includes a feature-axis (channel x horizon) page."
+    )
