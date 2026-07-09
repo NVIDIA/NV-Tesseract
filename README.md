@@ -67,7 +67,7 @@ darr_result = perform_forecasting(
 
 #### Interpretability
 
-Forecasting includes a model-agnostic **interpretability** framework that explains *why* a forecast looks the way it does — without modifying the underlying model. Pass `interpretability=True` to write an explanation bundle alongside the forecast: input attributions per horizon, semantic-flow magnitudes in latent space, forecast-vs-history diagnostic ratios, and latent trajectory stability metrics (JSON, CSVs, and optional PDF report):
+Forecasting includes a model-agnostic **interpretability** framework that explains *why* a forecast looks the way it does — without modifying the underlying model. Pass `interpretability=True` to write an explanation bundle alongside the forecast: temporal lag × horizon attributions (which past step drives each forecast step), feature-axis channel × horizon attributions for multivariate inputs (which input channel drives each forecast step), semantic-flow magnitudes in latent space, forecast-vs-history diagnostic ratios, and latent trajectory stability metrics (JSON, CSVs, and optional PDF report):
 
 ```python
 results = perform_forecasting(

@@ -9,7 +9,8 @@ This example demonstrates:
 1. Auto-downloading model weights from Hugging Face (on first run)
 2. Standard forecasting mode
 3. DARR mode (context-enhanced forecasting)
-4. Interpretability mode (lag x horizon attributions, JSON + PDF report)
+4. Interpretability mode (temporal lag x horizon attributions plus, for
+   multivariate inputs, feature-axis channel x horizon attributions; JSON + PDF)
 
 Make sure you're authenticated with Hugging Face for the private repo:
     huggingface-cli login
@@ -86,9 +87,26 @@ if __name__ == "__main__":
     #   - "json" -> writes only forecast.csv + explanation.json
     #   - "pdf"  -> writes forecast.csv + lag_horizon_*.csv/png + explanation_report.pdf
     #   - None   -> writes both (full bundle)
+    #
+    # Feature axis: when the input has more than one numeric column (a
+    # multivariate frame), the SDK also decomposes the forecast along the
+    # *feature axis*. The report gains a channel x horizon attribution page
+    # (which input channel drives each forecast step) and writes
+    # channel_horizon_attributions.csv / channel_horizon_heatmap.png. Below we
+    # derive two extra channels from the target so the feature-axis page is
+    # produced; swap in your own feature columns for a real multivariate signal.
+    # (By default the feature-axis attribution is measured in latent space; pass
+    # channel_output_aware=True to attribute the target channel's forecast
+    # directly instead, at the cost of extra forward passes.)
+    multivariate_df = df.copy()
+    multivariate_df[f"{target_col}_diff"] = multivariate_df[target_col].diff().fillna(0.0)
+    multivariate_df[f"{target_col}_roll12"] = (
+        multivariate_df[target_col].rolling(window=12, min_periods=1).mean()
+    )
+
     interp_out_dir = Path(__file__).resolve().parent / "interpretability_output"
     interp_df = perform_forecasting(
-        df=df,
+        df=multivariate_df,
         seq_len=seq_len,
         forecast_horizon=forecast_horizon,
         timestamp_column=timestamp_col,
@@ -105,3 +123,4 @@ if __name__ == "__main__":
     print(f"\nInterpretability forecast (single-window baseline in '{target_col}_forecast' column):")
     print(interp_df.head().to_string(index=False))
     print(f"\nReport bundle written under: {interp_out_dir}")
+    print("Multivariate input -> the report includes a feature-axis (channel x horizon) page.")

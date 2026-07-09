@@ -159,7 +159,7 @@ forecasting/
 │   ├── quick_example.py  # Example usage script
 │   └── tests/            # Test files and datasets
 ├── dataset_longhorizon.py # Dataset utilities
-├── interpretability.py   # Model-agnostic explanation engine (lag x horizon)
+├── interpretability.py   # Model-agnostic explanation engine (lag x horizon + feature axis)
 ├── model.py              # Model building utilities
 ├── standardizer.pkl      # Normalization params (auto-downloaded on first use)
 └── moment_head_512_6hr.pt  # Head checkpoint (auto-downloaded on first use)
@@ -222,9 +222,15 @@ The framework's core component is the **Lag–Horizon Attribution Engine**, whic
 
 Internally `F` is computed by composing the model's consecutive flow operators along the latent path from each past input to each future prediction; per horizon, the scores are softmax-normalized into attributions.
 
+### The Feature Axis (channel × horizon)
+
+For multivariate inputs the same latent semantic flow is decomposed along a second axis — the **feature axis**. The scalar flow magnitude of each latent transition (`|| Z_{t+1} − Z_t ||`) is split into per-channel contributions using a fast, model-agnostic first-order (Jacobian-flow) estimator. Aggregated across lags per horizon, this yields a **channel × horizon attribution matrix** answering *which input channel drives each forecast step* — the feature-axis complement to the lag × horizon (temporal-axis) matrix. 
+
+By default the flow is measured in the model's latent space (output-agnostic "semantic flow"). Passing `channel_output_aware=True` to `perform_forecasting` instead measures it on the **target channel's forecast**, so the attribution answers *which input channel drives the target's prediction* directly — using only the black-box forecast interface (no embedding access). This is more interpretable for a single target at the cost of extra forward passes.
+
 ### What the SDK gives you
 
-When you call `perform_forecasting(..., interpretability=True)` the SDK runs the same loaded model on the trailing window and writes a self-contained explanation bundle: the K×H matrix as wide and long CSVs, a heatmap PNG, a per-transition `semantic_flow.csv` with a `history`/`forecast` segment label, a full `explanation.json` (baseline forecast, lag×horizon scores and attributions, latent trajectory, semantic-flow magnitudes, diagnostic ratios that flag whether the forecast segment is volatile relative to history, and a `trajectory_stability` block with temporal-smoothness metrics over the context window), and a multi-page PDF report whose final pages surface (a) the semantic-flow time series with a history/forecast split chart, per-segment summary statistics, and the forecast-vs-history diagnostic ratios, and (b) the latent-trajectory stability metrics. See the **Interpretability (Lag x Horizon Explanations)** example below for the call shape and `sdk/README.md` for the full parameter reference and on-disk artifact catalogue.
+When you call `perform_forecasting(..., interpretability=True)` the SDK runs the same loaded model on the trailing window and writes a self-contained explanation bundle: the K×H matrix as wide and long CSVs, a heatmap PNG, a per-transition `semantic_flow.csv` with a `history`/`forecast` segment label, a full `explanation.json` (baseline forecast, lag×horizon scores and attributions, latent trajectory, semantic-flow magnitudes, diagnostic ratios that flag whether the forecast segment is volatile relative to history, and a `trajectory_stability` block with temporal-smoothness metrics over the context window), and a multi-page PDF report whose final pages surface (a) the semantic-flow time series with a history/forecast split chart, per-segment summary statistics, and the forecast-vs-history diagnostic ratios, and (b) the latent-trajectory stability metrics. For **multivariate inputs** the bundle additionally includes the feature-axis outputs: a `channel_horizon_attributions.csv` (and `channel_horizon_heatmap.png`), a `feature_axis` block in `explanation.json`, and a dedicated channel × horizon page in the PDF report. See the **Interpretability (Lag x Horizon Explanations)** example below for the call shape and `sdk/README.md` for the full parameter reference and on-disk artifact catalogue.
 
 ## Usage Examples
 

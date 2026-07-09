@@ -35,10 +35,13 @@ Stability / quality notes:
 
 import warnings
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 Array = np.ndarray
 
@@ -181,6 +184,22 @@ class ForecastExplanation:
       - curvature_ratio_forecast_vs_history: compares second-difference energy of Z in forecast vs history.
       - latent_diag_mahalanobis_ratio_forecast_vs_history: compares a diagonal-Mahalanobis latent distance
         in forecast vs history (OOD shift indicator).
+
+    Feature-axis (v2) outputs (populated only when ``explain_forecast`` is
+    called with ``channel_axis=True`` on a multivariate input):
+      - per_channel_flow: [T-1, C] -- per-channel decomposition of latent
+        flow (phi_tau(c)).
+      - lag_channel_horizon_scores: [K, C, H] -- joint score tensor before
+        normalization.
+      - lag_channel_horizon_attributions: [K, C, H] -- softmax-normalized
+        joint lag x channel x horizon attribution.
+      - channel_horizon_attributions: [C, H] -- channel-marginal of the joint
+        attribution; which input channel drives each forecast step.
+      - channel_flow_method: which estimator produced the above ("jacobian").
+      - channel_flow_residual_ratio_mean / _p95: trust-region diagnostic for
+        the Jacobian estimator. ``|| Delta Z - sum_c Delta Z^(c) || / ||Delta Z||``
+        averaged over transitions; lower means the first-order decomposition
+        explains more of the latent step.
     """
 
     baseline_forecast: Array
@@ -195,6 +214,14 @@ class ForecastExplanation:
     flow_variance_ratio_forecast_vs_history: float | None = None
     curvature_ratio_forecast_vs_history: float | None = None
     latent_diag_mahalanobis_ratio_forecast_vs_history: float | None = None
+    # v2 feature-axis outputs (None when channel_axis=False)
+    per_channel_flow: Array | None = None
+    lag_channel_horizon_scores: Array | None = None
+    lag_channel_horizon_attributions: Array | None = None
+    channel_horizon_attributions: Array | None = None
+    channel_flow_method: str | None = None
+    channel_flow_residual_ratio_mean: float | None = None
+    channel_flow_residual_ratio_p95: float | None = None
 
 
 def _flow_segment_ratios(
@@ -1321,6 +1348,426 @@ def fit_horizon_surrogates(
     return coef, intercept, feature_layout
 
 
+# ---------------------------------------------------------------------------
+# Feature-axis (v2): per-channel semantic-flow decomposition
+# ---------------------------------------------------------------------------
+#
+# The temporal-axis engine above decomposes a forecast along *when* the model
+# looked (the lag axis). For multivariate inputs we can also ask *which input
+# channel* drove each latent step -- the feature axis. We decompose the scalar
+# flow magnitude ``m_tau = || Z_{tau+1} - Z_tau ||_2`` into per-channel
+# contributions ``phi_tau(c)`` via a first-order (Jacobian-flow) estimator: a
+# symmetric ``+/- s * Delta_x`` secant probe measures each channel's
+# directional effect on the latent step at O(C) extra forward passes per
+# transition, and reports an analytic trust ratio
+# ``|| Delta Z - sum_c Delta Z^(c) || / || Delta Z ||``.
+
+
+@dataclass(frozen=True)
+class ChannelFlowConfig:
+    """Configuration for the per-channel (feature-axis) flow decomposition.
+
+    Args:
+      jacobian_secant_scale: Multiplicative scale applied to the per-channel
+        input increment when computing the central-difference probe. Smaller
+        values approach the analytic Jacobian-vector product (lower bias,
+        higher variance from float noise); larger values measure a finite
+        secant (lower variance, higher bias). The default of 0.5 corresponds
+        to a symmetric ``+/- 0.5 * Delta_x`` probe centered on the window.
+      time_indices: Optional explicit list of trajectory transition indices at
+        which to compute the per-channel flow. ``None`` (the default)
+        processes every consecutive transition in the rolling-window
+        trajectory.
+      batch_size: Number of probe windows evaluated per forward pass.
+      transition_batch: Number of transitions whose probe windows are stacked
+        into a single embed call before being chunked by ``batch_size``.
+        Values > 1 amortise per-call overhead across transitions.
+    """
+
+    jacobian_secant_scale: float = 0.5
+    time_indices: Sequence[int] | None = None
+    batch_size: int = 32
+    transition_batch: int = 1
+
+
+@dataclass(frozen=True)
+class ChannelFlowReport:
+    """Per-channel flow decomposition outputs.
+
+    Shapes:
+      - per_channel_flow: [T-1, C] -- ``phi_tau(c)`` for each transition.
+      - flow_total: [T-1] -- the scalar magnitude ``m_tau = || Delta Z_tau ||_2``
+        for cross-checking against the temporal-axis flow.
+      - residual_ratio_per_step: [T-1] -- ``|| Delta Z_tau - sum_c Delta Z^(c) ||
+        / || Delta Z_tau ||``. NaN means the flow was numerically zero.
+    """
+
+    method: str
+    per_channel_flow: Array
+    flow_total: Array
+    residual_ratio_per_step: Array | None = None
+    residual_ratio_mean: float | None = None
+    residual_ratio_p95: float | None = None
+    n_time_steps: int = 0
+    n_channels: int = 0
+
+
+def _resolve_step_indices(
+    *,
+    time_indices: Sequence[int] | None,
+    n_windows: int,
+) -> np.ndarray:
+    """Return the array of trajectory transition indices to evaluate.
+
+    A "transition" at index ``tau`` is the pair ``(tau, tau+1)``; the valid
+    range is ``[0, n_windows - 2]``.
+    """
+    if n_windows < 2:
+        raise ValueError(f"Need at least 2 rolling windows for flow, got {n_windows}")
+    if time_indices is None:
+        return np.arange(n_windows - 1, dtype=np.int64)
+    arr = np.asarray(time_indices, dtype=np.int64).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("`time_indices` must contain at least one transition index.")
+    invalid = (arr < 0) | (arr >= n_windows - 1)
+    if np.any(invalid):
+        raise ValueError(f"`time_indices` contains values outside [0, {n_windows - 2}]: {arr[invalid].tolist()}")
+    return np.unique(arr)
+
+
+def _embed_windows_batched(
+    model: ForecastModel,
+    windows: Array,
+    masks: Array,
+    *,
+    device: torch.device,
+    batch_size: int,
+) -> Array:
+    """Batched embedding of a stack of ``[N, C, L]`` windows.
+
+    NaN/inf in the model's embedding output are replaced with zero, mirroring
+    the sanitization that :func:`extract_latent_trajectory` applies to the
+    temporal-axis path (out-of-distribution forecast-extension windows can
+    otherwise emit non-finite activations that corrupt ``per_channel_flow``).
+    """
+    n = int(windows.shape[0])
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+    out_chunks: list[Array] = []
+    for i in range(0, n, batch_size):
+        x = torch.from_numpy(np.ascontiguousarray(windows[i : i + batch_size])).to(device=device, dtype=torch.float32)
+        m = torch.from_numpy(np.ascontiguousarray(masks[i : i + batch_size])).to(device=device, dtype=torch.long)
+        out_chunks.append(_embed_batch(model, x, m))
+    z = np.concatenate(out_chunks, axis=0)
+    if np.any(~np.isfinite(z)):
+        z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    return z
+
+
+# Signature shared by the value function the flow estimator consumes:
+# ``(model, windows[N,C,L], masks[N,L], *, device, batch_size) -> [N, Dv]``.
+# The default (:func:`_embed_windows_batched`) measures flow in the latent
+# embedding space (output-agnostic "semantic flow", ``Dv == D``). The
+# output-aware variant below instead returns the *target channel's forecast*
+# (``Dv == H``), so the per-channel flow measures each input channel's effect
+# on the target prediction.
+ValueFn = Callable[..., Array]
+
+
+def make_target_forecast_value_fn(
+    *,
+    target_channel: int,
+    model_horizon: int,
+    forecast_horizon: int,
+) -> ValueFn:
+    """Value function mapping a window stack to the target channel's forecast.
+
+    Passing this to :func:`compute_per_channel_flow` (or, more conveniently,
+    calling ``explain_forecast(channel_output_aware=True, channel_target=...)``)
+    turns the per-channel flow from an *output-agnostic* latent-movement
+    decomposition (``|| Delta Z ||``) into an *output-aware* one: the flow is
+    measured on the target channel's ``H``-step forecast, so ``phi_tau(c)`` is
+    channel ``c``'s contribution to the change in the target's prediction. It
+    uses only the black-box ``forecast`` interface (no embedding / decoder
+    Jacobian), so it stays model-agnostic.
+    """
+
+    def _value_fn(model: ForecastModel, windows: Array, masks: Array, *, device: torch.device, batch_size: int) -> Array:
+        n = int(windows.shape[0])
+        if n == 0:
+            return np.zeros((0, int(forecast_horizon)), dtype=np.float32)
+        out_chunks: list[Array] = []
+        for i in range(0, n, int(batch_size)):
+            xb = torch.from_numpy(np.ascontiguousarray(windows[i : i + int(batch_size)])).to(
+                device=device, dtype=torch.float32
+            )
+            mb = torch.from_numpy(np.ascontiguousarray(masks[i : i + int(batch_size)])).to(
+                device=device, dtype=torch.long
+            )
+            y = _forecast_autoregressive(
+                model, xb, mb, model_horizon=int(model_horizon), target_horizon=int(forecast_horizon)
+            )  # numpy [B, C, H]
+            out_chunks.append(np.asarray(y[:, int(target_channel), :], dtype=np.float32))
+        z = np.concatenate(out_chunks, axis=0)  # [N, H]
+        if np.any(~np.isfinite(z)):
+            z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        return z
+
+    return _value_fn
+
+
+@torch.no_grad()
+def compute_per_channel_flow(
+    model: ForecastModel,
+    series_ct: Array,  # [C, T]
+    *,
+    seq_len: int,
+    input_mask_t: Array | None = None,
+    device: torch.device,
+    cfg: ChannelFlowConfig | None = None,
+    value_fn: ValueFn | None = None,
+) -> ChannelFlowReport:
+    """First-order per-channel decomposition of latent flow (Jacobian-flow).
+
+    For each transition ``tau -> tau+1`` we approximate
+
+        Delta Z_tau^(c) ~= [ embed(X_tau + s * bump_c) - embed(X_tau - s * bump_c) ] / (2s)
+
+    where ``bump_c`` shifts only channel ``c`` by the per-channel increment
+    ``Delta x_tau^(c) = X_{tau+1}[c] - X_tau[c]`` and ``s`` is
+    ``cfg.jacobian_secant_scale``. The per-channel flow magnitude is
+    ``phi_tau(c) = || Delta Z_tau^(c) ||_2`` and the residual
+    ``r_tau = Delta Z_tau - sum_c Delta Z_tau^(c)`` populates the trust ratio.
+
+    By default the flow is measured in the latent embedding space
+    (output-agnostic). Pass ``value_fn`` (e.g. from
+    :func:`make_target_forecast_value_fn`) to measure it in another space, such
+    as the target channel's forecast (output-aware), in which case
+    ``phi_tau(c)`` and the trust ratio are computed on that value function's
+    output instead of the embedding.
+
+    Cost: one batched forward of ``2C + 2`` probe windows per transition
+    (``Z_tau``, ``Z_{tau+1}``, and the ``+/- s`` bumps for each channel).
+    """
+    cfg = cfg or ChannelFlowConfig()
+    vf = value_fn if value_fn is not None else _embed_windows_batched
+
+    xw_view, m_view, T = _rolling_window_sources(series_ct, seq_len=seq_len, input_mask_t=input_mask_t)
+    if T < 2:
+        raise ValueError(f"Need at least 2 time steps for flow decomposition, got T={T}")
+    transitions = _resolve_step_indices(time_indices=cfg.time_indices, n_windows=T)
+
+    C = int(np.asarray(series_ct).shape[0])
+    L = int(seq_len)
+    s = float(cfg.jacobian_secant_scale)
+    if s <= 0:
+        raise ValueError(f"jacobian_secant_scale must be > 0, got {s}")
+
+    phi = np.full((T - 1, C), np.nan, dtype=np.float32)
+    flow_total = np.full((T - 1,), np.nan, dtype=np.float32)
+    residual = np.full((T - 1,), np.nan, dtype=np.float32)
+
+    # Probe windows per transition: Z_tau, Z_{tau+1}, and the +/- bumps.
+    probes_per_trans = 2 + 2 * C
+    trans_batch = max(1, int(cfg.transition_batch))
+
+    for chunk_start in range(0, len(transitions), trans_batch):
+        chunk = transitions[chunk_start : chunk_start + trans_batch]
+        m_chunk = len(chunk)
+
+        starts = chunk.astype(np.int64)
+        win_a = np.asarray(xw_view[starts], dtype=np.float32)  # [m, C, L]
+        win_b = np.asarray(xw_view[starts + 1], dtype=np.float32)  # [m, C, L]
+        mask_a = np.asarray(m_view[starts], dtype=np.int64)  # [m, L]
+        mask_b = np.asarray(m_view[starts + 1], dtype=np.int64)  # [m, L]
+        delta_cl = (win_b - win_a).astype(np.float32, copy=False)  # [m, C, L]
+
+        # Build the [m, probes_per_trans, C, L] probe stack. Per transition the
+        # layout is [a, b, +probe_0..+probe_{C-1}, -probe_0..-probe_{C-1}].
+        stack = np.empty((m_chunk, probes_per_trans, C, L), dtype=np.float32)
+        stack[:, 0] = win_a
+        stack[:, 1] = win_b
+
+        # Bumps reuse window A except on the bumped channel row (c, c), which
+        # is shifted by +/- s * delta_x.
+        plus = np.broadcast_to(win_a[:, None, :, :], (m_chunk, C, C, L)).copy()
+        minus = plus.copy()
+        diag_idx = np.arange(C)
+        plus[:, diag_idx, diag_idx, :] = win_a[:, diag_idx, :] + s * delta_cl[:, diag_idx, :]
+        minus[:, diag_idx, diag_idx, :] = win_a[:, diag_idx, :] - s * delta_cl[:, diag_idx, :]
+        stack[:, 2 : 2 + C] = plus
+        stack[:, 2 + C :] = minus
+
+        # Mask discipline: position 1 (Z_{tau+1}) uses window B's mask; every
+        # other probe uses window A's mask, matching extract_latent_trajectory.
+        masks_full = np.broadcast_to(mask_a[:, None, :], (m_chunk, probes_per_trans, L)).copy()
+        masks_full[:, 1] = mask_b
+
+        flat_stack = stack.reshape(m_chunk * probes_per_trans, C, L)
+        flat_masks = masks_full.reshape(m_chunk * probes_per_trans, L)
+
+        z_flat = vf(
+            model,
+            flat_stack,
+            flat_masks,
+            device=device,
+            batch_size=int(cfg.batch_size),
+        )  # [m * probes_per_trans, Dv]
+        D = int(z_flat.shape[1])
+        z = z_flat.reshape(m_chunk, probes_per_trans, D)
+
+        delta_z = z[:, 1, :] - z[:, 0, :]  # [m, D]
+        # Central-secant per-channel directional derivative: (z_+ - z_-) / (2s).
+        delta_z_per_chan = (z[:, 2 : 2 + C, :] - z[:, 2 + C :, :]) / (2.0 * s)  # [m, C, D]
+
+        for k, tau in enumerate(chunk):
+            dz_k = delta_z[k]  # [D]
+            dzpc_k = delta_z_per_chan[k]  # [C, D]
+            phi[int(tau)] = np.linalg.norm(dzpc_k, ord=2, axis=1).astype(np.float32)
+            total_k = float(np.linalg.norm(dz_k, ord=2))
+            flow_total[int(tau)] = total_k
+            r_k = dz_k - dzpc_k.sum(axis=0)
+            residual[int(tau)] = float(np.linalg.norm(r_k, ord=2)) / (total_k + 1e-12)
+
+    finite = np.isfinite(residual)
+    res_mean = float(np.nanmean(residual[finite])) if np.any(finite) else None
+    res_p95 = float(np.nanpercentile(residual[finite], 95)) if np.any(finite) else None
+
+    return ChannelFlowReport(
+        method="jacobian",
+        per_channel_flow=phi,
+        flow_total=flow_total,
+        residual_ratio_per_step=residual,
+        residual_ratio_mean=res_mean,
+        residual_ratio_p95=res_p95,
+        n_time_steps=int(T - 1),
+        n_channels=C,
+    )
+
+
+def lag_channel_horizon_attribution(
+    per_channel_flow: Array,  # [T-1, C]
+    *,
+    t_index: int,
+    n_lags: int,
+    horizon: int,
+    softmax_tau: float = 1.0,
+    horizon_kernel: Literal["exp", "none"] = "exp",
+    kernel_min_scale: float = 4.0,
+    kernel_max_scale: float | None = None,
+    normalize: Literal["joint", "per_channel", "none"] = "joint",
+) -> tuple[Array, Array]:
+    """Joint lag x channel x horizon attribution.
+
+    This is the natural generalisation of :func:`lag_horizon_attribution` to a
+    per-channel flow input. The lag-horizon kernel ``w_h(a) = exp(-a / s_h)`` is
+    reused unchanged; the cumulative kernel-weighted sum is taken per channel,
+    producing a ``[K, C, H]`` score tensor instead of the ``[K, H]`` matrix.
+
+    The ``normalize`` flag controls the softmax over the score tensor:
+
+    * ``"joint"`` (default): softmax over the joint ``(lag, channel)`` axis for
+      each horizon. Marginalising over channels recovers the temporal-axis
+      lag-horizon attribution; marginalising over lags gives a per-channel
+      per-horizon attribution.
+    * ``"per_channel"``: softmax over the lag axis, separately for each
+      ``(channel, horizon)`` pair.
+    * ``"none"``: raw scores without softmax normalization.
+
+    Returns:
+      scores: [K, C, H]
+      attributions: [K, C, H]
+    """
+    flow_tc = np.asarray(per_channel_flow, dtype=np.float32)
+    if flow_tc.ndim != 2:
+        raise ValueError(f"Expected per_channel_flow shape [T-1, C], got {flow_tc.shape}")
+    flow_tc = np.where(np.isfinite(flow_tc), flow_tc, 0.0).astype(np.float32)
+
+    Tm1, C = flow_tc.shape
+    K = int(n_lags)
+    H = int(horizon)
+    if K <= 0 or H <= 0:
+        raise ValueError("n_lags and horizon must be positive")
+    if not (1 <= int(t_index) <= Tm1):
+        raise ValueError(f"t_index must be in [1, {Tm1}], got {t_index}")
+    if int(t_index) < K:
+        raise ValueError(f"n_lags must be <= t_index={int(t_index)}, got {K}")
+
+    # Most-recent-first slice of history flow per channel.
+    hist_tail = flow_tc[max(0, int(t_index) - K) : int(t_index), :]  # [<=K, C]
+    hist_rev = hist_tail[::-1, :]  # most recent first
+    Lh = hist_rev.shape[0]
+
+    min_s = float(kernel_min_scale)
+    max_s = float(kernel_max_scale) if kernel_max_scale is not None else float(K)
+    if min_s <= 0 or max_s <= 0:
+        raise ValueError("kernel scales must be positive")
+    max_s = max(max_s, min_s)
+    if H == 1:
+        scales_h = np.array([min_s], dtype=np.float32)
+    else:
+        u_h = np.arange(H, dtype=np.float32) / float(H - 1)
+        scales_h = (min_s + u_h * (max_s - min_s)).astype(np.float32)
+
+    scores = np.zeros((K, C, H), dtype=np.float32)
+    if horizon_kernel == "none":
+        csum = np.cumsum(hist_rev, axis=0, dtype=np.float32)  # [Lh, C]
+        scores[:Lh, :, :] = csum[:, :, None]
+    elif horizon_kernel == "exp":
+        ages_l = np.arange(Lh, dtype=np.float32)[:, None]  # [Lh, 1]
+        target_bytes = 64 * 1024 * 1024
+        bytes_per_h = max(1, Lh * C * 4)
+        chunk = max(1, min(H, target_bytes // bytes_per_h))
+        for h0 in range(0, H, chunk):
+            h1 = min(H, h0 + chunk)
+            sc = np.maximum(scales_h[h0:h1][None, :], np.float32(1e-6))
+            w_lh = np.exp(-ages_l / sc).astype(np.float32)  # [Lh, chunk]
+            hw_lhc = hist_rev[:, :, None] * w_lh[:, None, :]  # [Lh, C, chunk]
+            csum = np.cumsum(hw_lhc, axis=0, dtype=np.float32)  # [Lh, C, chunk]
+            scores[:Lh, :, h0:h1] = csum
+    else:
+        raise ValueError(f"Unsupported horizon_kernel={horizon_kernel!r}")
+
+    tau = max(float(softmax_tau), 1e-6)
+    if normalize == "none":
+        return scores, scores.copy()
+    if normalize == "per_channel":
+        attrib = np.empty_like(scores)
+        for c in range(C):
+            for h in range(H):
+                col = scores[:, c, h]
+                if not np.any(col):
+                    attrib[:, c, h] = 1.0 / float(K)
+                else:
+                    e = np.exp((col - col.max()) / tau)
+                    ssum = e.sum()
+                    attrib[:, c, h] = e / ssum if ssum > 0 else 1.0 / float(K)
+        return scores, attrib
+    if normalize != "joint":
+        raise ValueError(f"Unsupported normalize={normalize!r}")
+
+    # Joint softmax over (lag, channel) per horizon.
+    attrib = np.empty_like(scores)
+    flat = scores.reshape(K * C, H)
+    for h in range(H):
+        col = flat[:, h]
+        if not np.any(col):
+            attrib[:, :, h] = 1.0 / float(K * C)
+            continue
+        e = np.exp((col - col.max()) / tau)
+        ssum = e.sum()
+        if ssum <= 0:
+            attrib[:, :, h] = 1.0 / float(K * C)
+        else:
+            attrib[:, :, h] = (e / ssum).reshape(K, C)
+    return scores, attrib
+
+
+def channel_horizon_marginal(attribution_kch: Array) -> Array:
+    """Sum a ``[K, C, H]`` attribution tensor over the lag axis -> ``[C, H]``."""
+    return np.asarray(attribution_kch, dtype=np.float32).sum(axis=0).astype(np.float32)
+
+
 def explain_forecast(
     model: ForecastModel,
     *,
@@ -1336,6 +1783,12 @@ def explain_forecast(
     pert_cfg: PerturbationConfig | None = None,
     surr_cfg: SurrogateConfig | None = None,
     latent_batch_size: int = 32,
+    # v2 feature-axis switches
+    channel_axis: bool = False,
+    chan_cfg: ChannelFlowConfig | None = None,
+    channel_softmax_tau: float | None = None,
+    channel_output_aware: bool = False,
+    channel_target: int | None = None,
 ) -> ForecastExplanation:
     """
     End-to-end interpretability pipeline:
@@ -1344,6 +1797,24 @@ def explain_forecast(
       3) Semantic flow magnitudes
       4) Lag x Horizon attribution matrix + horizon-wise softmax
       5) Optional horizon-specific local surrogates with structure-preserving perturbations
+
+    When ``channel_axis=True`` (and the input has C > 1 channels) we additionally
+    run the feature-axis stages: per-channel flow decomposition followed by the
+    joint lag x channel x horizon attribution (see :func:`compute_per_channel_flow`
+    and :func:`lag_channel_horizon_attribution`).
+
+    Pass ``chan_cfg`` to tune the per-channel flow estimator; when it is None we
+    default to ``ChannelFlowConfig()``, the fast O(C) Jacobian estimator.
+
+    By default the feature-axis flow is measured in the latent embedding space
+    (output-agnostic "semantic flow"). Set ``channel_output_aware=True`` with a
+    ``channel_target`` to instead measure it on that target channel's forecast,
+    so the attribution answers "which input channel drives the target's
+    prediction" directly (uses only the black-box forecast interface). This is
+    more interpretable for a single target but costs extra forward passes (each
+    probe window is forecast rather than embedded). Non-target channels only
+    receive attribution if the model couples channels; otherwise only the target
+    contributes.
     """
     flow_cfg = flow_cfg or SemanticFlowConfig()
     pert_cfg = pert_cfg or PerturbationConfig()
@@ -1433,6 +1904,57 @@ def explain_forecast(
             surr_cfg=surr_cfg,
         )
 
+    # --- 6) feature-axis stages (optional; multivariate inputs only) ---
+    per_chan_flow = None
+    lag_chan_scores = None
+    lag_chan_attrib = None
+    chan_horizon_attrib = None
+    chan_method = None
+    chan_resid_mean = None
+    chan_resid_p95 = None
+    if channel_axis:
+        chan_cfg_eff = chan_cfg if chan_cfg is not None else ChannelFlowConfig()
+        # Select the flow's value function: the default latent embedding
+        # (output-agnostic) or the target channel's forecast (output-aware).
+        chan_value_fn = None
+        if channel_output_aware:
+            if channel_target is None:
+                raise ValueError(
+                    "channel_output_aware=True requires channel_target (the forecast "
+                    "channel whose prediction the attribution should explain)."
+                )
+            chan_value_fn = make_target_forecast_value_fn(
+                target_channel=int(channel_target),
+                model_horizon=int(model_horizon),
+                forecast_horizon=int(forecast_horizon),
+            )
+        # Channel-flow operates on the same extended series so lag indices match
+        # the temporal-axis attribution above.
+        report = compute_per_channel_flow(
+            model,
+            series_ext,
+            seq_len=L,
+            input_mask_t=mask_ext,
+            device=device,
+            cfg=chan_cfg_eff,
+            value_fn=chan_value_fn,
+        )
+        per_chan_flow = report.per_channel_flow
+        chan_method = report.method
+        chan_resid_mean = report.residual_ratio_mean
+        chan_resid_p95 = report.residual_ratio_p95
+
+        chan_tau = float(channel_softmax_tau) if channel_softmax_tau is not None else float(softmax_tau)
+        lag_chan_scores, lag_chan_attrib = lag_channel_horizon_attribution(
+            per_chan_flow,
+            t_index=t_index,
+            n_lags=K,
+            horizon=int(forecast_horizon),
+            softmax_tau=chan_tau,
+            normalize="joint",
+        )
+        chan_horizon_attrib = channel_horizon_marginal(lag_chan_attrib)
+
     return ForecastExplanation(
         baseline_forecast=base,
         lag_horizon_scores=scores,
@@ -1446,4 +1968,11 @@ def explain_forecast(
         flow_variance_ratio_forecast_vs_history=flow_var_ratio,
         curvature_ratio_forecast_vs_history=curvature_ratio,
         latent_diag_mahalanobis_ratio_forecast_vs_history=maha_ratio,
+        per_channel_flow=per_chan_flow,
+        lag_channel_horizon_scores=lag_chan_scores,
+        lag_channel_horizon_attributions=lag_chan_attrib,
+        channel_horizon_attributions=chan_horizon_attrib,
+        channel_flow_method=chan_method,
+        channel_flow_residual_ratio_mean=chan_resid_mean,
+        channel_flow_residual_ratio_p95=chan_resid_p95,
     )
