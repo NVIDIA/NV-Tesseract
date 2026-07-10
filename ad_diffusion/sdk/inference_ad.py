@@ -70,7 +70,7 @@ from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader, Dataset
 
 try:
-    from huggingface_hub import ModelHubMixin, hf_hub_download
+    from huggingface_hub import ModelHubMixin, snapshot_download
 
     HF_HUB_AVAILABLE = True
 except ImportError:
@@ -919,34 +919,28 @@ def download_model_weights(
 
     logger.info("Downloading AD Diffusion weights from Hugging Face (%s)...", repo_id)
 
-    # Create parent directories if the user specified a subdirectory.
-    if model_file.parent != Path():
-        model_file.parent.mkdir(parents=True, exist_ok=True)
-    if config_file.parent != Path():
-        config_file.parent.mkdir(parents=True, exist_ok=True)
+    # Use the shared parent dir, falling back to CWD when files live in different dirs
+    local_dir = str(model_file.parent) if model_file.parent == config_file.parent else "."
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+
+    # Only fetch what is actually missing
+    patterns = []
+    if force_download or not model_file.exists():
+        patterns.append(model_file.name)
+    if force_download or not config_file.exists():
+        patterns.append(config_file.name)
 
     try:
-        if force_download or not model_file.exists():
-            logger.info("Downloading %s...", model_file.name)
-            hf_hub_download(
+        if patterns:
+            logger.info("Downloading: %s", ", ".join(patterns))
+            snapshot_download(
                 repo_id=repo_id,
-                filename=model_file.name,
-                local_dir=str(model_file.parent) if model_file.parent != Path() else ".",
+                local_dir=local_dir,
+                allow_patterns=patterns,
                 force_download=force_download,
                 library_name="nv-tesseract",
             )
-            logger.info("Downloaded %s", model_file)
-
-        if force_download or not config_file.exists():
-            logger.info("Downloading %s...", config_file.name)
-            hf_hub_download(
-                repo_id=repo_id,
-                filename=config_file.name,
-                local_dir=str(config_file.parent) if config_file.parent != Path() else ".",
-                force_download=force_download,
-                library_name="nv-tesseract",
-            )
-            logger.info("Downloaded %s", config_file)
+            logger.info("Downloaded: %s", ", ".join(patterns))
 
     except Exception as e:
         error_msg = f"Failed to download model weights from {repo_id}: {e}"

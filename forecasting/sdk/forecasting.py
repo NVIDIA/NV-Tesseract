@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
-    from huggingface_hub import ModelHubMixin, hf_hub_download
+    from huggingface_hub import ModelHubMixin, snapshot_download
 
     HF_HUB_AVAILABLE = True
 except ImportError:
@@ -206,34 +206,28 @@ def download_model_weights(
 
     logger.info("Downloading model weights from Hugging Face...")
 
-    # Create parent directories if they don't exist (in case user specifies subdirectories)
-    if standardizer_path.parent != Path():
-        standardizer_path.parent.mkdir(parents=True, exist_ok=True)
-    if checkpoint_path.parent != Path():
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    # Use the shared parent dir, falling back to CWD when files live in different dirs
+    local_dir = str(standardizer_path.parent) if standardizer_path.parent == checkpoint_path.parent else "."
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+
+    # Only fetch what is actually missing
+    patterns = []
+    if force_download or not standardizer_path.exists():
+        patterns.append(standardizer_path.name)
+    if force_download or not checkpoint_path.exists():
+        patterns.append(checkpoint_path.name)
 
     try:
-        # Download standardizer
-        if force_download or not standardizer_path.exists():
-            logger.info("Downloading %s...", standardizer_path.name)
-            downloaded_file = hf_hub_download(
+        if patterns:
+            logger.info("Downloading: %s", ", ".join(patterns))
+            snapshot_download(
                 repo_id=repo_id,
-                filename=standardizer_path.name,
-                local_dir=str(standardizer_path.parent) if standardizer_path.parent != Path() else ".",
+                local_dir=local_dir,
+                allow_patterns=patterns,
+                force_download=force_download,
                 library_name="nv-tesseract",
             )
-            logger.info("Downloaded %s", standardizer_path)
-
-        # Download checkpoint
-        if force_download or not checkpoint_path.exists():
-            logger.info("Downloading %s...", checkpoint_path.name)
-            downloaded_file = hf_hub_download(
-                repo_id=repo_id,
-                filename=checkpoint_path.name,
-                local_dir=str(checkpoint_path.parent) if checkpoint_path.parent != Path() else ".",
-                library_name="nv-tesseract",
-            )
-            logger.info("Downloaded %s", checkpoint_path)
+            logger.info("Downloaded: %s", ", ".join(patterns))
 
     except Exception as e:
         error_msg = f"Failed to download model weights: {e}"
