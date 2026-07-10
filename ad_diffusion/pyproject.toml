@@ -38,6 +38,9 @@ indent-width = 4
 select = ["E", "F", "W", "I"]
 ignore = ["E501"]  # line too long (handled by line-length)
 
+[tool.ruff.lint.per-file-ignores]
+"examples/finetune_example.py" = ["E402"]  # Imports follow the direct-script sys.path setup.
+
 # Basic test configuration (for future use)
 [tool.pytest.ini_options]
 addopts = "--disable-warnings -v"

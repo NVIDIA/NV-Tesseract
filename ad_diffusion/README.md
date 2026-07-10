@@ -235,7 +235,12 @@ The output directory contains:
 - `metrics.json` - training and validation losses
 - `finetune_config.yaml` - model configuration used for fine-tuning
 
-Run anomaly detection with the fine-tuned checkpoint. Pass only numeric analysis columns to `df`; drop timestamp, label, and other metadata columns before calling the SDK.
+Fine-tuned checkpoints contain the fitted feature-column order, min-max statistics, PCA projection (when used),
+scale factor, and window settings. The SDK replays that preprocessing automatically instead of fitting a new
+transform on each inference batch. Extra columns are ignored, while missing training features produce a clear error.
+
+Run anomaly detection with the fine-tuned checkpoint. The SDK selects the feature columns recorded during fine-tuning;
+dropping timestamp, label, and other metadata columns explicitly is still recommended for clarity.
 
 ```python
 analysis_df = df.select_dtypes(include="number").drop(columns=["is_anomaly"], errors="ignore")
