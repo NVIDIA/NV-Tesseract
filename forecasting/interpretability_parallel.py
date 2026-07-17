@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-
 from channel_flow import (
     ChannelFlowConfig,
     ChannelFlowReport,

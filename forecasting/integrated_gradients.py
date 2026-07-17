@@ -439,6 +439,7 @@ def moment_embed_fn(model, *, input_mask: torch.Tensor | None = None, grad_throu
             IG stays faithful. The override is scoped to each embedding call
             and restored immediately.
     """
+
     def _fn(x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError(f"MOMENT embed_fn expects [n, C, L]; got {tuple(x.shape)}")

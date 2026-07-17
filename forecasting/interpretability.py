@@ -39,7 +39,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import numpy as np
 import torch
-
 from integrated_gradients import normalization_statistics_gradient
 
 if TYPE_CHECKING:

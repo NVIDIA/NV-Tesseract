@@ -26,7 +26,6 @@ except ImportError:
 
 # Clean absolute imports - package is installed in editable mode
 from backbone.utils.utils import control_randomness
-
 from dataset_longhorizon import (
     CSVLongHorizonSimpleDataset,
     Standardizer,
@@ -1310,7 +1309,6 @@ def _integrated_gradients_page(
 
     pdf.savefig(fig)
     plt.close(fig)
-
 
 
 def _build_pdf_report(
