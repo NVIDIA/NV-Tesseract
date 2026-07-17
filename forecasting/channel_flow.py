@@ -60,12 +60,13 @@ import numpy as np
 import torch
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 from interpretability import (
     Array,
     ForecastModel,
     _embed_batch,
+    _forecast_autoregressive,
     _rolling_window_sources,
 )
 
@@ -1134,3 +1135,50 @@ def lag_horizon_marginal(attribution_kch: Array) -> Array:
     plugged directly into :func:`evaluate_lag_faithfulness`.
     """
     return np.asarray(attribution_kch, dtype=np.float32).sum(axis=1).astype(np.float32)
+
+
+def make_target_forecast_value_fn(
+    *,
+    target_channel: int,
+    model_horizon: int,
+    forecast_horizon: int,
+) -> Callable[..., Array]:
+    """Return a value function that evaluates the target channel's forecast.
+
+    The returned callable runs the model autoregressively on a batch of input
+    windows and returns the mean-absolute forecast for ``target_channel`` over
+    ``forecast_horizon`` steps as a 1-D array of shape ``[B]``. It is designed
+    to be passed as ``value_fn`` to :func:`compute_per_channel_flow` to enable
+    output-aware per-channel attribution, where the Shapley game measures how
+    each channel affects a specific forecast output rather than the latent
+    embedding.
+
+    Args:
+        target_channel: Index of the forecast channel to explain.
+        model_horizon: Native forecast horizon of the model.
+        forecast_horizon: Desired number of future steps to attribute.
+
+    Returns:
+        A callable ``f(model, x_enc, input_mask) -> Array[B]`` giving the
+        mean absolute forecast value for the target channel over the requested
+        horizon for each sample in the batch.
+    """
+    _tc = int(target_channel)
+    _mh = int(model_horizon)
+    _fh = int(forecast_horizon)
+
+    def _value_fn(
+        model: ForecastModel,
+        x_enc: torch.Tensor,
+        input_mask: torch.Tensor,
+    ) -> Array:
+        forecast = _forecast_autoregressive(
+            model,
+            x_enc,
+            input_mask,
+            model_horizon=_mh,
+            target_horizon=_fh,
+        )  # [B, C, H]
+        return np.mean(np.abs(forecast[:, _tc, :]), axis=1).astype(np.float32)  # [B]
+
+    return _value_fn
