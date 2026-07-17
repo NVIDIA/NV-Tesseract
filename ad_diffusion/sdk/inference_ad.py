@@ -75,7 +75,13 @@ try:
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
-    ModelHubMixin = object  # fallback so class definition doesn't crash
+
+    class ModelHubMixin:  # type: ignore[no-redef]
+        """No-op fallback when huggingface_hub is not installed."""
+
+        def __init_subclass__(cls, **kwargs: object) -> None:
+            super().__init_subclass__()
+
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.main_model import TSDiffuser_Generic
@@ -879,6 +885,10 @@ def download_model_weights(
     config_path: str = DEFAULT_CONFIG_FILENAME,
     repo_id: str = HF_REPO_ID,
     force_download: bool = False,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+    token: str | bool | None = None,
 ) -> tuple[str, str]:
     """
     Auto-download AD Diffusion model weights from Hugging Face if they don't exist locally.
@@ -919,28 +929,24 @@ def download_model_weights(
 
     logger.info("Downloading AD Diffusion weights from Hugging Face (%s)...", repo_id)
 
-    # Use the shared parent dir, falling back to CWD when files live in different dirs
-    local_dir = str(model_file.parent) if model_file.parent == config_file.parent else "."
-    Path(local_dir).mkdir(parents=True, exist_ok=True)
-
-    # Only fetch what is actually missing
-    patterns = []
-    if force_download or not model_file.exists():
-        patterns.append(model_file.name)
-    if force_download or not config_file.exists():
-        patterns.append(config_file.name)
-
+    # Download each file to its own parent directory so returned paths always exist
     try:
-        if patterns:
-            logger.info("Downloading: %s", ", ".join(patterns))
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=local_dir,
-                allow_patterns=patterns,
-                force_download=force_download,
-                library_name="nv-tesseract",
-            )
-            logger.info("Downloaded: %s", ", ".join(patterns))
+        for file_path in (model_file, config_file):
+            if force_download or not file_path.exists():
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info("Downloading: %s", file_path.name)
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(file_path.parent),
+                    allow_patterns=[file_path.name],
+                    force_download=force_download,
+                    revision=revision,
+                    cache_dir=str(cache_dir) if cache_dir else None,
+                    local_files_only=local_files_only,
+                    token=token,
+                    library_name="nv-tesseract",
+                )
+                logger.info("Downloaded: %s", file_path.name)
 
     except Exception as e:
         error_msg = f"Failed to download model weights from {repo_id}: {e}"
@@ -1316,18 +1322,30 @@ class NVTesseractADDiffusion(
         cls,
         *,
         model_id: str,
-        revision: str | None,  # noqa: ARG003
-        cache_dir: str | Path | None,  # noqa: ARG003
+        revision: str | None,
+        cache_dir: str | Path | None,
         force_download: bool,
-        local_files_only: bool,  # noqa: ARG003
-        token: str | bool | None,  # noqa: ARG003
+        local_files_only: bool,
+        token: str | bool | None,
         **model_kwargs,
     ) -> "NVTesseractADDiffusion":
+        model_name = model_kwargs.get("model_path", DEFAULT_MODEL_FILENAME)
+        config_name = model_kwargs.get("config_path", DEFAULT_CONFIG_FILENAME)
+        local_path = Path(model_id)
+        if local_path.is_dir():
+            return cls(
+                model_path=str(local_path / model_name),
+                config_path=str(local_path / config_name),
+            )
         model_path, config_path = download_model_weights(
-            model_path=model_kwargs.get("model_path", DEFAULT_MODEL_FILENAME),
-            config_path=model_kwargs.get("config_path", DEFAULT_CONFIG_FILENAME),
+            model_path=model_name,
+            config_path=config_name,
             repo_id=model_id,
             force_download=force_download,
+            revision=revision,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            token=token,
         )
         return cls(model_path=model_path, config_path=config_path)
 

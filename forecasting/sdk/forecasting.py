@@ -23,7 +23,13 @@ try:
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
-    ModelHubMixin = object  # fallback so class definition doesn't crash
+
+    class ModelHubMixin:  # type: ignore[no-redef]
+        """No-op fallback when huggingface_hub is not installed."""
+
+        def __init_subclass__(cls, **kwargs: object) -> None:
+            super().__init_subclass__()
+
 
 # Clean absolute imports - package is installed in editable mode
 from backbone.utils.utils import control_randomness
@@ -166,6 +172,10 @@ def download_model_weights(
     ckpt: str = DEFAULT_CHECKPOINT_NAME,
     repo_id: str = "nvidia/nv-tesseract-forecasting",
     force_download: bool = False,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+    token: str | bool | None = None,
 ) -> tuple[str, str]:
     """
     Auto-download model weights from Hugging Face if they don't exist locally.
@@ -206,28 +216,24 @@ def download_model_weights(
 
     logger.info("Downloading model weights from Hugging Face...")
 
-    # Use the shared parent dir, falling back to CWD when files live in different dirs
-    local_dir = str(standardizer_path.parent) if standardizer_path.parent == checkpoint_path.parent else "."
-    Path(local_dir).mkdir(parents=True, exist_ok=True)
-
-    # Only fetch what is actually missing
-    patterns = []
-    if force_download or not standardizer_path.exists():
-        patterns.append(standardizer_path.name)
-    if force_download or not checkpoint_path.exists():
-        patterns.append(checkpoint_path.name)
-
+    # Download each file to its own parent directory so returned paths always exist
     try:
-        if patterns:
-            logger.info("Downloading: %s", ", ".join(patterns))
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=local_dir,
-                allow_patterns=patterns,
-                force_download=force_download,
-                library_name="nv-tesseract",
-            )
-            logger.info("Downloaded: %s", ", ".join(patterns))
+        for file_path in (standardizer_path, checkpoint_path):
+            if force_download or not file_path.exists():
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info("Downloading: %s", file_path.name)
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(file_path.parent),
+                    allow_patterns=[file_path.name],
+                    force_download=force_download,
+                    revision=revision,
+                    cache_dir=str(cache_dir) if cache_dir else None,
+                    local_files_only=local_files_only,
+                    token=token,
+                    library_name="nv-tesseract",
+                )
+                logger.info("Downloaded: %s", file_path.name)
 
     except Exception as e:
         error_msg = f"Failed to download model weights: {e}"
@@ -2222,18 +2228,30 @@ class NVTesseractForecasting(
         cls,
         *,
         model_id: str,
-        revision: str | None,  # noqa: ARG003
-        cache_dir: str | Path | None,  # noqa: ARG003
+        revision: str | None,
+        cache_dir: str | Path | None,
         force_download: bool,
-        local_files_only: bool,  # noqa: ARG003
-        token: str | bool | None,  # noqa: ARG003
+        local_files_only: bool,
+        token: str | bool | None,
         **model_kwargs,
     ) -> "NVTesseractForecasting":
+        standardizer_name = model_kwargs.get("standardizer_pkl", "standardizer.pkl")
+        ckpt_name = model_kwargs.get("ckpt", DEFAULT_CHECKPOINT_NAME)
+        local_path = Path(model_id)
+        if local_path.is_dir():
+            return cls(
+                standardizer_pkl=str(local_path / standardizer_name),
+                ckpt=str(local_path / ckpt_name),
+            )
         standardizer_pkl, ckpt = download_model_weights(
-            standardizer_pkl=model_kwargs.get("standardizer_pkl", "standardizer.pkl"),
-            ckpt=model_kwargs.get("ckpt", DEFAULT_CHECKPOINT_NAME),
+            standardizer_pkl=standardizer_name,
+            ckpt=ckpt_name,
             repo_id=model_id,
             force_download=force_download,
+            revision=revision,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            token=token,
         )
         return cls(standardizer_pkl=standardizer_pkl, ckpt=ckpt)
 
