@@ -1561,8 +1561,8 @@ def explain_forecast(
             input_mask_t=mask_ext,
             device=device,
             cfg=chan_cfg_eff,
-            value_fn=chan_value_fn,
-            protect_channels=chan_protect,
+            # value_fn=chan_value_fn,
+            # protect_channels=chan_protect,
         )
         per_chan_flow = report.per_channel_flow
         chan_method = report.method
