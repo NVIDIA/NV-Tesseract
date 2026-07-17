@@ -54,7 +54,7 @@ These reductions are codified in the unit tests under ``tests/``.
 
 from dataclasses import dataclass
 from itertools import combinations
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 import numpy as np
 import torch
@@ -294,6 +294,48 @@ def _embed_windows_batched(
     return z
 
 
+ValueFn = Callable[..., Array]
+
+
+def make_target_forecast_value_fn(
+    *,
+    target_channel: int,
+    model_horizon: int,
+    forecast_horizon: int,
+) -> ValueFn:
+    """Build a channel-flow value function over the target forecast."""
+    from interpretability import _forecast_autoregressive
+
+    def _value_fn(model, windows, masks, *, device, batch_size) -> Array:
+        n = int(windows.shape[0])
+        if n == 0:
+            return np.zeros((0, int(forecast_horizon)), dtype=np.float32)
+        out_chunks: list[Array] = []
+        for i in range(0, n, int(batch_size)):
+            xb = torch.from_numpy(np.ascontiguousarray(windows[i : i + int(batch_size)])).to(
+                device=device,
+                dtype=torch.float32,
+            )
+            mb = torch.from_numpy(np.ascontiguousarray(masks[i : i + int(batch_size)])).to(
+                device=device,
+                dtype=torch.long,
+            )
+            forecast = _forecast_autoregressive(
+                model,
+                xb,
+                mb,
+                model_horizon=int(model_horizon),
+                target_horizon=int(forecast_horizon),
+            )
+            out_chunks.append(np.asarray(forecast[:, int(target_channel), :], dtype=np.float32))
+        values = np.concatenate(out_chunks, axis=0)
+        if np.any(~np.isfinite(values)):
+            values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        return values
+
+    return _value_fn
+
+
 # ---------------------------------------------------------------------------
 # Variant A: Jacobian-flow (fast, first-order)
 # ---------------------------------------------------------------------------
@@ -308,6 +350,7 @@ def compute_per_channel_flow_jacobian(
     input_mask_t: Array | None = None,
     device: torch.device,
     cfg: ChannelFlowConfig | None = None,
+    value_fn: ValueFn | None = None,
 ) -> ChannelFlowReport:
     """First-order per-channel decomposition of latent flow.
 
@@ -332,6 +375,7 @@ def compute_per_channel_flow_jacobian(
     cfg = cfg or ChannelFlowConfig(method="jacobian")
     if cfg.method != "jacobian":
         raise ValueError(f"compute_per_channel_flow_jacobian requires method='jacobian', got {cfg.method!r}")
+    vf = value_fn if value_fn is not None else _embed_windows_batched
 
     xw_view, m_view, T = _rolling_window_sources(series_ct, seq_len=seq_len, input_mask_t=input_mask_t)
     if T < 2:
@@ -396,13 +440,13 @@ def compute_per_channel_flow_jacobian(
         flat_stack = stack.reshape(m_chunk * probes_per_trans, C, L)
         flat_masks = masks_full.reshape(m_chunk * probes_per_trans, L)
 
-        z_flat = _embed_windows_batched(
+        z_flat = vf(
             model,
             flat_stack,
             flat_masks,
             device=device,
             batch_size=int(cfg.batch_size),
-        )  # [m * probes_per_trans, D]
+        )  # [m * probes_per_trans, Dv]
         D = int(z_flat.shape[1])
         z = z_flat.reshape(m_chunk, probes_per_trans, D)
 
@@ -498,57 +542,79 @@ def _kernelshap_from_v(
     n_samples: int,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Approximate Shapley values via KernelSHAP weighted least squares.
+    """Approximate Shapley values via constrained KernelSHAP regression.
 
     Solves:
         min_phi  sum_S w_S (v(S) - v(empty) - phi.T @ z_S)^2
         s.t.     sum_c phi_c = v(full) - v(empty)
     """
+    del n_samples, rng
+    coalitions = sorted(v, key=lambda s: (len(s), s))
+    values = np.asarray([v[S] for S in coalitions], dtype=np.float64)
+    return _kernelshap_from_values(coalitions, values, C=C)
+
+
+def _kernelshap_from_values(
+    coalitions: Sequence[tuple[int, ...]],
+    values: np.ndarray,
+    *,
+    C: int,
+) -> np.ndarray:
+    """Constrained KernelSHAP for one or many outputs."""
+    coalition_list = [tuple(int(c) for c in S) for S in coalitions]
+    vals = np.asarray(values, dtype=np.float64)
+    if vals.ndim < 1 or vals.shape[0] != len(coalition_list):
+        raise ValueError(
+            "values must have one leading row per coalition; "
+            f"got values.shape={vals.shape}, n_coalitions={len(coalition_list)}"
+        )
+    if C < 1:
+        raise ValueError(f"C must be positive, got {C}")
+
+    try:
+        empty_idx = coalition_list.index(())
+        full_idx = coalition_list.index(tuple(range(C)))
+    except ValueError as exc:
+        raise ValueError("KernelSHAP requires both empty and full coalitions") from exc
+
+    trailing_shape = vals.shape[1:]
+    flat = vals.reshape(vals.shape[0], -1)
+    v_empty = flat[empty_idx]
+    total_effect = flat[full_idx] - v_empty
     if C == 1:
-        return np.array([v[(0,)] - v[()]], dtype=np.float32)
-    v_empty = float(v[()])
-    v_full = float(v[tuple(range(C))])
+        return total_effect.reshape((1, *trailing_shape)).astype(np.float32)
 
-    # Sample coalitions (excluding empty and full, which act as constraints).
-    sizes = np.arange(1, C, dtype=np.int64)
-    p_sizes = np.array([_kernelshap_weight(C, int(s)) for s in sizes], dtype=np.float64)
-    p_sizes = p_sizes / p_sizes.sum()
+    interior = [(i, S) for i, S in enumerate(coalition_list) if 0 < len(S) < C]
+    if not interior:
+        uniform = np.broadcast_to(total_effect[None, :] / C, (C, total_effect.size)).copy()
+        return uniform.reshape((C, *trailing_shape)).astype(np.float32)
 
-    z_rows: list[np.ndarray] = []
-    targets: list[float] = []
-    weights: list[float] = []
-    seen: set[tuple[int, ...]] = set()
-    n_target = max(1, int(n_samples))
-    n_attempts = 0
-    while len(z_rows) < n_target and n_attempts < n_target * 5:
-        n_attempts += 1
-        size = int(rng.choice(sizes, p=p_sizes))
-        S = tuple(sorted(rng.choice(C, size=size, replace=False).tolist()))
-        if S in seen or S not in v:
-            continue
-        seen.add(S)
-        z = np.zeros((C,), dtype=np.float64)
-        z[list(S)] = 1.0
-        z_rows.append(z)
-        targets.append(float(v[S]) - v_empty)
-        weights.append(_kernelshap_weight(C, size))
-    if not z_rows:
-        # Degenerate fall back: split v(full) - v(empty) uniformly.
-        return np.full((C,), (v_full - v_empty) / C, dtype=np.float32)
+    size_counts: dict[int, int] = {}
+    for _, S in interior:
+        size_counts[len(S)] = size_counts.get(len(S), 0) + 1
 
-    Z = np.stack(z_rows, axis=0).astype(np.float64)
-    y = np.asarray(targets, dtype=np.float64)
-    w = np.sqrt(np.asarray(weights, dtype=np.float64))
-    Zw = Z * w[:, None]
-    yw = y * w
+    Z = np.zeros((len(interior), C), dtype=np.float64)
+    y = np.empty((len(interior), flat.shape[1]), dtype=np.float64)
+    w = np.empty((len(interior),), dtype=np.float64)
+    for row, (value_idx, S) in enumerate(interior):
+        size = len(S)
+        Z[row, list(S)] = 1.0
+        y[row] = flat[value_idx] - v_empty
+        size_mass = (C - 1) / (size * (C - size))
+        w[row] = size_mass / size_counts[size]
 
-    # Solve constrained least squares via projection onto the affine subspace
-    # { phi : 1^T phi = v_full - v_empty }. Project the unconstrained solution
-    # back to the constraint plane.
-    sol_unconstrained, *_ = np.linalg.lstsq(Zw, yw, rcond=None)
-    correction = (v_full - v_empty) - sol_unconstrained.sum()
-    phi = sol_unconstrained + correction / float(C)
-    return phi.astype(np.float32)
+    gram = Z.T @ (w[:, None] * Z)
+    rhs = Z.T @ (w[:, None] * y)
+    ridge = max(1e-12, 1e-10 * float(np.trace(gram)) / max(1, C))
+    gram = gram + ridge * np.eye(C, dtype=np.float64)
+    ones = np.ones((C, 1), dtype=np.float64)
+    kkt = np.block([[gram, ones], [ones.T, np.zeros((1, 1), dtype=np.float64)]])
+    target = np.concatenate([rhs, total_effect[None, :]], axis=0)
+    try:
+        sol = np.linalg.solve(kkt, target)
+    except np.linalg.LinAlgError:
+        sol, *_ = np.linalg.lstsq(kkt, target, rcond=None)
+    return sol[:C].reshape((C, *trailing_shape)).astype(np.float32)
 
 
 def _build_step_coalition_set(
@@ -575,20 +641,40 @@ def _build_step_coalition_set(
     coalitions.add(tuple(range(C)))
     for c in range(C):
         coalitions.add((c,))
+        coalitions.add(tuple(i for i in range(C) if i != c))
     if include_pairs:
         for pair in combinations(range(C), 2):
             coalitions.add(pair)
     sizes = np.arange(1, C, dtype=np.int64)
     if sizes.size:
-        p_sizes = np.array([_kernelshap_weight(C, int(s)) for s in sizes], dtype=np.float64)
-        p_sizes = p_sizes / p_sizes.sum() if p_sizes.sum() > 0 else None
+        target_total = max(len(coalitions), int(n_samples))
+        represented_sizes = {len(coalition) for coalition in coalitions}
+        for size in range(2, (C // 2) + 1):
+            complement_size = C - size
+            needed = int(size not in represented_sizes) + int(
+                complement_size not in represented_sizes and complement_size != size
+            )
+            if needed == 0 or len(coalitions) + needed > target_total:
+                continue
+            coalition = tuple(sorted(rng.choice(C, size=size, replace=False).tolist()))
+            complement = tuple(i for i in range(C) if i not in set(coalition))
+            coalitions.add(coalition)
+            if complement_size != size:
+                coalitions.add(complement)
+            represented_sizes.add(size)
+            represented_sizes.add(complement_size)
+
+        p_sizes = 1.0 / (sizes.astype(np.float64) * (C - sizes).astype(np.float64))
+        p_sizes = p_sizes / p_sizes.sum()
         attempts = 0
-        max_attempts = max(int(n_samples) * 5, int(n_samples) + 32)
-        while len(coalitions) < int(n_samples) + 2 + C and attempts < max_attempts:
+        max_attempts = max(target_total * 20, target_total + 64)
+        while len(coalitions) < target_total and attempts < max_attempts:
             attempts += 1
             size = int(rng.choice(sizes, p=p_sizes))
             S = tuple(sorted(rng.choice(C, size=size, replace=False).tolist()))
             coalitions.add(S)
+            if len(coalitions) < target_total:
+                coalitions.add(tuple(i for i in range(C) if i not in set(S)))
     # Stable ordering by (size, lex) so that batches are deterministic.
     return sorted(coalitions, key=lambda s: (len(s), s))
 
@@ -602,6 +688,8 @@ def compute_per_channel_flow_shapley(
     input_mask_t: Array | None = None,
     device: torch.device,
     cfg: ChannelFlowConfig | None = None,
+    value_fn: ValueFn | None = None,
+    protect_channels: Sequence[int] | None = None,
     _per_transition_rng: bool = False,
 ) -> ChannelFlowReport:
     """Axiomatic Shapley decomposition of latent flow.
@@ -647,6 +735,7 @@ def compute_per_channel_flow_shapley(
     cfg = cfg or ChannelFlowConfig(method="shapley")
     if cfg.method != "shapley":
         raise ValueError(f"compute_per_channel_flow_shapley requires method='shapley', got {cfg.method!r}")
+    vf = value_fn if value_fn is not None else _embed_windows_batched
 
     xw_view, m_view, T = _rolling_window_sources(series_ct, seq_len=seq_len, input_mask_t=input_mask_t)
     if T < 2:
@@ -656,16 +745,24 @@ def compute_per_channel_flow_shapley(
     C = int(np.asarray(series_ct).shape[0])
     L = int(seq_len)
     rng = np.random.default_rng(int(cfg.seed))
-    use_exact = int(cfg.shapley_max_exact_c) >= C
+
+    protect = tuple(sorted({int(p) for p in (protect_channels or ()) if 0 <= int(p) < C}))
+    free = [c for c in range(C) if c not in set(protect)]
+    n_free = len(free)
+    if n_free < 1:
+        raise ValueError("compute_per_channel_flow_shapley: all channels protected leaves no coalition game")
+    compute_coupling = bool(cfg.compute_coupling) and not protect
+
+    use_exact = int(cfg.shapley_max_exact_c) >= n_free
     method_label = "exact" if use_exact else "kernel"
-    n_samples = int(cfg.shapley_n_samples) if cfg.shapley_n_samples is not None else (2 * C + 256)
+    n_samples = int(cfg.shapley_n_samples) if cfg.shapley_n_samples is not None else (2 * n_free + 256)
 
     coalitions = _build_step_coalition_set(
-        C,
+        n_free,
         method=method_label,
         n_samples=n_samples,
         rng=rng,
-        include_pairs=bool(cfg.compute_coupling) and not use_exact,
+        include_pairs=compute_coupling and not use_exact,
     )
     coalition_idx = {S: i for i, S in enumerate(coalitions)}
 
@@ -692,9 +789,11 @@ def compute_per_channel_flow_shapley(
     # composition step (we just blend ``baseline`` and ``window`` according
     # to the channel's coalition membership).
     coal_mask = np.zeros((n_coal, C), dtype=bool)
+    if protect:
+        coal_mask[:, list(protect)] = True
     for i, S in enumerate(coalitions):
         if S:
-            coal_mask[i, list(S)] = True
+            coal_mask[i, [free[j] for j in S]] = True
     coal_keep = coal_mask.astype(np.float32)[:, :, None]  # [n_coal, C, 1]
     coal_drop = (1.0 - coal_keep).astype(np.float32)  # [n_coal, C, 1]
     nonempty_coal = coal_mask.any(axis=1)  # [n_coal] -- True iff S != empty
@@ -759,24 +858,25 @@ def compute_per_channel_flow_shapley(
         flat_stack = stack.reshape(m_chunk * 2 * n_coal, C, L)
         flat_masks = masks.reshape(m_chunk * 2 * n_coal, L)
 
-        z_flat = _embed_windows_batched(
+        z_flat = vf(
             model,
             flat_stack,
             flat_masks,
             device=device,
             batch_size=int(cfg.batch_size),
-        )  # [m * 2 * n_coal, D]
+        )  # [m * 2 * n_coal, Dv]
         D = int(z_flat.shape[1])
         z = z_flat.reshape(m_chunk, 2 * n_coal, D)
         z_a = z[:, 0::2, :]  # [m, n_coal, D]
         z_b = z[:, 1::2, :]  # [m, n_coal, D]
-        v_vals_chunk = np.linalg.norm(z_b - z_a, ord=2, axis=2).astype(np.float64)  # [m, n_coal]
+        delta_z_chunk = (z_b - z_a).astype(np.float64)  # [m, n_coal, D]
+        v_vals_chunk = np.linalg.norm(delta_z_chunk, ord=2, axis=2)  # [m, n_coal]
 
         for k, tau in enumerate(chunk):
             v_vals = v_vals_chunk[k]
             v: dict[tuple[int, ...], float] = {S: float(v_vals[coalition_idx[S]]) for S in coalitions}
             if use_exact:
-                phi_tau = _exact_shapley_from_v(v, C=C)
+                phi_free = _exact_shapley_from_v(v, C=n_free)
             else:
                 # Per-transition RNG: pin the kernel-Shapley sampler to a
                 # deterministic state derived from (seed, tau) so that the
@@ -785,24 +885,29 @@ def compute_per_channel_flow_shapley(
                 # This is what makes sharded execution produce identical
                 # results regardless of how many workers we split across.
                 rng_for_tau = np.random.default_rng((int(cfg.seed), int(tau))) if _per_transition_rng else rng
-                phi_tau = _kernelshap_from_v(
+                phi_free = _kernelshap_from_v(
                     v,
-                    C=C,
+                    C=n_free,
                     n_samples=n_samples,
                     rng=rng_for_tau,
                 )
+            phi_tau = np.zeros((C,), dtype=np.float32)
+            for j, c in enumerate(free):
+                phi_tau[c] = float(phi_free[j])
             phi[int(tau)] = phi_tau
-            flow_total[int(tau)] = float(v[tuple(range(C))])
+            flow_total[int(tau)] = float(v[tuple(range(n_free))])
 
-            if cfg.compute_coupling:
-                v_empty = float(v.get((), 0.0))
-                singletons = {c: float(v.get((c,), 0.0)) for c in range(C)}
+            if compute_coupling:
+                delta_z = delta_z_chunk[k]
+                d_empty = delta_z[coalition_idx[()]]
+                singletons = {c: delta_z[coalition_idx[(c,)]] for c in range(C)}
                 for c1, c2 in combinations(range(C), 2):
                     pair_key = (c1, c2)
-                    v_pair = v.get(pair_key)
-                    if v_pair is None:
+                    pair_idx = coalition_idx.get(pair_key)
+                    if pair_idx is None:
                         continue
-                    g = abs(float(v_pair) - singletons[c1] - singletons[c2] + v_empty)
+                    interaction = delta_z[pair_idx] - singletons[c1] - singletons[c2] + d_empty
+                    g = float(np.linalg.norm(interaction, ord=2))
                     coupling_acc[c1, c2] += g
                     coupling_acc[c2, c1] += g
                 coupling_n += 1
@@ -811,7 +916,7 @@ def compute_per_channel_flow_shapley(
     coupling_off_diag = None
     coupling_partial_sum: np.ndarray | None = None
     coupling_partial_n = 0
-    if cfg.compute_coupling and coupling_n > 0:
+    if compute_coupling and coupling_n > 0:
         if cfg.coupling_aggregation == "mean":
             coupling_matrix = (coupling_acc / float(coupling_n)).astype(np.float32)
         elif cfg.coupling_aggregation == "sum":
@@ -849,6 +954,8 @@ def compute_per_channel_flow(
     input_mask_t: Array | None = None,
     device: torch.device,
     cfg: ChannelFlowConfig | None = None,
+    value_fn: ValueFn | None = None,
+    protect_channels: Sequence[int] | None = None,
 ) -> ChannelFlowReport:
     """Dispatch to the configured per-channel flow estimator."""
     cfg = cfg or ChannelFlowConfig()
@@ -860,6 +967,7 @@ def compute_per_channel_flow(
             input_mask_t=input_mask_t,
             device=device,
             cfg=cfg,
+            value_fn=value_fn,
         )
     if cfg.method == "shapley":
         return compute_per_channel_flow_shapley(
@@ -869,6 +977,8 @@ def compute_per_channel_flow(
             input_mask_t=input_mask_t,
             device=device,
             cfg=cfg,
+            value_fn=value_fn,
+            protect_channels=protect_channels,
         )
     raise ValueError(f"Unsupported ChannelFlowConfig.method={cfg.method!r}")
 

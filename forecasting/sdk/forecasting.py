@@ -26,6 +26,7 @@ except ImportError:
 
 # Clean absolute imports - package is installed in editable mode
 from backbone.utils.utils import control_randomness
+
 from dataset_longhorizon import (
     CSVLongHorizonSimpleDataset,
     Standardizer,
@@ -769,7 +770,7 @@ def _semantic_flow_page(
         color="gray",
     )
 
-    ax = fig.add_axes((0.08, 0.52, 0.84, 0.26))
+    ax = fig.add_axes((0.08, 0.57, 0.84, 0.23))
     x_axis = np.arange(T_trans)
     ax.plot(x_axis, flow, linewidth=1.0, color="#1f77b4", label="flow magnitude")
     if 0 < boundary < T_trans:
@@ -810,7 +811,7 @@ def _semantic_flow_page(
         ["Variance", hist_s[4], fcst_s[4]],
         ["Transitions", hist_s[5], fcst_s[5]],
     ]
-    ax_t1 = fig.add_axes((0.06, 0.32, 0.42, 0.18))
+    ax_t1 = fig.add_axes((0.06, 0.34, 0.42, 0.15))
     ax_t1.axis("off")
     table_seg = ax_t1.table(
         cellText=seg_rows,
@@ -821,7 +822,7 @@ def _semantic_flow_page(
     )
     table_seg.auto_set_font_size(False)
     table_seg.set_fontsize(8)
-    table_seg.scale(1.0, 1.3)
+    table_seg.scale(1.0, 1.2)
     for c in range(3):
         cell = table_seg[(0, c)]
         cell.set_facecolor("#dddddd")
@@ -849,7 +850,7 @@ def _semantic_flow_page(
             "~1 healthy, >>1 OOD shift",
         ],
     ]
-    ax_t2 = fig.add_axes((0.52, 0.32, 0.42, 0.18))
+    ax_t2 = fig.add_axes((0.52, 0.34, 0.42, 0.15))
     ax_t2.axis("off")
     table_diag = ax_t2.table(
         cellText=diag_rows,
@@ -860,7 +861,7 @@ def _semantic_flow_page(
     )
     table_diag.auto_set_font_size(False)
     table_diag.set_fontsize(8)
-    table_diag.scale(1.0, 1.3)
+    table_diag.scale(1.0, 1.2)
     for c in range(3):
         cell = table_diag[(0, c)]
         cell.set_facecolor("#dddddd")
@@ -902,6 +903,416 @@ def _semantic_flow_page(
     plt.close(fig)
 
 
+def _save_channel_axis_artifacts(
+    out_dir: Path,
+    channel_horizon_attributions: np.ndarray,
+    channel_labels: list[str] | None = None,
+    *,
+    na_rep: str = "nan",
+) -> Path | None:
+    """Write the [C, H] channel x horizon attribution CSV and a heatmap PNG.
+
+    Returns the path to the heatmap PNG if matplotlib is available, else None.
+    """
+    A = np.asarray(channel_horizon_attributions, dtype=np.float32)
+    if A.ndim != 2:
+        return None
+    C, H = A.shape
+    labels = channel_labels if (channel_labels and len(channel_labels) == C) else [f"channel_{c}" for c in range(C)]
+
+    df = pd.DataFrame(A, columns=[f"horizon_{h}" for h in range(H)])
+    df.insert(0, "channel", labels)
+    df.to_csv(out_dir / "channel_horizon_attributions.csv", index=False, na_rep=na_rep)
+
+    try:
+        import matplotlib as mpl
+
+        mpl.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    fig, ax = plt.subplots(figsize=(max(8, H * 0.15), max(4, C * 0.4)))
+    im = ax.imshow(A, aspect="auto", cmap="viridis", interpolation="nearest")
+    ax.set_xlabel("Forecast horizon")
+    ax.set_ylabel("Input channel")
+    ax.set_yticks(range(C))
+    ax.set_yticklabels(labels, fontsize=8)
+    xt = np.linspace(0, H - 1, min(12, H), dtype=int)
+    ax.set_xticks(xt)
+    ax.set_xticklabels(xt)
+    plt.colorbar(im, ax=ax, label="Attribution")
+    plt.tight_layout()
+    heatmap_path = out_dir / "channel_horizon_heatmap.png"
+    plt.savefig(heatmap_path, dpi=120)
+    plt.close(fig)
+    return heatmap_path
+
+
+def _channel_axis_page(
+    pdf: Any,
+    plt: Any,
+    *,
+    explanation: ForecastExplanation,
+    channel_labels: list[str] | None = None,
+) -> None:
+    """Append one PDF page for the feature-axis (channel x horizon) attribution.
+
+    Primary visual: a [C, H] heatmap of how much each input channel contributes to
+    each forecast step. A side bar summarizes each channel's total attribution
+    (summed over horizons) as a single feature-importance score.
+    """
+    A = getattr(explanation, "channel_horizon_attributions", None)
+    if A is None:
+        return
+    A = np.asarray(A, dtype=np.float32)
+    if A.ndim != 2 or A.shape[0] < 1 or A.shape[1] < 1:
+        return
+    C, H = A.shape
+    labels = channel_labels if (channel_labels and len(channel_labels) == C) else [f"channel_{c}" for c in range(C)]
+    importance = A.sum(axis=1)
+    method = getattr(explanation, "channel_flow_method", None) or "jacobian"
+    resid = getattr(explanation, "channel_flow_residual_ratio_mean", None)
+    target_jacobian = method == "target_input_jacobian"
+    intro = (
+        "Which input channel drives each target forecast step. Each cell is the magnitude of\n"
+        "the target forecast's local directional response when that channel moves from its\n"
+        "local-mean replacement to the observed input. Rows are channels and columns are\n"
+        "forecast steps; brighter = a stronger target-specific effect."
+        if target_jacobian
+        else "Which input channel (feature) drives each forecast step. The model's response is\n"
+        "decomposed along the feature axis into per-channel contributions, then aggregated\n"
+        "per horizon. Rows are input channels, columns are forecast steps; brighter = that\n"
+        "channel matters more there."
+    )
+
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.text(
+        0.5,
+        0.95,
+        "Feature-axis attribution (channel x horizon)",
+        ha="center",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.text(
+        0.06,
+        0.90,
+        intro,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="gray",
+    )
+
+    ax = fig.add_axes((0.08, 0.40, 0.56, 0.42))
+    im = ax.imshow(A, aspect="auto", cmap="viridis", interpolation="nearest")
+    ax.set_xlabel("Forecast horizon (0 = first predicted step)")
+    ax.set_ylabel("Input channel")
+    ax.set_yticks(range(C))
+    ax.set_yticklabels(labels, fontsize=8)
+    xt = np.linspace(0, H - 1, min(12, H), dtype=int)
+    ax.set_xticks(xt)
+    ax.set_xticklabels(xt)
+    fig.colorbar(
+        im,
+        ax=ax,
+        fraction=0.046,
+        pad=0.04,
+        label="Directional effect" if target_jacobian else "Attribution",
+    )
+
+    axb = fig.add_axes((0.72, 0.40, 0.22, 0.42))
+    y = np.arange(C)
+    axb.barh(y, importance, color="#1f77b4")
+    axb.set_yticks(y)
+    axb.set_yticklabels([])
+    axb.invert_yaxis()  # channel 0 at top, aligned with the heatmap rows
+    axb.set_title("Channel importance\n(sum over horizons)", fontsize=9)
+    axb.set_xlabel("Total effect" if target_jacobian else "Total attribution", fontsize=8)
+    axb.tick_params(axis="both", labelsize=7)
+
+    top_c = int(np.argmax(importance))
+    resid_line = (
+        f"  - Estimator: {method}. Jacobian trust ratio (mean residual): {resid:.3f}\n"
+        "    (lower = more reliable first-order split; high values flag strong\n"
+        "    cross-channel interaction the first-order decomposition cannot capture).\n"
+        if resid is not None
+        else f"  - Estimator: {method}.\n"
+    )
+    heatmap_note = (
+        "  - Heatmap cell (channel c, horizon h): magnitude of the target forecast's\n"
+        "    first-order directional replacement effect; columns are not normalized.\n"
+        if target_jacobian
+        else "  - Heatmap cell (channel c, horizon h): share of the forecast at step h\n"
+        "    attributable to input channel c (each horizon column sums to 1 over channels).\n"
+    )
+    bar_note = "total effect" if target_jacobian else "total attribution"
+    note = (
+        "How to read this page\n"
+        "---------------------\n"
+        + heatmap_note
+        + f"  - Right bar: each channel's {bar_note} summed across horizons -- a single\n"
+        "    feature-importance score per input channel.\n"
+        f"  - Most influential channel overall: {labels[top_c]}.\n" + resid_line + "\n"
+        "Full [C x H] values are exported as channel_horizon_attributions.csv."
+    )
+    fig.text(
+        0.06,
+        0.30,
+        note,
+        ha="left",
+        va="top",
+        fontsize=9,
+        family="monospace",
+        color="#333333",
+        linespacing=1.05,
+    )
+
+    pdf.savefig(fig)
+
+
+def _compute_integrated_gradients_report(
+    *,
+    model: torch.nn.Module,
+    x_context_ct: np.ndarray,
+    input_mask_l: np.ndarray,
+    device: torch.device,
+    channel_labels: list[str],
+    baseline: Any,
+    n_steps: int,
+    n_baselines: int,
+    internal_batch_size: int | None,
+    reduce: str,
+    seed: int,
+    grad_through_norm: bool,
+) -> dict[str, Any]:
+    """Run embedding integrated gradients for the current SDK context window."""
+    from integrated_gradients import (
+        integrated_gradients_embedding,
+        moment_embed_fn,
+    )
+
+    x_tensor = torch.as_tensor(np.asarray(x_context_ct, dtype=np.float32), device=device)
+    input_mask = torch.as_tensor(np.asarray(input_mask_l, dtype=np.int64), device=device)
+    embed_fn = moment_embed_fn(model, input_mask=input_mask, grad_through_norm=grad_through_norm)
+
+    attribution = integrated_gradients_embedding(
+        embed_fn,
+        x_tensor,
+        baseline=baseline,
+        n_steps=n_steps,
+        n_baselines=n_baselines,
+        internal_batch_size=internal_batch_size,
+        reduce=reduce,
+        seed=seed,
+        device=device,
+    )
+
+    A = np.asarray(attribution.attribution, dtype=np.float32)
+    if A.ndim != 2:
+        raise ValueError(f"integrated gradients attribution must be [C, L], got shape {A.shape}")
+
+    C, _ = A.shape
+    labels = channel_labels if len(channel_labels) == C else [f"channel_{c}" for c in range(C)]
+    abs_A = np.abs(A)
+    channel_abs_effect = abs_A.sum(axis=1).astype(np.float32)
+    channel_signed_effect = A.sum(axis=1).astype(np.float32)
+    total_abs = float(channel_abs_effect.sum())
+    channel_abs_share = (
+        (channel_abs_effect / total_abs).astype(np.float32)
+        if total_abs > 1e-12
+        else np.zeros_like(channel_abs_effect, dtype=np.float32)
+    )
+    time_abs_effect = abs_A.sum(axis=0).astype(np.float32)
+    top_order = np.argsort(-channel_abs_effect)[: min(10, C)]
+
+    return {
+        "attribution": A,
+        "channel_labels": labels,
+        "channel_abs_effect": channel_abs_effect,
+        "channel_signed_effect": channel_signed_effect,
+        "channel_abs_share": channel_abs_share,
+        "time_abs_effect": time_abs_effect,
+        "top_channels": [
+            {
+                "channel": labels[int(i)],
+                "abs_effect": float(channel_abs_effect[int(i)]),
+                "signed_effect": float(channel_signed_effect[int(i)]),
+                "abs_share": float(channel_abs_share[int(i)]),
+            }
+            for i in top_order
+        ],
+        "overall_effect": float(attribution.overall_effect),
+        "abs_effect": float(attribution.abs_effect),
+        "embedding_delta": float(attribution.embedding_delta),
+        "embedding_delta_abs_mean": float(attribution.embedding_delta_abs_mean),
+        "convergence_delta": float(attribution.convergence_delta),
+        "n_steps": int(attribution.n_steps),
+        "n_baselines": int(attribution.n_baselines),
+        "baseline": str(attribution.baseline),
+        "reduce": str(attribution.reduce),
+        "embedding_dim": int(attribution.embedding_dim),
+        "grad_through_norm": bool(grad_through_norm),
+    }
+
+
+def _save_integrated_gradients_artifacts(
+    out_dir: Path,
+    integrated_gradients_report: dict[str, Any],
+    *,
+    na_rep: str = "nan",
+) -> Path | None:
+    """Write integrated-gradients CSVs and a signed heatmap PNG."""
+    A = np.asarray(integrated_gradients_report.get("attribution"), dtype=np.float32)
+    if A.ndim != 2:
+        return None
+    C, L = A.shape
+    labels = integrated_gradients_report.get("channel_labels")
+    labels = labels if isinstance(labels, list) and len(labels) == C else [f"channel_{c}" for c in range(C)]
+
+    df_matrix = pd.DataFrame(A.T, columns=labels)
+    df_matrix.insert(0, "lag_from_last", np.arange(L - 1, -1, -1, dtype=int))
+    df_matrix.insert(0, "context_index", np.arange(L, dtype=int))
+    df_matrix.to_csv(out_dir / "integrated_gradients_attributions.csv", index=False, na_rep=na_rep)
+
+    summary = pd.DataFrame(
+        {
+            "channel": labels,
+            "signed_effect": np.asarray(integrated_gradients_report["channel_signed_effect"], dtype=np.float32),
+            "abs_effect": np.asarray(integrated_gradients_report["channel_abs_effect"], dtype=np.float32),
+            "abs_share": np.asarray(integrated_gradients_report["channel_abs_share"], dtype=np.float32),
+        }
+    )
+    summary.to_csv(out_dir / "integrated_gradients_channel_summary.csv", index=False, na_rep=na_rep)
+
+    try:
+        import matplotlib as mpl
+
+        mpl.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    scale = float(np.nanpercentile(np.abs(A), 99)) if np.isfinite(A).any() else 0.0
+    if scale <= 1e-12:
+        scale = float(np.nanmax(np.abs(A))) if np.isfinite(A).any() else 1.0
+    if scale <= 1e-12:
+        scale = 1.0
+
+    fig, ax = plt.subplots(figsize=(max(8, L * 0.02), max(4, C * 0.35)))
+    im = ax.imshow(A, aspect="auto", cmap="coolwarm", interpolation="nearest", vmin=-scale, vmax=scale)
+    ax.set_xlabel("Input context lag (0 = most recent)")
+    ax.set_ylabel("Input channel")
+    ax.set_yticks(range(C))
+    ax.set_yticklabels(labels, fontsize=8)
+    xt = np.linspace(0, L - 1, min(12, L), dtype=int)
+    ax.set_xticks(xt)
+    ax.set_xticklabels((L - 1 - xt).astype(int))
+    plt.colorbar(im, ax=ax, label="Signed IG attribution")
+    plt.tight_layout()
+    heatmap_path = out_dir / "integrated_gradients_heatmap.png"
+    plt.savefig(heatmap_path, dpi=120)
+    plt.close(fig)
+    return heatmap_path
+
+
+def _integrated_gradients_page(
+    pdf: Any,
+    plt: Any,
+    *,
+    integrated_gradients_report: dict[str, Any] | None,
+) -> None:
+    """Append one PDF page for embedding integrated gradients."""
+    if integrated_gradients_report is None:
+        return
+    A = np.asarray(integrated_gradients_report.get("attribution"), dtype=np.float32)
+    if A.ndim != 2 or A.shape[0] < 1 or A.shape[1] < 1:
+        return
+    C, L = A.shape
+    labels = integrated_gradients_report.get("channel_labels")
+    labels = labels if isinstance(labels, list) and len(labels) == C else [f"channel_{c}" for c in range(C)]
+    abs_effect = np.asarray(integrated_gradients_report.get("channel_abs_effect"), dtype=np.float32)
+    if abs_effect.shape != (C,):
+        abs_effect = np.abs(A).sum(axis=1)
+
+    scale = float(np.nanpercentile(np.abs(A), 99)) if np.isfinite(A).any() else 0.0
+    if scale <= 1e-12:
+        scale = float(np.nanmax(np.abs(A))) if np.isfinite(A).any() else 1.0
+    if scale <= 1e-12:
+        scale = 1.0
+
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.text(
+        0.5,
+        0.95,
+        "Integrated gradients (embedding sensitivity)",
+        ha="center",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.text(
+        0.06,
+        0.90,
+        "Signed input attributions for the model embedding along the baseline-to-input path.\n"
+        "Rows are input channels and columns are the context timesteps; lag 0 is the most\n"
+        "recent input. Positive and negative colors show direction, while magnitude shows strength.",
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="gray",
+    )
+
+    ax = fig.add_axes((0.08, 0.38, 0.58, 0.43))
+    im = ax.imshow(A, aspect="auto", cmap="coolwarm", interpolation="nearest", vmin=-scale, vmax=scale)
+    ax.set_xlabel("Input context lag (0 = most recent)")
+    ax.set_ylabel("Input channel")
+    ax.set_yticks(range(C))
+    ax.set_yticklabels(labels, fontsize=8)
+    xt = np.linspace(0, L - 1, min(12, L), dtype=int)
+    ax.set_xticks(xt)
+    ax.set_xticklabels((L - 1 - xt).astype(int))
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Signed attribution")
+
+    axb = fig.add_axes((0.74, 0.38, 0.22, 0.43))
+    y = np.arange(C)
+    axb.barh(y, abs_effect, color="#2a9d8f")
+    axb.set_yticks(y)
+    axb.set_yticklabels([])
+    axb.invert_yaxis()
+    axb.set_title("Channel effect\n(sum |IG|)", fontsize=9)
+    axb.set_xlabel("Absolute effect", fontsize=8)
+    axb.tick_params(axis="both", labelsize=7)
+
+    top_c = int(np.argmax(abs_effect))
+    baseline = integrated_gradients_report.get("baseline")
+    reduce = integrated_gradients_report.get("reduce")
+    steps = integrated_gradients_report.get("n_steps")
+    n_baselines = integrated_gradients_report.get("n_baselines")
+    convergence = _scalar_to_jsonable(integrated_gradients_report.get("convergence_delta"))
+    emb_delta = _scalar_to_jsonable(integrated_gradients_report.get("embedding_delta"))
+    grad_norm = bool(integrated_gradients_report.get("grad_through_norm"))
+    note = (
+        "How to read this page\n"
+        "---------------------\n"
+        "  - Heatmap cell (channel c, lag l): signed contribution of that input value\n"
+        "    to the scalar embedding objective used by integrated gradients.\n"
+        "  - Right bar: per-channel absolute effect, summed over all context timesteps.\n"
+        f"  - Most influential channel by |IG|: {labels[top_c]}.\n"
+        f"  - Config: baseline={baseline}, steps={steps}, baselines={n_baselines}, reduce={reduce}.\n"
+        f"  - RevIN/statistics gradient path enabled: {grad_norm}.\n"
+        f"  - Embedding delta: {emb_delta}; convergence delta: {convergence}.\n"
+        "\n"
+        "Full values are exported as integrated_gradients_attributions.csv and\n"
+        "integrated_gradients_channel_summary.csv."
+    )
+    fig.text(0.06, 0.30, note, ha="left", va="top", fontsize=9, family="monospace", color="#333333")
+
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+
 def _build_pdf_report(
     pdf_path: Path,
     *,
@@ -916,6 +1327,8 @@ def _build_pdf_report(
     trajectory_report: TrajectoryStabilityReport | None = None,
     context_len: int | None = None,
     forecast_horizon: int | None = None,
+    channel_labels: list[str] | None = None,
+    integrated_gradients_report: dict[str, Any] | None = None,
 ) -> Path | None:
     """Compose a multi-page PDF with the forecast and attribution heatmap."""
     try:
@@ -971,7 +1384,16 @@ def _build_pdf_report(
             "   forecast-vs-history diagnostics.",
             "5. Latent trajectory stability: temporal-smoothness metrics",
             "   over the context window.",
+            "6. Feature-axis attribution: which input channel drives each",
+            "   forecast step (multivariate inputs only).",
         ]
+        if integrated_gradients_report is not None:
+            summary.extend(
+                [
+                    "7. Integrated gradients: signed input-channel/time",
+                    "   sensitivity for the model embedding.",
+                ]
+            )
         fig.text(0.08, 0.85, "\n".join(summary), ha="left", va="top", fontsize=10, family="monospace")
         pdf.savefig(fig)
         plt.close(fig)
@@ -1201,6 +1623,29 @@ def _build_pdf_report(
             pdf.savefig(fig)
             plt.close(fig)
 
+        # Feature-axis page last (and only for multivariate inputs), matching
+        # its position in the cover summary.
+        if getattr(explanation, "channel_horizon_attributions", None) is not None:
+            try:
+                _channel_axis_page(
+                    pdf,
+                    plt,
+                    explanation=explanation,
+                    channel_labels=channel_labels,
+                )
+            except Exception as e:
+                logger.warning("Feature-axis page skipped: %s", e)
+
+        if integrated_gradients_report is not None:
+            try:
+                _integrated_gradients_page(
+                    pdf,
+                    plt,
+                    integrated_gradients_report=integrated_gradients_report,
+                )
+            except Exception as e:
+                logger.warning("Integrated-gradients page skipped: %s", e)
+
     return pdf_path
 
 
@@ -1244,6 +1689,39 @@ def _trajectory_report_to_dict(report: TrajectoryStabilityReport | None) -> dict
     }
 
 
+def _integrated_gradients_to_dict(
+    integrated_gradients_report: dict[str, Any] | None,
+    *,
+    include_full_arrays: bool = True,
+) -> dict[str, Any] | None:
+    """Convert an integrated-gradients report into a JSON-friendly dict."""
+    if integrated_gradients_report is None:
+        return None
+
+    payload: dict[str, Any] = {
+        "baseline": integrated_gradients_report.get("baseline"),
+        "reduce": integrated_gradients_report.get("reduce"),
+        "n_steps": int(integrated_gradients_report.get("n_steps", 0)),
+        "n_baselines": int(integrated_gradients_report.get("n_baselines", 0)),
+        "embedding_dim": int(integrated_gradients_report.get("embedding_dim", 0)),
+        "grad_through_norm": bool(integrated_gradients_report.get("grad_through_norm", False)),
+        "overall_effect": _scalar_to_jsonable(integrated_gradients_report.get("overall_effect")),
+        "abs_effect": _scalar_to_jsonable(integrated_gradients_report.get("abs_effect")),
+        "embedding_delta": _scalar_to_jsonable(integrated_gradients_report.get("embedding_delta")),
+        "embedding_delta_abs_mean": _scalar_to_jsonable(integrated_gradients_report.get("embedding_delta_abs_mean")),
+        "convergence_delta": _scalar_to_jsonable(integrated_gradients_report.get("convergence_delta")),
+        "channel_labels": list(integrated_gradients_report.get("channel_labels", [])),
+        "channel_signed_effect": _array_to_jsonable(integrated_gradients_report.get("channel_signed_effect")),
+        "channel_abs_effect": _array_to_jsonable(integrated_gradients_report.get("channel_abs_effect")),
+        "channel_abs_share": _array_to_jsonable(integrated_gradients_report.get("channel_abs_share")),
+        "top_channels": integrated_gradients_report.get("top_channels", []),
+    }
+    if include_full_arrays:
+        payload["attribution"] = _array_to_jsonable(integrated_gradients_report.get("attribution"))
+        payload["time_abs_effect"] = _array_to_jsonable(integrated_gradients_report.get("time_abs_effect"))
+    return payload
+
+
 def _explanation_to_dict(
     forecast_df: pd.DataFrame,
     explanation: ForecastExplanation,
@@ -1253,6 +1731,7 @@ def _explanation_to_dict(
     dataset_name: str | None = None,
     include_full_arrays: bool = True,
     trajectory_report: TrajectoryStabilityReport | None = None,
+    integrated_gradients_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Render the (forecast, explanation) pair as a JSON-serializable dict."""
     fc = forecast_df.copy()
@@ -1325,6 +1804,13 @@ def _explanation_to_dict(
             explanation.channel_coupling_off_diag_norm
         )
 
+    ig_block = _integrated_gradients_to_dict(
+        integrated_gradients_report,
+        include_full_arrays=include_full_arrays,
+    )
+    if ig_block is not None:
+        explanation_block["integrated_gradients"] = ig_block
+
     return {
         "metadata": {
             "dataset_name": dataset_name,
@@ -1349,6 +1835,7 @@ def _save_explanation_json(
     include_full_arrays: bool = True,
     indent: int | None = 2,
     trajectory_report: TrajectoryStabilityReport | None = None,
+    integrated_gradients_report: dict[str, Any] | None = None,
 ) -> Path:
     """Persist the (forecast, explanation) pair as a JSON file."""
     out_path = Path(path)
@@ -1362,6 +1849,7 @@ def _save_explanation_json(
         dataset_name=dataset_name,
         include_full_arrays=include_full_arrays,
         trajectory_report=trajectory_report,
+        integrated_gradients_report=integrated_gradients_report,
     )
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=indent, allow_nan=False)
@@ -1416,6 +1904,14 @@ def _run_interpretability(
     dataset_name: str | None,
     channel_output_aware: bool = False,
     return_all_channels: bool = False,
+    integrated_gradients: bool = False,
+    integrated_gradients_baseline: Any = "noise",
+    integrated_gradients_steps: int = 64,
+    integrated_gradients_n_baselines: int = 1,
+    integrated_gradients_internal_batch_size: int | None = None,
+    integrated_gradients_reduce: str = "l2",
+    integrated_gradients_seed: int = 0,
+    integrated_gradients_grad_through_norm: bool = True,
     # v2 channel-axis / coupling params
     interpretability_channel_axis: bool | None = None,
     interpretability_coupling: bool | None = None,
@@ -1492,13 +1988,10 @@ def _run_interpretability(
 
     model.eval()
 
-    # Optionally dispatch to interpretability_parallel for multi-GPU coupling.
-    use_parallel = (
-        channel_axis
-        and bool(interpretability_coupling)
-        and (bool(interpretability_parallel_passes) or int(interpretability_shapley_workers) >= 2)
-    )
-    if use_parallel:
+    # Coupling runs use the Pass A / Pass B orchestrator, which selects serial
+    # or multi-GPU execution from the requested and available devices.
+    use_pass_runner = channel_axis and bool(interpretability_coupling)
+    if use_pass_runner:
         from interpretability_parallel import (
             InterpretabilityPassConfig,
             run_interpretability_passes,
@@ -1519,6 +2012,8 @@ def _run_interpretability(
             parallel_passes=bool(interpretability_parallel_passes),
             shapley_workers=int(interpretability_shapley_workers),
             run_coupling=True,
+            channel_output_aware=output_aware,
+            channel_target=0 if output_aware else None,
         )
         pass_result = run_interpretability_passes(
             x_ct=x_context_ct,
@@ -1628,6 +2123,15 @@ def _run_interpretability(
                 )
             except Exception as e:
                 logger.warning("semantic_flow.csv skipped: %s", e)
+        if getattr(explanation, "channel_horizon_attributions", None) is not None:
+            try:
+                _save_channel_axis_artifacts(
+                    run_dir,
+                    np.asarray(explanation.channel_horizon_attributions, dtype=np.float32),
+                    channel_labels=columns_to_process,
+                )
+            except Exception as e:
+                logger.warning("channel_horizon artifacts skipped: %s", e)
 
     trajectory_report: TrajectoryStabilityReport | None = None
     try:
@@ -1641,6 +2145,29 @@ def _run_interpretability(
     except Exception as e:
         logger.warning("Trajectory stability skipped: %s", e)
 
+    integrated_gradients_report: dict[str, Any] | None = None
+    if integrated_gradients:
+        model.eval()
+        integrated_gradients_report = _compute_integrated_gradients_report(
+            model=model,
+            x_context_ct=x_context_ct,
+            input_mask_l=input_mask_l,
+            device=device,
+            channel_labels=columns_to_process,
+            baseline=integrated_gradients_baseline,
+            n_steps=integrated_gradients_steps,
+            n_baselines=integrated_gradients_n_baselines,
+            internal_batch_size=integrated_gradients_internal_batch_size,
+            reduce=integrated_gradients_reduce,
+            seed=integrated_gradients_seed,
+            grad_through_norm=integrated_gradients_grad_through_norm,
+        )
+        if write_pdf:
+            try:
+                _save_integrated_gradients_artifacts(run_dir, integrated_gradients_report)
+            except Exception as e:
+                logger.warning("integrated_gradients artifacts skipped: %s", e)
+
     if write_json:
         _save_explanation_json(
             forecast_df=forecast_df,
@@ -1650,6 +2177,7 @@ def _run_interpretability(
             timestamp_column=timestamp_column,
             dataset_name=dataset_name,
             trajectory_report=trajectory_report,
+            integrated_gradients_report=integrated_gradients_report,
         )
         logger.info("Interpretability JSON written to: %s", run_dir / "explanation.json")
 
@@ -1668,6 +2196,8 @@ def _run_interpretability(
             trajectory_report=trajectory_report,
             context_len=seq_len,
             forecast_horizon=forecast_horizon,
+            channel_labels=columns_to_process,
+            integrated_gradients_report=integrated_gradients_report,
         )
         if produced is None:
             logger.warning("Interpretability PDF report skipped: matplotlib is not installed.")
@@ -1716,6 +2246,14 @@ def perform_forecasting(
     interpretability_dataset_name: str | None = None,
     n_lags: int = 128,
     softmax_tau: float = 1.0,
+    channel_output_aware: bool = False,
+    integrated_gradients: bool = False,
+    integrated_gradients_baseline: Any = "noise",
+    integrated_gradients_steps: int = 64,
+    integrated_gradients_n_baselines: int = 1,
+    integrated_gradients_internal_batch_size: int | None = None,
+    integrated_gradients_reduce: str = "l2",
+    integrated_gradients_grad_through_norm: bool = True,
     # v2 channel-axis interpretability
     interpretability_channel_axis: bool | None = None,
     interpretability_coupling: bool | None = None,
@@ -2032,6 +2570,15 @@ def perform_forecasting(
                 interpretability_run_name=interpretability_run_name,
                 interpretability_top_k=interpretability_top_k,
                 dataset_name=interpretability_dataset_name,
+                channel_output_aware=channel_output_aware,
+                integrated_gradients=integrated_gradients,
+                integrated_gradients_baseline=integrated_gradients_baseline,
+                integrated_gradients_steps=integrated_gradients_steps,
+                integrated_gradients_n_baselines=integrated_gradients_n_baselines,
+                integrated_gradients_internal_batch_size=integrated_gradients_internal_batch_size,
+                integrated_gradients_reduce=integrated_gradients_reduce,
+                integrated_gradients_seed=seed,
+                integrated_gradients_grad_through_norm=integrated_gradients_grad_through_norm,
                 interpretability_channel_axis=interpretability_channel_axis,
                 interpretability_coupling=interpretability_coupling,
                 interpretability_coupling_transitions=interpretability_coupling_transitions,

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
+import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+
 from sdk import forecasting
 
 
@@ -343,6 +346,172 @@ def test_perform_forecasting_return_all_channels_rejects_interpretability():
             return_all_channels=True,
             interpretability=True,
         )
+
+
+def test_interpretability_sdk_defaults_match_algorithms():
+    from integrated_gradients import integrated_gradients_embedding
+
+    sdk_params = inspect.signature(forecasting.perform_forecasting).parameters
+    explain_params = inspect.signature(forecasting.explain_forecast).parameters
+    ig_params = inspect.signature(integrated_gradients_embedding).parameters
+
+    assert sdk_params["n_lags"].default == explain_params["n_lags"].default
+    assert sdk_params["softmax_tau"].default == explain_params["softmax_tau"].default
+    assert sdk_params["channel_output_aware"].default == explain_params["channel_output_aware"].default
+    assert sdk_params["integrated_gradients_baseline"].default == ig_params["baseline"].default
+    assert sdk_params["integrated_gradients_steps"].default == ig_params["n_steps"].default
+    assert sdk_params["integrated_gradients_n_baselines"].default == ig_params["n_baselines"].default
+    assert sdk_params["integrated_gradients_internal_batch_size"].default == ig_params["internal_batch_size"].default
+    assert sdk_params["integrated_gradients_reduce"].default == ig_params["reduce"].default
+
+
+def test_perform_forecasting_forwards_output_aware_mode(monkeypatch, tmp_path):
+    captured = {}
+
+    def run_interpretability(**kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-02", periods=2, freq="h"),
+                "target_forecast": np.ones(2, dtype=np.float32),
+            }
+        ), tmp_path
+
+    monkeypatch.setattr(forecasting, "_run_interpretability", run_interpretability)
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=10, freq="h"),
+            "target": np.arange(10, dtype=np.float32),
+            "feature": np.linspace(0.0, 1.0, 10, dtype=np.float32),
+        }
+    )
+    forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=2,
+        model_horizon=2,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        interpretability=True,
+        channel_output_aware=True,
+    )
+
+    assert captured["channel_output_aware"] is True
+
+
+def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, tmp_path):
+    import integrated_gradients as ig
+
+    explanation = SimpleNamespace(
+        baseline_forecast=np.ones((2, 2), dtype=np.float32),
+        lag_horizon_scores=np.ones((3, 2), dtype=np.float32),
+        lag_horizon_attributions=np.ones((3, 2), dtype=np.float32) / 3.0,
+        flow_magnitudes=None,
+        latent_trajectory=None,
+        surrogate_coef=None,
+        surrogate_intercept=None,
+        surrogate_feature_layout=None,
+        flow_ratio_forecast_vs_history=None,
+        flow_variance_ratio_forecast_vs_history=None,
+        curvature_ratio_forecast_vs_history=None,
+        latent_diag_mahalanobis_ratio_forecast_vs_history=None,
+        per_channel_flow=None,
+        lag_channel_horizon_attributions=None,
+        channel_horizon_attributions=None,
+        channel_coupling_matrix=None,
+        channel_flow_method=None,
+        channel_coupling_off_diag_norm=None,
+    )
+    captured = {}
+
+    def moment_embed_fn(model, *, input_mask=None, grad_through_norm=False):
+        captured["input_mask"] = input_mask.detach().cpu().tolist()
+        captured["grad_through_norm"] = grad_through_norm
+        return lambda x: x.reshape(x.shape[0], -1).sum(dim=1, keepdim=True)
+
+    def integrated_gradients_embedding(embed_fn, x, **kwargs):
+        captured["ig_shape"] = tuple(x.shape)
+        captured["ig_kwargs"] = kwargs
+        assert tuple(embed_fn(torch.zeros((2, *x.shape), dtype=torch.float32)).shape) == (2, 1)
+        return SimpleNamespace(
+            attribution=np.array([[1.0, 2.0, 3.0, 4.0], [-1.0, -2.0, -3.0, -4.0]], dtype=np.float32),
+            overall_effect=0.0,
+            abs_effect=20.0,
+            embedding_delta=0.5,
+            embedding_delta_abs_mean=0.5,
+            convergence_delta=0.1,
+            n_steps=kwargs["n_steps"],
+            n_baselines=kwargs["n_baselines"],
+            baseline=kwargs["baseline"],
+            reduce=kwargs["reduce"],
+            embedding_dim=1,
+        )
+
+    def build_pdf_report(pdf_path, **kwargs):
+        captured["pdf_report"] = kwargs["integrated_gradients_report"]
+        captured["channel_labels"] = kwargs["channel_labels"]
+        pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        return pdf_path
+
+    monkeypatch.setattr(forecasting, "explain_forecast", lambda *args, **kwargs: explanation)
+    monkeypatch.setattr(forecasting, "compute_trajectory_stability", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ig, "moment_embed_fn", moment_embed_fn)
+    monkeypatch.setattr(ig, "integrated_gradients_embedding", integrated_gradients_embedding)
+    monkeypatch.setattr(forecasting, "_save_lag_horizon_artifacts", lambda *args, **kwargs: None)
+    monkeypatch.setattr(forecasting, "_build_pdf_report", build_pdf_report)
+
+    model = SimpleNamespace(eval=lambda: None)
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=6, freq="h"),
+            "target": np.arange(6, dtype=np.float32),
+            "feature": np.linspace(0.0, 1.0, 6, dtype=np.float32),
+        }
+    )
+    standardizer = forecasting.Standardizer(
+        mean=np.zeros(2, dtype=np.float32),
+        std=np.ones(2, dtype=np.float32),
+    )
+    _, run_dir = forecasting._run_interpretability(
+        model=model,
+        standardizer=standardizer,
+        working_df=df,
+        columns_to_process=["target", "feature"],
+        timestamp_column="timestamp",
+        target_column="target",
+        seq_len=4,
+        forecast_horizon=2,
+        model_horizon=2,
+        device=torch.device("cpu"),
+        n_lags=3,
+        softmax_tau=1.0,
+        interpretability_output=None,
+        interpretability_out_dir=tmp_path,
+        interpretability_run_name="integrated_gradients",
+        interpretability_top_k=2,
+        dataset_name="unit",
+        integrated_gradients=True,
+        integrated_gradients_steps=7,
+        integrated_gradients_n_baselines=2,
+        integrated_gradients_internal_batch_size=3,
+        integrated_gradients_reduce="mean",
+        integrated_gradients_seed=123,
+        interpretability_channel_axis=False,
+    )
+
+    payload = json.loads((run_dir / "explanation.json").read_text(encoding="utf-8"))
+    ig_payload = payload["explanation"]["integrated_gradients"]
+    assert ig_payload["channel_labels"] == ["target", "feature"]
+    assert ig_payload["channel_abs_effect"] == [10.0, 10.0]
+    assert captured["input_mask"] == [1, 1, 1, 1]
+    assert captured["ig_shape"] == (2, 4)
+    assert captured["ig_kwargs"]["internal_batch_size"] == 3
+    assert captured["ig_kwargs"]["seed"] == 123
+    assert captured["grad_through_norm"] is True
+    assert captured["channel_labels"] == ["target", "feature"]
+    assert captured["pdf_report"]["attribution"].shape == (2, 4)
+    assert (run_dir / "integrated_gradients_attributions.csv").exists()
+    assert (run_dir / "integrated_gradients_channel_summary.csv").exists()
 
 
 def test_perform_forecasting_return_all_channels_rejects_timestamp_collision():

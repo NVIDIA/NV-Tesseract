@@ -122,6 +122,7 @@ interp_result = perform_forecasting(
     interpretability_dataset_name="my_dataset.csv",
     n_lags=128,
     softmax_tau=1.0,
+    integrated_gradients=True,
 )
 ```
 
@@ -130,7 +131,7 @@ interp_result = perform_forecasting(
 | Value | Files written under `<interpretability_out_dir>/run_<UTC>/` |
 |-------|-------------------------------------------------------------|
 | `"json"` | `forecast.csv`, `explanation.json` |
-| `"pdf"` | `forecast.csv`, `lag_horizon_attributions.csv`, `lag_horizon_long.csv`, `lag_horizon_heatmap.png`, `semantic_flow.csv`, `explanation_report.pdf` |
+| `"pdf"` | `forecast.csv`, lag/semantic-flow artifacts, feature-axis artifacts for multivariate input, optional integrated-gradients artifacts, `explanation_report.pdf` |
 | `None`  | All of the above |
 
 The returned DataFrame is the explanation-aligned forecast (single forward pass, so it lines up 1:1 with the attribution matrix). PDF / heatmap require `matplotlib`; if it's missing, those steps are skipped with a warning while JSON output continues to work.
@@ -179,6 +180,14 @@ perform_forecasting(
     interpretability_dataset_name: Optional[str] = None,
     n_lags: int = 128,
     softmax_tau: float = 1.0,
+    channel_output_aware: bool = False,
+    integrated_gradients: bool = False,
+    integrated_gradients_baseline: Any = "noise",
+    integrated_gradients_steps: int = 64,
+    integrated_gradients_n_baselines: int = 1,
+    integrated_gradients_internal_batch_size: Optional[int] = None,
+    integrated_gradients_reduce: str = "l2",
+    integrated_gradients_grad_through_norm: bool = True,
 
     # v2 channel-axis interpretability
     interpretability_channel_axis: Optional[bool] = None,
@@ -222,6 +231,14 @@ perform_forecasting(
 | `interpretability_dataset_name` | Free-form label embedded in the JSON metadata and the PDF cover page |
 | `n_lags` | Number of past steps the lag-attribution matrix resolves (default `128`) |
 | `softmax_tau` | Temperature applied when softmaxing scores into per-horizon attribution |
+| `channel_output_aware` | Use target-specific directional input-Jacobian effects for feature-axis attribution (default `False`) |
+| `integrated_gradients` | Add embedding integrated-gradients attribution to the JSON/PDF report and export its CSV/PNG artifacts |
+| `integrated_gradients_baseline` | IG reference input; `"noise"` is the default and avoids the constant-baseline degeneracy of instance normalization |
+| `integrated_gradients_steps` | Number of midpoint integration steps (default `64`) |
+| `integrated_gradients_n_baselines` | Number of noise baselines averaged as Expected Gradients (default `1`) |
+| `integrated_gradients_internal_batch_size` | Maximum interpolation points embedded per batch; `None` processes all steps together |
+| `integrated_gradients_reduce` | Embedding scalar objective: `"l2"`, `"sum"`, or `"mean"` |
+| `integrated_gradients_grad_through_norm` | Include RevIN statistics in the attribution gradient while leaving forward outputs unchanged |
 | `return_all_channels` | When `True`, the result contains one `{column}_forecast` column per processed channel (target column first, then the remaining numeric features) instead of only `{target_column}_forecast`. Not supported with `interpretability=True` (raises `ValueError`) |
 | `interpretability_channel_axis` | Enable v2 per-channel Jacobian flow (auto-enabled for `C > 1`) |
 | `interpretability_coupling` | Enable Shapley channel coupling matrix (auto-enabled for `C > 1`) |
@@ -272,7 +289,12 @@ When `interpretability=True`, the run directory contains the following files (se
 | `lag_horizon_long.csv` | pdf, both | Tidy `(lag, horizon, attribution[, score])` table |
 | `lag_horizon_heatmap.png` | pdf, both *(needs matplotlib)* | Visual heatmap, viridis cmap |
 | `semantic_flow.csv` | pdf, both | Tidy `(transition_index, segment, flow_magnitude)` table, where `segment` is `history` for transitions fully inside the input window, `forecast` for transitions whose window extends into the model-generated future, and `tail` for any trailing transitions outside both segments |
-| `explanation_report.pdf` | pdf, both *(needs matplotlib)* | Multi-page report: (1) cover with metadata, (2) forecast preview, (3) lag×horizon heatmap, (4) top-`interpretability_top_k` lag-step tables, (5) semantic-flow magnitudes page with the per-transition flow time series (history/forecast split annotated), a per-segment summary (mean / median / p95 / max / variance / transition count) and the four forecast-vs-history diagnostic ratios (`flow_ratio`, `flow_variance_ratio`, `curvature_ratio`, `latent_diag_mahalanobis_ratio`), (6) latent-trajectory stability table with per-dimension zero-crossing / direction-flip / relative-jitter (mean & p95) and occupancy metrics |
+| `channel_horizon_attributions.csv` | multivariate pdf, both | Feature-axis `C×H` attribution matrix |
+| `channel_horizon_heatmap.png` | multivariate pdf, both *(needs matplotlib)* | Feature-axis channel-by-horizon heatmap |
+| `integrated_gradients_attributions.csv` | `integrated_gradients=True` with pdf or both | Signed embedding IG value for every channel and context position |
+| `integrated_gradients_channel_summary.csv` | `integrated_gradients=True` with pdf or both | Signed effect, absolute effect, and absolute share by channel |
+| `integrated_gradients_heatmap.png` | `integrated_gradients=True` with pdf or both *(needs matplotlib)* | Signed channel-by-context IG heatmap |
+| `explanation_report.pdf` | pdf, both *(needs matplotlib)* | Multi-page report covering forecast, lag×horizon attribution, feature-axis attribution for multivariate input, semantic flow, latent stability, and optional embedding integrated gradients |
 | `channel_coupling_matrix.csv` | multivariate inputs | `C×C` coupling matrix `Γ[i,j]` — how much channel `j` influences the forecast via channel `i` |
 | `channel_coupling_heatmap.png` | multivariate inputs *(needs matplotlib)* | Heatmap of the channel coupling matrix |
 
@@ -280,7 +302,7 @@ The run directory path is printed on stdout when the call completes.
 
 ## Multi-GPU channel-axis interpretability
 
-On hosts with 2+ CUDA devices, Pass A (Jacobian) and Pass B (Shapley coupling) can run concurrently, and Pass B can be sharded across N GPUs:
+On hosts with 2+ CUDA devices, feature-axis Pass A (Jacobian) and Pass B (Shapley coupling) run concurrently automatically when coupling is enabled. Pass B can also be sharded across N GPUs. Integrated gradients is a separate optional attribution pass and is not part of this Pass A / Pass B dispatch.
 
 ```python
 perform_forecasting(

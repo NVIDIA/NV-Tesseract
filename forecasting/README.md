@@ -148,6 +148,7 @@ forecasting/
 ├── dataset_longhorizon.py            # Dataset utilities and Standardizer
 ├── interpretability.py               # Model-agnostic explanation engine (semantic flow, lag×horizon, trajectory stability, PDF report)
 ├── channel_flow.py                   # v2 per-channel Jacobian/Shapley flow + coupling
+├── integrated_gradients.py           # Embedding Integrated Gradients / Expected Gradients
 ├── interpretability_parallel.py      # Multi-GPU Pass A / Pass B dispatch + sharding
 ├── parallel.py                       # GPU worker pool + surrogate thread pool
 ├── run_interpretability_sharded.py   # CLI benchmark for multi-GPU interpretability (Pass A ‖ Pass B sharding)
