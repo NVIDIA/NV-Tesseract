@@ -360,6 +360,25 @@ def test_perform_forecasting_return_all_channels_rejects_timestamp_collision():
         )
 
 
+def test_perform_forecasting_with_interpretability_exports_json(tmp_path):
+    df = make_timeseries(num_rows=10)
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=3,
+        model_horizon=3,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        interpretability=True,
+        interpretability_output="json",
+        interpretability_out_dir=tmp_path,
+        interpretability_run_name="test_run",
+        n_lags=4,
+    )
+
+    assert (tmp_path / "test_run" / "explanation.json").exists()
+
+
 def test_perform_forecasting_requires_timestamp_column():
     df = make_timeseries(num_rows=6).drop(columns=["timestamp"])
     with pytest.raises(ValueError, match="Timestamp column 'timestamp' not found"):
