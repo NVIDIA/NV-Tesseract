@@ -476,6 +476,10 @@ def main() -> None:
             LOGGER.info("Saved new best checkpoint to %s", output_dir / "best_model.pt")
 
     LOGGER.info("Fine-tuning complete. Best val MSE %.6f at epoch %s", best_val, best_epoch)
+    # Machine-readable metric line consumed by TAO AutoML runner log extraction.
+    best_mae = min((m["val_mae"] for m in metrics), default=float("inf"))
+    print(f"val_mse: {best_val}")
+    print(f"val_mae: {best_mae}")
     # Per-epoch log for human inspection.
     with (output_dir / "epoch_metrics.json").open("w") as f:
         json.dump(metrics, f, indent=2)
