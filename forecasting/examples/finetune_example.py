@@ -353,7 +353,7 @@ def _run_config_defaults(cfg: dict) -> list[str]:
         section_cfg = cfg.get(section, {}) or {}
         for key, flag in keys.items():
             val = section_cfg.get(key)
-            if val is None:
+            if val is None or val == "":
                 continue
             if key in _BOOL_FLAGS:
                 if val:
