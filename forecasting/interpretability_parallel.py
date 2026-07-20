@@ -57,6 +57,8 @@ class InterpretabilityPassConfig:
     parallel_passes: bool = False
     shapley_workers: int = 0
     run_coupling: bool = True
+    channel_output_aware: bool = False
+    channel_target: int | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,8 @@ class _PassAJob:
     latent_batch_size: int
     surrogate_n_jobs: int | None
     chan_cfg: ChannelFlowConfig
+    channel_output_aware: bool
+    channel_target: int | None
 
 
 @dataclass(frozen=True)
@@ -155,6 +159,8 @@ def _run_pass_worker(ctx: dict, device: torch.device, job) -> dict:
             surrogate_n_jobs=job.surrogate_n_jobs,
             channel_axis=True,
             chan_cfg=job.chan_cfg,
+            channel_output_aware=job.channel_output_aware,
+            channel_target=job.channel_target,
         )
         return {"expl": expl, "elapsed": time.time() - t0}
     if isinstance(job, _PassBJob):
@@ -331,6 +337,8 @@ def _run_parallel_passes(
                 latent_batch_size=int(cfg.latent_batch_size),
                 surrogate_n_jobs=cfg.surrogate_n_jobs,
                 chan_cfg=chan_cfg_jac,
+                channel_output_aware=bool(cfg.channel_output_aware),
+                channel_target=cfg.channel_target,
             ),
         ]
         for shard_idx, sl in enumerate(shard_slices):
@@ -377,6 +385,8 @@ def _run_parallel_passes(
                 latent_batch_size=int(cfg.latent_batch_size),
                 surrogate_n_jobs=cfg.surrogate_n_jobs,
                 chan_cfg=chan_cfg_jac,
+                channel_output_aware=bool(cfg.channel_output_aware),
+                channel_target=cfg.channel_target,
             ),
             _PassBJob(
                 series_ext=series_ext,
@@ -528,6 +538,8 @@ def run_interpretability_passes(
         surrogate_n_jobs=cfg.surrogate_n_jobs,
         channel_axis=use_channel_axis,
         chan_cfg=chan_cfg_jac if use_channel_axis else None,
+        channel_output_aware=bool(cfg.channel_output_aware),
+        channel_target=cfg.channel_target,
     )
     t_jac = time.time() - t0
 

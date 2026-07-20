@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import numpy as np
 import torch
+from integrated_gradients import normalization_statistics_gradient
 
 if TYPE_CHECKING:
     from channel_flow import ChannelFlowConfig
@@ -413,6 +414,113 @@ def _forecast_autoregressive(
         cur_mask = torch.ones(B, seq_len, dtype=cur_mask.dtype, device=device)
 
     return np.concatenate(preds_chunks, axis=2).astype(np.float32, copy=False)
+
+
+def _channel_replacement_rows(arr_cl: Array, *, replacement: str) -> Array:
+    arr = np.asarray(arr_cl, dtype=np.float32)
+    C, L = arr.shape
+    if replacement == "zero":
+        return np.zeros((C, L), dtype=np.float32)
+    if replacement == "local_mean":
+        return np.repeat(arr.mean(axis=1, keepdims=True).astype(np.float32), L, axis=1)
+    raise ValueError(f"Unsupported replacement={replacement!r}")
+
+
+def compute_target_channel_input_jacobian_importance(
+    model: ForecastModel,
+    *,
+    x_context_ct: Array,
+    input_mask_l: Array,
+    device: torch.device,
+    target_channel: int,
+    model_horizon: int,
+    forecast_horizon: int,
+    replacement: Literal["local_mean", "zero"] = "local_mean",
+    forecast_batch_size: int = 8,
+    finite_difference_scale: float = 0.1,
+    prefer_autograd: bool = True,
+) -> Array:
+    """Target-specific directional replacement effect by channel and horizon."""
+    arr = np.asarray(x_context_ct, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected x_context_ct [C,L], got {arr.shape}")
+    C, L = arr.shape
+    H = int(forecast_horizon)
+    target = int(target_channel)
+    if not (0 <= target < C):
+        raise ValueError(f"target_channel out of range for C={C}: {target}")
+    mask = np.asarray(input_mask_l, dtype=np.int64)
+    if mask.shape != (L,):
+        raise ValueError(f"Expected input_mask_l shape {(L,)}, got {mask.shape}")
+
+    baseline = _channel_replacement_rows(arr, replacement=str(replacement))
+    delta = arr - baseline
+    active_direction = np.any(np.abs(delta) > 1e-12, axis=1)
+
+    if prefer_autograd:
+        delta_t = torch.from_numpy(delta[None]).to(device=device, dtype=torch.float32)
+        x_t = torch.from_numpy(arr[None]).to(device=device, dtype=torch.float32).requires_grad_(True)
+        m_t = torch.from_numpy(mask[None]).to(device=device, dtype=torch.long)
+        with normalization_statistics_gradient(model, "frozen"):
+            with torch.enable_grad():
+                out = model(x_enc=x_t, input_mask=m_t)
+                forecast = out.forecast[:, target, :H]
+                if forecast.shape[-1] < H:
+                    raise ValueError(f"Model returned horizon={forecast.shape[-1]}, expected at least {H}")
+                if forecast.requires_grad:
+                    importance = np.zeros((C, H), dtype=np.float32)
+                    input_is_connected = True
+                    for h in range(H):
+                        grad = torch.autograd.grad(
+                            forecast[:, h].sum(),
+                            x_t,
+                            retain_graph=h < H - 1,
+                            create_graph=False,
+                            allow_unused=True,
+                        )[0]
+                        if grad is None:
+                            input_is_connected = False
+                            break
+                        score_c = (grad * delta_t).sum(dim=-1).abs()[0]
+                        active_t = torch.as_tensor(active_direction, dtype=torch.bool, device=score_c.device)
+                        score_c = torch.where(active_t, score_c, torch.zeros_like(score_c))
+                        importance[:, h] = score_c.detach().cpu().numpy().astype(np.float32)
+                    if input_is_connected:
+                        importance[target, :] = 0.0
+                        if not np.isfinite(importance).all():
+                            n_bad = int((~np.isfinite(importance)).sum())
+                            raise FloatingPointError(f"Jacobian attribution produced {n_bad} non-finite value(s)")
+                        return importance.astype(np.float32, copy=False)
+
+    eps = float(finite_difference_scale)
+    if not (0.0 < eps <= 1.0):
+        raise ValueError(f"finite_difference_scale must be in (0, 1], got {finite_difference_scale}")
+    importance = np.zeros((C, H), dtype=np.float32)
+    chans = [c for c in range(C) if c != target]
+    channel_batch = max(1, int(forecast_batch_size) // 2)
+    for start in range(0, len(chans), channel_batch):
+        chunk = chans[start : start + channel_batch]
+        stack = np.broadcast_to(arr[None], (2 * len(chunk), C, L)).copy()
+        for i, c in enumerate(chunk):
+            stack[i, c, :] = arr[c, :] - eps * delta[c, :]
+            stack[len(chunk) + i, c, :] = arr[c, :] + eps * delta[c, :]
+        masks = np.broadcast_to(mask[None], (2 * len(chunk), L)).copy()
+        xb = torch.from_numpy(stack).to(device=device, dtype=torch.float32)
+        mb = torch.from_numpy(masks).to(device=device, dtype=torch.long)
+        yb = _forecast_autoregressive(
+            model,
+            xb,
+            mb,
+            model_horizon=int(model_horizon),
+            target_horizon=H,
+        )[:, target, :]
+        effects = np.abs(yb[len(chunk) :] - yb[: len(chunk)]) / (2.0 * eps)
+        for i, c in enumerate(chunk):
+            importance[c, :] = effects[i]
+    if not np.isfinite(importance).all():
+        n_bad = int((~np.isfinite(importance)).sum())
+        raise FloatingPointError(f"Finite-difference attribution produced {n_bad} non-finite value(s)")
+    return importance.astype(np.float32, copy=False)
 
 
 @torch.no_grad()
@@ -1531,56 +1639,63 @@ def explain_forecast(
         )
 
         chan_cfg_eff = chan_cfg if chan_cfg is not None else ChannelFlowConfig()
-        # ``channel_output_aware`` selects the flow's value function: the default
-        # latent embedding (output-agnostic "semantic flow"; feeds the coupling
-        # matrix and the Prop-1/Prop-2 reductions) or the target channel's
-        # forecast (output-aware; the target-specific attribution that the
-        # channel-faithfulness metric scores). The latent default is preserved
-        # so existing coupling / Prop experiments are unchanged.
-        chan_value_fn = None
-        if channel_output_aware:
+        if channel_output_aware and chan_cfg_eff.method == "jacobian":
             if channel_target is None:
                 raise ValueError(
                     "channel_output_aware=True requires channel_target (the forecast "
                     "channel whose prediction the attribution should explain)."
                 )
-            chan_value_fn = make_target_forecast_value_fn(
+            chan_horizon_attrib = compute_target_channel_input_jacobian_importance(
+                model,
+                x_context_ct=x0,
+                input_mask_l=mask,
+                device=device,
                 target_channel=int(channel_target),
                 model_horizon=int(model_horizon),
                 forecast_horizon=int(forecast_horizon),
             )
-        # Channel-flow operates on the same extended series so lag indices match v1.
-        # In output-aware mode we protect the target channel from ablation in the
-        # Shapley game (ablating it destroys the target signal and biases the
-        # non-target attributions); ignored by the Jacobian estimator.
-        chan_protect = (int(channel_target),) if channel_output_aware and channel_target is not None else None
-        report = compute_per_channel_flow(
-            model,
-            series_ext,
-            seq_len=L,
-            input_mask_t=mask_ext,
-            device=device,
-            cfg=chan_cfg_eff,
-            value_fn=chan_value_fn,
-            protect_channels=chan_protect,
-        )
-        per_chan_flow = report.per_channel_flow
-        chan_method = report.method
-        chan_resid_mean = report.residual_ratio_mean
-        chan_resid_p95 = report.residual_ratio_p95
-        coupling_mat = report.coupling_matrix
-        coupling_norm = report.coupling_off_diag_norm
+            chan_method = "target_input_jacobian"
+        else:
+            chan_value_fn = None
+            if channel_output_aware:
+                if channel_target is None:
+                    raise ValueError(
+                        "channel_output_aware=True requires channel_target (the forecast "
+                        "channel whose prediction the attribution should explain)."
+                    )
+                chan_value_fn = make_target_forecast_value_fn(
+                    target_channel=int(channel_target),
+                    model_horizon=int(model_horizon),
+                    forecast_horizon=int(forecast_horizon),
+                )
+            chan_protect = (int(channel_target),) if channel_output_aware and channel_target is not None else None
+            report = compute_per_channel_flow(
+                model,
+                series_ext,
+                seq_len=L,
+                input_mask_t=mask_ext,
+                device=device,
+                cfg=chan_cfg_eff,
+                value_fn=chan_value_fn,
+                protect_channels=chan_protect,
+            )
+            per_chan_flow = report.per_channel_flow
+            chan_method = report.method
+            chan_resid_mean = report.residual_ratio_mean
+            chan_resid_p95 = report.residual_ratio_p95
+            coupling_mat = report.coupling_matrix
+            coupling_norm = report.coupling_off_diag_norm
 
-        chan_tau = float(channel_softmax_tau) if channel_softmax_tau is not None else float(softmax_tau)
-        lag_chan_scores, lag_chan_attrib = lag_channel_horizon_attribution(
-            per_chan_flow,
-            t_index=t_index,
-            n_lags=K,
-            horizon=int(forecast_horizon),
-            softmax_tau=chan_tau,
-            normalize="joint",
-        )
-        chan_horizon_attrib = channel_horizon_marginal(lag_chan_attrib)
+            chan_tau = float(channel_softmax_tau) if channel_softmax_tau is not None else float(softmax_tau)
+            lag_chan_scores, lag_chan_attrib = lag_channel_horizon_attribution(
+                per_chan_flow,
+                t_index=t_index,
+                n_lags=K,
+                horizon=int(forecast_horizon),
+                softmax_tau=chan_tau,
+                normalize="joint",
+            )
+            chan_horizon_attrib = channel_horizon_marginal(lag_chan_attrib)
 
     return ForecastExplanation(
         baseline_forecast=base,
