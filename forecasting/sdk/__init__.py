@@ -7,6 +7,7 @@ from .forecasting import (
     DEFAULT_BACKBONE_NAME,
     DEFAULT_CHECKPOINT_NAME,
     DEVICE,
+    NVTesseractForecasting,
     download_model_weights,
     perform_forecasting,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "DEFAULT_BACKBONE_NAME",
     "DEFAULT_CHECKPOINT_NAME",
     "DEVICE",
+    "NVTesseractForecasting",
     "download_model_weights",
     "perform_forecasting",
 ]

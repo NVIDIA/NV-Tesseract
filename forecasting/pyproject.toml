@@ -12,7 +12,7 @@ dependencies = [
     "numpy>=1.24.0",
     "torch>=2.7.0",
     "tqdm>=4.65.0",
-    "huggingface_hub>=0.17.0",
+    "huggingface_hub>=0.22.0",
     "transformers>=4.36.0",
 ]
 

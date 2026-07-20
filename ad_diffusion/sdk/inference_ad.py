@@ -70,11 +70,18 @@ from sklearn.decomposition import PCA
 from torch.utils.data import DataLoader, Dataset
 
 try:
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import ModelHubMixin, snapshot_download
 
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
+
+    class ModelHubMixin:  # type: ignore[no-redef]
+        """No-op fallback when huggingface_hub is not installed."""
+
+        def __init_subclass__(cls, **kwargs: object) -> None:
+            super().__init_subclass__()
+
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.main_model import TSDiffuser_Generic
@@ -878,6 +885,10 @@ def download_model_weights(
     config_path: str = DEFAULT_CONFIG_FILENAME,
     repo_id: str = HF_REPO_ID,
     force_download: bool = False,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+    token: str | bool | None = None,
 ) -> tuple[str, str]:
     """
     Auto-download AD Diffusion model weights from Hugging Face if they don't exist locally.
@@ -918,34 +929,24 @@ def download_model_weights(
 
     logger.info("Downloading AD Diffusion weights from Hugging Face (%s)...", repo_id)
 
-    # Create parent directories if the user specified a subdirectory.
-    if model_file.parent != Path():
-        model_file.parent.mkdir(parents=True, exist_ok=True)
-    if config_file.parent != Path():
-        config_file.parent.mkdir(parents=True, exist_ok=True)
-
+    # Download each file to its own parent directory so returned paths always exist
     try:
-        if force_download or not model_file.exists():
-            logger.info("Downloading %s...", model_file.name)
-            hf_hub_download(
-                repo_id=repo_id,
-                filename=model_file.name,
-                local_dir=str(model_file.parent) if model_file.parent != Path() else ".",
-                local_dir_use_symlinks=False,
-                force_download=force_download,
-            )
-            logger.info("Downloaded %s", model_file)
-
-        if force_download or not config_file.exists():
-            logger.info("Downloading %s...", config_file.name)
-            hf_hub_download(
-                repo_id=repo_id,
-                filename=config_file.name,
-                local_dir=str(config_file.parent) if config_file.parent != Path() else ".",
-                local_dir_use_symlinks=False,
-                force_download=force_download,
-            )
-            logger.info("Downloaded %s", config_file)
+        for file_path in (model_file, config_file):
+            if force_download or not file_path.exists():
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info("Downloading: %s", file_path.name)
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(file_path.parent),
+                    allow_patterns=[file_path.name],
+                    force_download=force_download,
+                    revision=revision,
+                    cache_dir=str(cache_dir) if cache_dir else None,
+                    local_files_only=local_files_only,
+                    token=token,
+                    library_name="nv-tesseract",
+                )
+                logger.info("Downloaded: %s", file_path.name)
 
     except Exception as e:
         error_msg = f"Failed to download model weights from {repo_id}: {e}"
@@ -1291,3 +1292,71 @@ def inference_ad_tesseract2_mp(
         return _merge_chunked_results(results_per_chunk, target_dim)
     finally:
         _cleanup_shared_memory(shm_info)
+
+
+class NVTesseractADDiffusion(
+    ModelHubMixin,
+    library_name="nv-tesseract",
+    tags=["time-series", "anomaly-detection"],
+    repo_url="https://github.com/NVIDIA/NV-Tesseract",
+    docs_url="https://huggingface.co/nvidia/nv-tesseract-ad-diffusion",
+):
+    """NV-Tesseract AD Diffusion anomaly detection model with HuggingFace Hub integration.
+
+    Example::
+
+        model = NVTesseractADDiffusion.from_pretrained("nvidia/nv-tesseract-ad-diffusion")
+        results = model.detect(data, nsample=30)
+
+        # Save weights locally or push to Hub
+        model.save_pretrained("./my-ad-model")
+        model.push_to_hub("username/my-ad-model")
+    """
+
+    def __init__(self, *, model_path: str, config_path: str) -> None:
+        self.model_path = model_path
+        self.config_path = config_path
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        *,
+        model_id: str,
+        revision: str | None,
+        cache_dir: str | Path | None,
+        force_download: bool,
+        local_files_only: bool,
+        token: str | bool | None,
+        **model_kwargs,
+    ) -> "NVTesseractADDiffusion":
+        model_name = model_kwargs.get("model_path", DEFAULT_MODEL_FILENAME)
+        config_name = model_kwargs.get("config_path", DEFAULT_CONFIG_FILENAME)
+        local_path = Path(model_id)
+        if local_path.is_dir():
+            return cls(
+                model_path=str(local_path / model_name),
+                config_path=str(local_path / config_name),
+            )
+        model_path, config_path = download_model_weights(
+            model_path=model_name,
+            config_path=config_name,
+            repo_id=model_id,
+            force_download=force_download,
+            revision=revision,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            token=token,
+        )
+        return cls(model_path=model_path, config_path=config_path)
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        import shutil
+
+        save_directory = Path(save_directory)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.model_path, save_directory / Path(self.model_path).name)
+        shutil.copy2(self.config_path, save_directory / Path(self.config_path).name)
+
+    def detect(self, data: "pd.DataFrame", **kwargs) -> dict:
+        """Run anomaly detection. All keyword args are forwarded to ``inference_ad_tesseract2``."""
+        return inference_ad_tesseract2(data, model_path=self.model_path, config_path=self.config_path, **kwargs)

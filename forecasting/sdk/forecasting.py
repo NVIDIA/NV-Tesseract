@@ -18,11 +18,18 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import ModelHubMixin, snapshot_download
 
     HF_HUB_AVAILABLE = True
 except ImportError:
     HF_HUB_AVAILABLE = False
+
+    class ModelHubMixin:  # type: ignore[no-redef]
+        """No-op fallback when huggingface_hub is not installed."""
+
+        def __init_subclass__(cls, **kwargs: object) -> None:
+            super().__init_subclass__()
+
 
 # Clean absolute imports - package is installed in editable mode
 from backbone.utils.utils import control_randomness
@@ -165,6 +172,10 @@ def download_model_weights(
     ckpt: str = DEFAULT_CHECKPOINT_NAME,
     repo_id: str = "nvidia/nv-tesseract-forecasting",
     force_download: bool = False,
+    revision: str | None = None,
+    cache_dir: str | Path | None = None,
+    local_files_only: bool = False,
+    token: str | bool | None = None,
 ) -> tuple[str, str]:
     """
     Auto-download model weights from Hugging Face if they don't exist locally.
@@ -205,34 +216,24 @@ def download_model_weights(
 
     logger.info("Downloading model weights from Hugging Face...")
 
-    # Create parent directories if they don't exist (in case user specifies subdirectories)
-    if standardizer_path.parent != Path():
-        standardizer_path.parent.mkdir(parents=True, exist_ok=True)
-    if checkpoint_path.parent != Path():
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
+    # Download each file to its own parent directory so returned paths always exist
     try:
-        # Download standardizer
-        if force_download or not standardizer_path.exists():
-            logger.info("Downloading %s...", standardizer_path.name)
-            downloaded_file = hf_hub_download(
-                repo_id=repo_id,
-                filename=standardizer_path.name,
-                local_dir=str(standardizer_path.parent) if standardizer_path.parent != Path() else ".",
-                local_dir_use_symlinks=False,
-            )
-            logger.info("Downloaded %s", standardizer_path)
-
-        # Download checkpoint
-        if force_download or not checkpoint_path.exists():
-            logger.info("Downloading %s...", checkpoint_path.name)
-            downloaded_file = hf_hub_download(
-                repo_id=repo_id,
-                filename=checkpoint_path.name,
-                local_dir=str(checkpoint_path.parent) if checkpoint_path.parent != Path() else ".",
-                local_dir_use_symlinks=False,
-            )
-            logger.info("Downloaded %s", checkpoint_path)
+        for file_path in (standardizer_path, checkpoint_path):
+            if force_download or not file_path.exists():
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                logger.info("Downloading: %s", file_path.name)
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(file_path.parent),
+                    allow_patterns=[file_path.name],
+                    force_download=force_download,
+                    revision=revision,
+                    cache_dir=str(cache_dir) if cache_dir else None,
+                    local_files_only=local_files_only,
+                    token=token,
+                    library_name="nv-tesseract",
+                )
+                logger.info("Downloaded: %s", file_path.name)
 
     except Exception as e:
         error_msg = f"Failed to download model weights: {e}"
@@ -2197,3 +2198,71 @@ def perform_forecasting(
         for temp_csv in (temp_test_csv, temp_context_csv):
             if temp_csv:
                 Path(temp_csv).unlink(missing_ok=True)
+
+
+class NVTesseractForecasting(
+    ModelHubMixin,
+    library_name="nv-tesseract",
+    tags=["time-series", "forecasting"],
+    repo_url="https://github.com/NVIDIA/NV-Tesseract",
+    docs_url="https://huggingface.co/nvidia/nv-tesseract-forecasting",
+):
+    """NV-Tesseract Forecasting model with HuggingFace Hub integration.
+
+    Example::
+
+        model = NVTesseractForecasting.from_pretrained("nvidia/nv-tesseract-forecasting")
+        predictions = model.forecast(df, forecast_horizon=72)
+
+        # Save weights locally or push to Hub
+        model.save_pretrained("./my-forecasting-model")
+        model.push_to_hub("username/my-forecasting-model")
+    """
+
+    def __init__(self, *, standardizer_pkl: str, ckpt: str) -> None:
+        self.standardizer_pkl = standardizer_pkl
+        self.ckpt = ckpt
+
+    @classmethod
+    def _from_pretrained(
+        cls,
+        *,
+        model_id: str,
+        revision: str | None,
+        cache_dir: str | Path | None,
+        force_download: bool,
+        local_files_only: bool,
+        token: str | bool | None,
+        **model_kwargs,
+    ) -> "NVTesseractForecasting":
+        standardizer_name = model_kwargs.get("standardizer_pkl", "standardizer.pkl")
+        ckpt_name = model_kwargs.get("ckpt", DEFAULT_CHECKPOINT_NAME)
+        local_path = Path(model_id)
+        if local_path.is_dir():
+            return cls(
+                standardizer_pkl=str(local_path / standardizer_name),
+                ckpt=str(local_path / ckpt_name),
+            )
+        standardizer_pkl, ckpt = download_model_weights(
+            standardizer_pkl=standardizer_name,
+            ckpt=ckpt_name,
+            repo_id=model_id,
+            force_download=force_download,
+            revision=revision,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+            token=token,
+        )
+        return cls(standardizer_pkl=standardizer_pkl, ckpt=ckpt)
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        import shutil
+
+        save_directory = Path(save_directory)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.standardizer_pkl, save_directory / Path(self.standardizer_pkl).name)
+        shutil.copy2(self.ckpt, save_directory / Path(self.ckpt).name)
+
+    def forecast(self, df: "pd.DataFrame", **kwargs) -> "pd.DataFrame":
+        """Run forecasting. All keyword args are forwarded to ``perform_forecasting``."""
+        return perform_forecasting(df, standardizer_pkl=self.standardizer_pkl, ckpt=self.ckpt, **kwargs)
