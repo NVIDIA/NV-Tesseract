@@ -188,7 +188,7 @@ class CSVLongHorizonDataset:
             raise ValueError(f"timestamp column '{timestamp_col}' not found")
         df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
         df = df.sort_values(timestamp_col)
-        self.raw_timestamps = df["timestamp"].values
+        self.raw_timestamps = df[timestamp_col].values
 
         if usecols is None:
             num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
