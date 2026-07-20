@@ -316,6 +316,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _load_run_config(path: str) -> dict:
     import yaml
+
     text = Path(path).read_text()
     return yaml.safe_load(text) or {}
 
@@ -323,28 +324,43 @@ def _load_run_config(path: str) -> dict:
 def _run_config_defaults(cfg: dict) -> list[str]:
     """Flatten a nested YAML run-config into CLI-style --key value pairs."""
     _BOOL_FLAGS = {
-        "no_standardize", "local_files_only",
-        "unfreeze_encoder", "unfreeze_embedder", "use_cross_channel",
+        "no_standardize",
+        "local_files_only",
+        "unfreeze_encoder",
+        "unfreeze_embedder",
+        "use_cross_channel",
     }
     mapping = {
         "dataset": {
-            "csv": "--csv", "train_csv": "--train-csv", "val_csv": "--val-csv",
-            "timestamp_col": "--timestamp-col", "target_cols": "--target-cols",
-            "val_ratio": "--val-ratio", "test_ratio": "--test-ratio",
-            "stride": "--stride", "no_standardize": "--no-standardize",
+            "csv": "--csv",
+            "train_csv": "--train-csv",
+            "val_csv": "--val-csv",
+            "timestamp_col": "--timestamp-col",
+            "target_cols": "--target-cols",
+            "val_ratio": "--val-ratio",
+            "test_ratio": "--test-ratio",
+            "stride": "--stride",
+            "no_standardize": "--no-standardize",
         },
         "model": {
-            "seq_len": "--seq-len", "forecast_horizon": "--forecast-horizon",
-            "ckpt_init": "--ckpt-init", "use_cross_channel": "--use-cross-channel",
+            "seq_len": "--seq-len",
+            "forecast_horizon": "--forecast-horizon",
+            "ckpt_init": "--ckpt-init",
+            "use_cross_channel": "--use-cross-channel",
             "cross_channel_heads": "--cross-channel-heads",
             "cross_channel_dropout": "--cross-channel-dropout",
             "unfreeze_encoder": "--unfreeze-encoder",
             "unfreeze_embedder": "--unfreeze-embedder",
         },
         "train": {
-            "epochs": "--epochs", "batch_size": "--batch-size", "lr": "--lr",
-            "weight_decay": "--weight-decay", "head_dropout": "--head-dropout",
-            "max_norm": "--max-norm", "seed": "--seed", "output_dir": "--output-dir",
+            "epochs": "--epochs",
+            "batch_size": "--batch-size",
+            "lr": "--lr",
+            "weight_decay": "--weight-decay",
+            "head_dropout": "--head-dropout",
+            "max_norm": "--max-norm",
+            "seed": "--seed",
+            "output_dir": "--output-dir",
             "local_files_only": "--local-files-only",
         },
     }
@@ -482,8 +498,9 @@ def main() -> None:
     # Scalar summary consumed by TAO AutoML runner metric extraction.
     best_row = min(metrics, key=lambda r: r["val_mse"]) if metrics else {}
     with (output_dir / "metrics.json").open("w") as f:
-        json.dump({"val_mse": best_row.get("val_mse", float("inf")),
-                   "val_mae": best_row.get("val_mae", float("inf"))}, f)
+        json.dump(
+            {"val_mse": best_row.get("val_mse", float("inf")), "val_mae": best_row.get("val_mae", float("inf"))}, f
+        )
     LOGGER.info("Artifacts written to %s", output_dir)
 
 
