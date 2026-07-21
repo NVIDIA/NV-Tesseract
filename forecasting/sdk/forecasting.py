@@ -5,7 +5,10 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import tempfile
+import types
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,7 @@ except ImportError:
 
 # Clean absolute imports - package is installed in editable mode
 from backbone.utils.utils import control_randomness
+
 from dataset_longhorizon import (
     CSVLongHorizonSimpleDataset,
     Standardizer,
@@ -1070,6 +1074,53 @@ def _channel_axis_page(
     )
 
     pdf.savefig(fig)
+    plt.close(fig)
+
+
+@contextmanager
+def _normalization_statistics_gradient(model: torch.nn.Module, *, enabled: bool):
+    """Temporarily include supported normalization statistics in autograd."""
+    if not enabled:
+        yield 0
+        return
+
+    restores: list[tuple[object, object, bool]] = []
+    for module in model.modules():
+        if not all(hasattr(module, name) for name in ("_get_statistics", "_normalize", "eps")):
+            continue
+
+        original = module._get_statistics
+        had_instance_override = "_get_statistics" in vars(module)
+        module_namespace = sys.modules.get(type(module).__module__)
+        nanstd = getattr(module_namespace, "nanstd", None)
+
+        def _make_get_statistics(nanstd_fn: Any):
+            def _get_statistics(self: Any, x: torch.Tensor, mask: torch.Tensor | None = None) -> None:
+                if mask is None:
+                    mask = torch.ones((x.shape[0], x.shape[-1]), device=x.device)
+                expanded = mask.to(device=x.device).unsqueeze(1).repeat(1, x.shape[1], 1).bool()
+                masked_x = torch.where(expanded, x, torch.full_like(x, float("nan")))
+                self.mean = torch.nanmean(masked_x, dim=-1, keepdim=True)
+                if nanstd_fn is None:
+                    centered = masked_x - torch.nanmean(masked_x, dim=-1, keepdim=True)
+                    stdev = centered.square().nanmean(dim=-1, keepdim=True).sqrt()
+                else:
+                    stdev = nanstd_fn(masked_x, dim=-1, keepdim=True)
+                self.stdev = stdev + self.eps
+
+            return _get_statistics
+
+        module._get_statistics = types.MethodType(_make_get_statistics(nanstd), module)
+        restores.append((module, original, had_instance_override))
+
+    try:
+        yield len(restores)
+    finally:
+        for module, original, had_instance_override in reversed(restores):
+            if had_instance_override:
+                module._get_statistics = original
+            else:
+                delattr(module, "_get_statistics")
 
 
 def _compute_integrated_gradients_report(
@@ -1088,14 +1139,19 @@ def _compute_integrated_gradients_report(
     grad_through_norm: bool,
 ) -> dict[str, Any]:
     """Run embedding integrated gradients for the current SDK context window."""
-    from integrated_gradients import (
-        integrated_gradients_embedding,
-        moment_embed_fn,
-    )
+    from integrated_gradients import integrated_gradients_embedding
 
     x_tensor = torch.as_tensor(np.asarray(x_context_ct, dtype=np.float32), device=device)
     input_mask = torch.as_tensor(np.asarray(input_mask_l, dtype=np.int64), device=device)
-    embed_fn = moment_embed_fn(model, input_mask=input_mask, grad_through_norm=grad_through_norm)
+
+    def embed_fn(x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(f"SDK embedding input must be [batch, channels, context], got {tuple(x.shape)}")
+        mask = input_mask.reshape(1, -1).expand(x.shape[0], -1).to(device=x.device)
+        with _normalization_statistics_gradient(model, enabled=grad_through_norm):
+            output = model.embed(x_enc=x, input_mask=mask)
+        embeddings = output.embeddings if hasattr(output, "embeddings") else output
+        return embeddings.reshape(embeddings.shape[0], -1)
 
     attribution = integrated_gradients_embedding(
         embed_fn,
@@ -1782,26 +1838,21 @@ def _explanation_to_dict(
         "trajectory_stability": _trajectory_report_to_dict(trajectory_report),
     }
 
+    channel_attribution = getattr(explanation, "channel_horizon_attributions", None)
+    if channel_attribution is not None:
+        feature_axis: dict[str, Any] = {
+            "method": getattr(explanation, "channel_flow_method", None),
+            "channel_horizon_attributions": _array_to_jsonable(np.asarray(channel_attribution)),
+            "residual_ratio_mean": _scalar_to_jsonable(explanation.channel_flow_residual_ratio_mean),
+            "residual_ratio_p95": _scalar_to_jsonable(explanation.channel_flow_residual_ratio_p95),
+        }
+        if include_full_arrays and getattr(explanation, "per_channel_flow", None) is not None:
+            feature_axis["per_channel_flow"] = _array_to_jsonable(np.asarray(explanation.per_channel_flow))
+        explanation_block["feature_axis"] = feature_axis
+
     if include_full_arrays:
         explanation_block["flow_magnitudes"] = _array_to_jsonable(explanation.flow_magnitudes)
         explanation_block["latent_trajectory"] = _array_to_jsonable(explanation.latent_trajectory)
-
-    if explanation.per_channel_flow is not None:
-        explanation_block["per_channel_flow"] = _array_to_jsonable(explanation.per_channel_flow)
-    if explanation.lag_channel_horizon_attributions is not None:
-        explanation_block["lag_channel_horizon_attributions"] = _array_to_jsonable(
-            explanation.lag_channel_horizon_attributions
-        )
-    if explanation.channel_horizon_attributions is not None:
-        explanation_block["channel_horizon_attributions"] = _array_to_jsonable(explanation.channel_horizon_attributions)
-    if explanation.channel_coupling_matrix is not None:
-        explanation_block["channel_coupling_matrix"] = _array_to_jsonable(explanation.channel_coupling_matrix)
-    if explanation.channel_flow_method is not None:
-        explanation_block["channel_flow_method"] = explanation.channel_flow_method
-    if explanation.channel_coupling_off_diag_norm is not None:
-        explanation_block["channel_coupling_off_diag_norm"] = _scalar_to_jsonable(
-            explanation.channel_coupling_off_diag_norm
-        )
 
     ig_block = _integrated_gradients_to_dict(
         integrated_gradients_report,
@@ -1855,33 +1906,6 @@ def _save_explanation_json(
     return out_path
 
 
-def _save_channel_coupling_artifacts(
-    run_dir: Path,
-    coupling_matrix: np.ndarray,
-    channel_labels: list[str],
-) -> None:
-    """Write Pass B coupling matrix CSV (and heatmap when matplotlib is available)."""
-    labels = [str(lab) for lab in channel_labels]
-    pd.DataFrame(coupling_matrix, index=labels, columns=labels).to_csv(run_dir / "channel_coupling_matrix.csv")
-    try:
-        import matplotlib.pyplot as plt
-
-        c = int(coupling_matrix.shape[0])
-        fig, ax = plt.subplots(figsize=(max(6.0, c * 0.45), max(5.0, c * 0.42)))
-        im = ax.imshow(coupling_matrix, aspect="auto", cmap="magma")
-        ax.set_title("Channel coupling matrix G (Harsanyi dividends)")
-        ax.set_xticks(range(c))
-        ax.set_yticks(range(c))
-        ax.set_xticklabels(labels, rotation=45, ha="right")
-        ax.set_yticklabels(labels)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.tight_layout()
-        fig.savefig(run_dir / "channel_coupling_heatmap.png", dpi=150)
-        plt.close(fig)
-    except ImportError:
-        pass
-
-
 def _run_interpretability(
     *,
     model: torch.nn.Module,
@@ -1911,22 +1935,6 @@ def _run_interpretability(
     integrated_gradients_reduce: str = "l2",
     integrated_gradients_seed: int = 0,
     integrated_gradients_grad_through_norm: bool = True,
-    # v2 channel-axis / coupling params
-    interpretability_channel_axis: bool | None = None,
-    interpretability_coupling: bool | None = None,
-    interpretability_coupling_transitions: int = 16,
-    interpretability_shapley_n_samples: int = 64,
-    interpretability_shapley_baseline: str = "zero",
-    interpretability_transition_batch: int = 8,
-    interpretability_channel_batch_size: int = 64,
-    interpretability_devices: str | None = None,
-    interpretability_parallel_passes: bool = False,
-    interpretability_shapley_workers: int = 0,
-    ckpt: str | None = None,
-    model_name: str = DEFAULT_BACKBONE_NAME,
-    use_cross_channel: bool = True,
-    cross_channel_heads: int = 8,
-    cross_channel_dropout: float = 0.1,
 ) -> tuple[pd.DataFrame, Path]:
     """Generate the lag x horizon explanation, write artifacts, return (forecast_df, run_dir).
 
@@ -1946,11 +1954,7 @@ def _run_interpretability(
 
     # Feature-axis (channel) attribution only makes sense for multivariate inputs.
     n_channels = int(x_context_ct.shape[0])
-    # Allow caller to explicitly control channel_axis; default: auto-detect from channel count.
-    if interpretability_channel_axis is not None:
-        channel_axis = bool(interpretability_channel_axis) and n_channels > 1
-    else:
-        channel_axis = n_channels > 1
+    channel_axis = n_channels > 1
     # The target column is always channel 0 of columns_to_process, so output-aware
     # attribution explains the target's own forecast.
     output_aware = bool(channel_output_aware) and channel_axis
@@ -1965,93 +1969,24 @@ def _run_interpretability(
         lag_count = min(int(n_lags), max(0, int(seq_len) - 1))
         start = max(0, int(seq_len) - 1 - lag_count)
         time_indices = tuple(range(start, int(seq_len) - 1))
-
-        # When coupling is requested, use Shapley method for the channel config.
-        run_coupling = bool(interpretability_coupling) if interpretability_coupling is not None else False
-        if run_coupling:
-            chan_cfg = ChannelFlowConfig(
-                method="shapley",
-                shapley_baseline=interpretability_shapley_baseline,  # type: ignore[arg-type]
-                shapley_n_samples=int(interpretability_shapley_n_samples),
-                compute_coupling=True,
-                time_indices=list(time_indices),
-                batch_size=int(interpretability_channel_batch_size),
-                transition_batch=int(interpretability_transition_batch),
-            )
-        else:
-            chan_cfg = ChannelFlowConfig(
-                batch_size=int(interpretability_channel_batch_size),
-                transition_batch=int(interpretability_transition_batch),
-                time_indices=list(time_indices),
-            )
+        chan_cfg = ChannelFlowConfig(time_indices=time_indices)
 
     model.eval()
-
-    # Coupling runs use the Pass A / Pass B orchestrator, which selects serial
-    # or multi-GPU execution from the requested and available devices.
-    use_pass_runner = channel_axis and bool(interpretability_coupling)
-    if use_pass_runner:
-        from interpretability_parallel import (
-            InterpretabilityPassConfig,
-            run_interpretability_passes,
-        )
-
-        pass_cfg = InterpretabilityPassConfig(
-            seq_len=int(seq_len),
-            forecast_horizon=int(forecast_horizon),
-            model_horizon=int(model_horizon),
-            n_lags=int(n_lags),
-            softmax_tau=float(softmax_tau),
-            coupling_transitions=int(interpretability_coupling_transitions),
-            shapley_n_samples=int(interpretability_shapley_n_samples),
-            shapley_baseline=interpretability_shapley_baseline,
-            transition_batch=int(interpretability_transition_batch),
-            channel_batch_size=int(interpretability_channel_batch_size),
-            devices=interpretability_devices,
-            parallel_passes=bool(interpretability_parallel_passes),
-            shapley_workers=int(interpretability_shapley_workers),
-            run_coupling=True,
-            channel_output_aware=output_aware,
-            channel_target=0 if output_aware else None,
-        )
-        pass_result = run_interpretability_passes(
-            x_ct=x_context_ct,
-            input_mask_l=input_mask_l,
-            cfg=pass_cfg,
-            use_channel_axis=True,
-            model=model,
-            device=device,
-            ckpt_path=ckpt,
-            model_name=model_name,
-            use_cross_channel=use_cross_channel,
-            cross_channel_heads=cross_channel_heads,
-            cross_channel_dropout=cross_channel_dropout,
-        )
-        explanation = pass_result.explanation
-        coupling_report = pass_result.coupling_report
-        logger.info(
-            "Interpretability passes done (pass_a=%.1fs, pass_b=%.1fs, parallel=%s)",
-            pass_result.pass_a_seconds,
-            pass_result.pass_b_seconds,
-            pass_result.parallel,
-        )
-    else:
-        coupling_report = None
-        explanation = explain_forecast(
-            model,
-            x_context_ct=x_context_ct,
-            input_mask_l=input_mask_l,
-            model_horizon=model_horizon,
-            forecast_horizon=forecast_horizon,
-            device=device,
-            n_lags=n_lags,
-            softmax_tau=softmax_tau,
-            surrogate=False,
-            channel_axis=channel_axis,
-            chan_cfg=chan_cfg,
-            channel_output_aware=output_aware,
-            channel_target=0 if output_aware else None,
-        )
+    explanation = explain_forecast(
+        model,
+        x_context_ct=x_context_ct,
+        input_mask_l=input_mask_l,
+        model_horizon=model_horizon,
+        forecast_horizon=forecast_horizon,
+        device=device,
+        n_lags=n_lags,
+        softmax_tau=softmax_tau,
+        surrogate=False,
+        channel_axis=channel_axis,
+        chan_cfg=chan_cfg,
+        channel_output_aware=output_aware,
+        channel_target=0 if output_aware else None,
+    )
 
     base_std = explanation.baseline_forecast
     H = base_std.shape[1]
@@ -2080,19 +2015,6 @@ def _run_interpretability(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     forecast_df.to_csv(run_dir / "forecast.csv", index=False)
-
-    if coupling_report is not None and coupling_report.coupling_matrix is not None:
-        _save_channel_coupling_artifacts(
-            run_dir,
-            np.asarray(coupling_report.coupling_matrix, dtype=np.float32),
-            columns_to_process,
-        )
-        sh_phi = np.asarray(coupling_report.per_channel_flow)
-        sh_finite = np.where(np.isfinite(sh_phi).all(axis=1))[0]
-        if sh_finite.size:
-            sh_df = pd.DataFrame(sh_phi[sh_finite], columns=columns_to_process)
-            sh_df.insert(0, "transition", sh_finite)
-            sh_df.to_csv(run_dir / "per_channel_flow_shapley_finite.csv", index=False)
 
     write_json = interpretability_output in (None, "json")
     write_pdf = interpretability_output in (None, "pdf")
@@ -2253,17 +2175,6 @@ def perform_forecasting(
     integrated_gradients_internal_batch_size: int | None = None,
     integrated_gradients_reduce: str = "l2",
     integrated_gradients_grad_through_norm: bool = True,
-    # v2 channel-axis interpretability
-    interpretability_channel_axis: bool | None = None,
-    interpretability_coupling: bool | None = None,
-    interpretability_coupling_transitions: int = 16,
-    interpretability_shapley_n_samples: int = 64,
-    interpretability_shapley_baseline: str = "zero",
-    interpretability_transition_batch: int = 8,
-    interpretability_channel_batch_size: int = 64,
-    interpretability_devices: str | None = None,
-    interpretability_parallel_passes: bool = False,
-    interpretability_shapley_workers: int = 0,
     # Output configuration
     return_all_channels: bool = False,  # When True, emit one {col}_forecast per feature column
 ) -> pd.DataFrame:
@@ -2276,8 +2187,7 @@ def perform_forecasting(
     When ``return_all_channels=True``, the returned DataFrame contains one
     ``{column}_forecast`` column per processed channel (target column first,
     then the remaining numeric feature columns) instead of only
-    ``{target_column}_forecast``. Not supported with ``interpretability=True``
-    (raises ``ValueError``).
+    ``{target_column}_forecast``. This also applies to interpretability mode.
     """
     # Set model_horizon to forecast_horizon if not specified
     if model_horizon is None:
@@ -2300,15 +2210,6 @@ def perform_forecasting(
     # context windows for shorter requests while retaining the full retrieval
     # trajectory whenever callers ask for a longer forecast.
     darr_context_horizon = max(model_horizon, forecast_horizon)
-
-    # return_all_channels is not supported with interpretability: that path
-    # returns an explanation-aligned target forecast before the all-channel
-    # output branch runs. Fail loudly instead of silently ignoring the flag.
-    if return_all_channels and interpretability:
-        raise ValueError(
-            "return_all_channels=True is not supported with interpretability=True; "
-            "interpretability reports are generated for the target column only"
-        )
 
     # Input validation
     if df is None or df.empty:
@@ -2570,6 +2471,7 @@ def perform_forecasting(
                 interpretability_top_k=interpretability_top_k,
                 dataset_name=interpretability_dataset_name,
                 channel_output_aware=channel_output_aware,
+                return_all_channels=return_all_channels,
                 integrated_gradients=integrated_gradients,
                 integrated_gradients_baseline=integrated_gradients_baseline,
                 integrated_gradients_steps=integrated_gradients_steps,
@@ -2578,21 +2480,6 @@ def perform_forecasting(
                 integrated_gradients_reduce=integrated_gradients_reduce,
                 integrated_gradients_seed=seed,
                 integrated_gradients_grad_through_norm=integrated_gradients_grad_through_norm,
-                interpretability_channel_axis=interpretability_channel_axis,
-                interpretability_coupling=interpretability_coupling,
-                interpretability_coupling_transitions=interpretability_coupling_transitions,
-                interpretability_shapley_n_samples=interpretability_shapley_n_samples,
-                interpretability_shapley_baseline=interpretability_shapley_baseline,
-                interpretability_transition_batch=interpretability_transition_batch,
-                interpretability_channel_batch_size=interpretability_channel_batch_size,
-                interpretability_devices=interpretability_devices,
-                interpretability_parallel_passes=interpretability_parallel_passes,
-                interpretability_shapley_workers=interpretability_shapley_workers,
-                ckpt=ckpt,
-                model_name=model_name,
-                use_cross_channel=use_cross_channel,
-                cross_channel_heads=cross_channel_heads,
-                cross_channel_dropout=cross_channel_dropout,
             )
             logger.info("Interpretability bundle written to: %s", run_dir)
             if save_preds:

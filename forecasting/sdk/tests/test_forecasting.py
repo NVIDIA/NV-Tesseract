@@ -6,12 +6,14 @@ import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
+
 from sdk import forecasting
 
 
@@ -89,7 +91,7 @@ def patch_external_dependencies(monkeypatch):
 
 
 def make_timeseries(num_rows: int = 10) -> pd.DataFrame:
-    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="H")
+    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="h")
     return pd.DataFrame(
         {
             "timestamp": timestamps,
@@ -123,7 +125,7 @@ def make_timeseries_with_columns(num_rows: int = 10, columns: list[str] | None =
     if columns is None:
         columns = ["feature1", "feature2"]
 
-    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="H")
+    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="h")
     data = {
         "timestamp": timestamps,
         "target": np.arange(num_rows, dtype=np.float32),
@@ -332,19 +334,31 @@ def test_perform_forecasting_return_all_channels_darr_mode():
     assert result["feature_forecast"].notna().all()
 
 
-def test_perform_forecasting_return_all_channels_rejects_interpretability():
+def test_perform_forecasting_return_all_channels_supports_interpretability(monkeypatch, tmp_path):
+    def run_interpretability(**kwargs):
+        assert kwargs["return_all_channels"] is True
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-02", periods=3, freq="h"),
+                "target_forecast": np.ones(3, dtype=np.float32),
+                "feature_forecast": np.full(3, 2.0, dtype=np.float32),
+            }
+        ), tmp_path
+
+    monkeypatch.setattr(forecasting, "_run_interpretability", run_interpretability)
     df = make_timeseries(num_rows=10)
-    with pytest.raises(ValueError, match="return_all_channels"):
-        forecasting.perform_forecasting(
-            df,
-            seq_len=5,
-            forecast_horizon=3,
-            model_horizon=3,
-            standardizer_pkl="fake_std.pkl",
-            ckpt="fake_ckpt.pt",
-            return_all_channels=True,
-            interpretability=True,
-        )
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=3,
+        model_horizon=3,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        return_all_channels=True,
+        interpretability=True,
+    )
+
+    assert list(result.columns) == ["timestamp", "target_forecast", "feature_forecast"]
 
 
 def test_interpretability_sdk_defaults_match_algorithms():
@@ -362,6 +376,45 @@ def test_interpretability_sdk_defaults_match_algorithms():
     assert sdk_params["integrated_gradients_n_baselines"].default == ig_params["n_baselines"].default
     assert sdk_params["integrated_gradients_internal_batch_size"].default == ig_params["internal_batch_size"].default
     assert sdk_params["integrated_gradients_reduce"].default == ig_params["reduce"].default
+
+
+def test_explanation_json_groups_feature_axis_results():
+    explanation = forecasting.ForecastExplanation(
+        baseline_forecast=np.ones((2, 2), dtype=np.float32),
+        lag_horizon_scores=np.ones((2, 2), dtype=np.float32),
+        lag_horizon_attributions=np.full((2, 2), 0.5, dtype=np.float32),
+        flow_magnitudes=np.ones(3, dtype=np.float32),
+        latent_trajectory=np.ones((4, 2), dtype=np.float32),
+        per_channel_flow=np.ones((3, 2), dtype=np.float32),
+        lag_channel_horizon_attributions=np.ones((2, 2, 2), dtype=np.float32),
+        channel_horizon_attributions=np.full((2, 2), 0.25, dtype=np.float32),
+        channel_flow_method="jacobian",
+        channel_flow_residual_ratio_mean=0.1,
+        channel_flow_residual_ratio_p95=0.2,
+    )
+    forecast_df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h"),
+            "target_forecast": np.ones(2, dtype=np.float32),
+        }
+    )
+
+    payload = forecasting._explanation_to_dict(
+        forecast_df,
+        explanation,
+        target_column="target",
+    )
+
+    explanation_payload = payload["explanation"]
+    assert explanation_payload["feature_axis"] == {
+        "method": "jacobian",
+        "channel_horizon_attributions": [[0.25, 0.25], [0.25, 0.25]],
+        "residual_ratio_mean": 0.1,
+        "residual_ratio_p95": 0.2,
+        "per_channel_flow": [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+    }
+    assert "lag_channel_horizon_attributions" not in explanation_payload
+    assert "channel_horizon_attributions" not in explanation_payload
 
 
 def test_perform_forecasting_forwards_output_aware_mode(monkeypatch, tmp_path):
@@ -417,16 +470,19 @@ def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, t
         per_channel_flow=None,
         lag_channel_horizon_attributions=None,
         channel_horizon_attributions=None,
-        channel_coupling_matrix=None,
         channel_flow_method=None,
-        channel_coupling_off_diag_norm=None,
     )
     captured = {}
 
-    def moment_embed_fn(model, *, input_mask=None, grad_through_norm=False):
-        captured["input_mask"] = input_mask.detach().cpu().tolist()
-        captured["grad_through_norm"] = grad_through_norm
-        return lambda x: x.reshape(x.shape[0], -1).sum(dim=1, keepdim=True)
+    class EmbedModel(torch.nn.Module):
+        def embed(self, *, x_enc, input_mask):
+            captured["input_mask"] = input_mask[0].detach().cpu().tolist()
+            return SimpleNamespace(embeddings=x_enc.reshape(x_enc.shape[0], -1).sum(dim=1, keepdim=True))
+
+    @contextmanager
+    def normalization_statistics_gradient(model, *, enabled):
+        captured["grad_through_norm"] = enabled
+        yield 0
 
     def integrated_gradients_embedding(embed_fn, x, **kwargs):
         captured["ig_shape"] = tuple(x.shape)
@@ -454,12 +510,12 @@ def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, t
 
     monkeypatch.setattr(forecasting, "explain_forecast", lambda *args, **kwargs: explanation)
     monkeypatch.setattr(forecasting, "compute_trajectory_stability", lambda *args, **kwargs: None)
-    monkeypatch.setattr(ig, "moment_embed_fn", moment_embed_fn)
     monkeypatch.setattr(ig, "integrated_gradients_embedding", integrated_gradients_embedding)
+    monkeypatch.setattr(forecasting, "_normalization_statistics_gradient", normalization_statistics_gradient)
     monkeypatch.setattr(forecasting, "_save_lag_horizon_artifacts", lambda *args, **kwargs: None)
     monkeypatch.setattr(forecasting, "_build_pdf_report", build_pdf_report)
 
-    model = SimpleNamespace(eval=lambda: None)
+    model = EmbedModel()
     df = pd.DataFrame(
         {
             "timestamp": pd.date_range("2024-01-01", periods=6, freq="h"),
@@ -495,7 +551,6 @@ def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, t
         integrated_gradients_internal_batch_size=3,
         integrated_gradients_reduce="mean",
         integrated_gradients_seed=123,
-        interpretability_channel_axis=False,
     )
 
     payload = json.loads((run_dir / "explanation.json").read_text(encoding="utf-8"))
@@ -511,6 +566,36 @@ def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, t
     assert captured["pdf_report"]["attribution"].shape == (2, 4)
     assert (run_dir / "integrated_gradients_attributions.csv").exists()
     assert (run_dir / "integrated_gradients_channel_summary.csv").exists()
+
+
+def test_normalization_statistics_gradient_is_scoped():
+    class Normalizer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.eps = 1e-5
+
+        def _get_statistics(self, x, mask=None):
+            self.mean = x.mean(dim=-1, keepdim=True).detach()
+            self.stdev = x.std(dim=-1, keepdim=True, correction=0).detach() + self.eps
+
+        def _normalize(self, x):
+            return (x - self.mean) / self.stdev
+
+    model = torch.nn.Sequential(Normalizer())
+    normalizer = model[0]
+    x = torch.arange(12, dtype=torch.float32).reshape(1, 2, 6).requires_grad_(True)
+
+    assert "_get_statistics" not in vars(normalizer)
+    with forecasting._normalization_statistics_gradient(model, enabled=True) as patched:
+        normalizer._get_statistics(x)
+        assert patched == 1
+        assert normalizer.mean.requires_grad
+        assert normalizer.stdev.requires_grad
+
+    assert "_get_statistics" not in vars(normalizer)
+    normalizer._get_statistics(x)
+    assert not normalizer.mean.requires_grad
+    assert not normalizer.stdev.requires_grad
 
 
 def test_perform_forecasting_return_all_channels_rejects_timestamp_collision():

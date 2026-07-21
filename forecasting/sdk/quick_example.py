@@ -9,20 +9,13 @@ This example demonstrates:
 1. Auto-downloading model weights from Hugging Face (on first run)
 2. Standard forecasting mode
 3. DARR mode (context-enhanced forecasting)
-4. Interpretability mode (lag x horizon attributions, JSON + PDF report;
-   multivariate panels use channel-flow GPU batching and optional multi-GPU
-   Shapley coupling via SDK parallelism flags)
+4. Interpretability mode (lag and feature attributions, JSON + PDF report)
 
 Model weights download automatically from the public Hugging Face repo on first run.
-
-Multi-GPU interpretability (2+ CUDA devices):
-    RUN_MULTI_GPU_INTERP=1 uv run python quick_example.py
 """
 
 import logging
 import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -97,15 +90,11 @@ if __name__ == "__main__":
     #   - "pdf"  -> writes forecast.csv + lag_horizon_*.csv/png + explanation_report.pdf
     #   - None   -> writes both (full bundle)
     interp_out_dir = Path(__file__).resolve().parent / "interpretability_output"
-    # Use a multivariate panel so channel-flow batching and coupling run (C > 1).
-    interp_csv_path = Path(__file__).resolve().parent / "tests" / "datasets" / "ETTh_4feature.csv"
-    if not interp_csv_path.exists():
-        raise SystemExit(f"Multivariate CSV not found at {interp_csv_path} (needed for channel-flow demo).")
-    df_interp = pd.read_csv(interp_csv_path)
-
-    multi_gpu = os.environ.get("RUN_MULTI_GPU_INTERP", "").strip() in ("1", "true", "yes")
-    shapley_workers = 2 if multi_gpu else 0
-    parallel_passes = multi_gpu
+    # Add two derived channels so the feature-attribution page is included. Replace
+    # these with the actual feature columns used by your model in production.
+    df_interp = df.copy()
+    df_interp[f"{target_col}_diff"] = df_interp[target_col].diff().fillna(0.0)
+    df_interp[f"{target_col}_roll12"] = df_interp[target_col].rolling(window=12, min_periods=1).mean()
 
     interp_df = perform_forecasting(
         df=df_interp,
@@ -117,22 +106,10 @@ if __name__ == "__main__":
         interpretability=True,
         interpretability_output=None,  # write both JSON and PDF
         interpretability_out_dir=interp_out_dir,
-        interpretability_dataset_name=interp_csv_path.name,
+        interpretability_dataset_name=csv_path.name,
         n_lags=128,
         softmax_tau=1.0,
-        # Pass A: Jacobian channel flow (GPU-batched across transitions)
-        interpretability_channel_axis=True,
-        interpretability_transition_batch=8,
-        interpretability_channel_batch_size=64,
-        # Pass B: Shapley coupling matrix (auto-enabled for C > 1)
-        interpretability_coupling=True,
-        interpretability_coupling_transitions=16,
-        interpretability_shapley_n_samples=64,
-        interpretability_shapley_baseline="zero",
-        # Multi-GPU: shard Pass B and/or overlap Pass A + Pass B (needs 2+ CUDA devices)
-        interpretability_devices="auto",
-        interpretability_parallel_passes=parallel_passes,
-        interpretability_shapley_workers=shapley_workers,
+        integrated_gradients=True,
         save_preds="forecast_ETTh_with_explanations.csv",
     )
     logger.info(
@@ -141,33 +118,3 @@ if __name__ == "__main__":
         interp_df.head().to_string(index=False),
     )
     logger.info("\nReport bundle written under: %s", interp_out_dir)
-    logger.info("  (includes channel_coupling_matrix.csv when coupling is enabled)")
-
-    if multi_gpu:
-        logger.info("Multi-GPU interpretability ran via SDK parallelism flags.")
-    else:
-        oss_root = Path(__file__).resolve().parent.parent
-        logger.info(
-            "\nOptional: benchmark multi-GPU Shapley sharding (standalone CLI):\n"
-            "  cd %s\n"
-            "  uv run python run_interpretability_sharded.py --benchmark --shapley-workers 2\n"
-            "Or re-run this script with RUN_MULTI_GPU_INTERP=1 on a 2+ GPU host.",
-            oss_root,
-        )
-        if os.environ.get("RUN_SHARDED_CLI"):
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(oss_root / "run_interpretability_sharded.py"),
-                    "--csv",
-                    str(interp_csv_path),
-                    "--seq-len",
-                    str(seq_len),
-                    "--forecast-horizon",
-                    str(forecast_horizon),
-                    "--shapley-workers",
-                    "2",
-                ],
-                cwd=str(oss_root),
-                check=False,
-            )
