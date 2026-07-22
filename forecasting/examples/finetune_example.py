@@ -263,9 +263,9 @@ def save_artifacts(
         json.dump(metadata, f, indent=2)
 
 
-def parse_args() -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fine-tune NV-Tesseract forecasting on a CSV dataset.")
-    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group = parser.add_mutually_exclusive_group()
     data_group.add_argument("--csv", type=str, help="Single CSV to split temporally into train/val/test.")
     data_group.add_argument("--train-csv", type=str, help="Training CSV. Requires --val-csv.")
     parser.add_argument("--val-csv", type=str, help="Validation CSV when --train-csv is used.")
@@ -309,7 +309,89 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-cross-channel", action="store_true")
     parser.add_argument("--cross-channel-heads", type=int, default=8)
     parser.add_argument("--cross-channel-dropout", type=float, default=0.1)
-    return parser.parse_args()
+
+    parser.add_argument("--run-config", type=str, default=None, help=argparse.SUPPRESS)
+    return parser
+
+
+def _load_run_config(path: str) -> dict:
+    import yaml
+
+    text = Path(path).read_text()
+    return yaml.safe_load(text) or {}
+
+
+def _run_config_defaults(cfg: dict) -> list[str]:
+    """Flatten a nested YAML run-config into CLI-style --key value pairs."""
+    _BOOL_FLAGS = {
+        "no_standardize",
+        "local_files_only",
+        "unfreeze_encoder",
+        "unfreeze_embedder",
+        "use_cross_channel",
+    }
+    mapping = {
+        "dataset": {
+            "csv": "--csv",
+            "train_csv": "--train-csv",
+            "val_csv": "--val-csv",
+            "timestamp_col": "--timestamp-col",
+            "target_cols": "--target-cols",
+            "val_ratio": "--val-ratio",
+            "test_ratio": "--test-ratio",
+            "stride": "--stride",
+            "no_standardize": "--no-standardize",
+        },
+        "model": {
+            "seq_len": "--seq-len",
+            "forecast_horizon": "--forecast-horizon",
+            "ckpt_init": "--ckpt-init",
+            "use_cross_channel": "--use-cross-channel",
+            "cross_channel_heads": "--cross-channel-heads",
+            "cross_channel_dropout": "--cross-channel-dropout",
+            "unfreeze_encoder": "--unfreeze-encoder",
+            "unfreeze_embedder": "--unfreeze-embedder",
+        },
+        "train": {
+            "epochs": "--epochs",
+            "batch_size": "--batch-size",
+            "lr": "--lr",
+            "weight_decay": "--weight-decay",
+            "head_dropout": "--head-dropout",
+            "max_norm": "--max-norm",
+            "seed": "--seed",
+            "output_dir": "--output-dir",
+            "local_files_only": "--local-files-only",
+        },
+    }
+    extras: list[str] = []
+    for section, keys in mapping.items():
+        section_cfg = cfg.get(section, {}) or {}
+        for key, flag in keys.items():
+            val = section_cfg.get(key)
+            if val is None or val == "":
+                continue
+            if key in _BOOL_FLAGS:
+                if val:
+                    extras.append(flag)
+            else:
+                extras.extend([flag, str(val)])
+    return extras
+
+
+def parse_args() -> argparse.Namespace:
+    parser = _build_parser()
+    # First pass: detect --run-config without requiring --csv/--train-csv yet.
+    pre, _ = parser.parse_known_args()
+    defaults: list[str] = []
+    if pre.run_config:
+        cfg = _load_run_config(pre.run_config)
+        defaults = _run_config_defaults(cfg)
+    # Second pass: config defaults first, then CLI overrides.
+    args = parser.parse_args(defaults + sys.argv[1:])
+    if args.csv is None and args.train_csv is None:
+        parser.error("one of --csv or --train-csv is required (or supply both via --run-config)")
+    return args
 
 
 def main() -> None:
@@ -410,8 +492,15 @@ def main() -> None:
             LOGGER.info("Saved new best checkpoint to %s", output_dir / "best_model.pt")
 
     LOGGER.info("Fine-tuning complete. Best val MSE %.6f at epoch %s", best_val, best_epoch)
-    with (output_dir / "metrics.json").open("w") as f:
+    # Per-epoch log for human inspection.
+    with (output_dir / "epoch_metrics.json").open("w") as f:
         json.dump(metrics, f, indent=2)
+    # Scalar summary consumed by TAO AutoML runner metric extraction.
+    best_row = min(metrics, key=lambda r: r["val_mse"]) if metrics else {}
+    with (output_dir / "metrics.json").open("w") as f:
+        json.dump(
+            {"val_mse": best_row.get("val_mse", float("inf")), "val_mae": best_row.get("val_mae", float("inf"))}, f
+        )
     LOGGER.info("Artifacts written to %s", output_dir)
 
 
