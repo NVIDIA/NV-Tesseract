@@ -67,7 +67,7 @@ darr_result = perform_forecasting(
 
 #### Interpretability
 
-Forecasting includes a model-agnostic **interpretability** framework that explains *why* a forecast looks the way it does — without modifying the underlying model. Pass `interpretability=True` to write an explanation bundle alongside the forecast: input attributions per horizon, semantic-flow magnitudes in latent space, forecast-vs-history diagnostic ratios, and latent trajectory stability metrics (JSON, CSVs, and optional PDF report):
+Forecasting includes a model-agnostic **interpretability** framework that explains *why* a forecast looks the way it does — without modifying the underlying model. Pass `interpretability=True` to write an explanation bundle alongside the forecast: lag and feature attributions per horizon, semantic-flow diagnostics, trajectory stability, and optional embedding Integrated Gradients (JSON, CSVs, and PDF report):
 
 ```python
 results = perform_forecasting(
@@ -144,6 +144,8 @@ NV-Tesseract/
 │   ├── model.py                 # Model construction utilities
 │   ├── dataset_longhorizon.py   # Dataset classes for long-horizon forecasting
 │   ├── interpretability.py      # Model-agnostic forecast explanation engine
+│   ├── channel_flow.py          # Batched feature-axis Jacobian attribution
+│   ├── integrated_gradients.py  # Embedding Integrated Gradients
 │   ├── examples/
 │   │   ├── finetune_example.py  # CSV fine-tuning example
 │   │   └── tests/               # Fine-tuning example tests

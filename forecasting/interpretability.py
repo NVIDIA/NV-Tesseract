@@ -23,9 +23,8 @@ Stability / quality notes:
 - The pipeline assumes temporal smoothness of the embedding: small input
   changes should yield proportionally small latent changes. If not, flow
   magnitudes may reflect representation noise.
-- Use compute_embedding_stability() to run an empirical stability test
-  (effective Lipschitz ratio under small perturbations). Optionally use
-  SemanticFlowConfig.smooth_latent_alpha for temporal smoothing of Z.
+- Use SemanticFlowConfig.smooth_latent_alpha for optional temporal smoothing
+  of Z.
 - The latent trajectory is built over [history; forecast]. The forecast
   segment is out-of-distribution (model-generated). Flow there can be noisier;
   use flow_ratio_forecast_vs_history and flow_variance_ratio_forecast_vs_history
@@ -39,7 +38,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import numpy as np
 import torch
-from integrated_gradients import normalization_statistics_gradient
 
 if TYPE_CHECKING:
     from channel_flow import ChannelFlowConfig
@@ -48,7 +46,7 @@ Array = np.ndarray
 
 
 class ForecastModel(Protocol):
-    """Minimal protocol for MOMENT-like forecasting models."""
+    """Minimal protocol for models exposing forecast and embedding interfaces."""
 
     def __call__(self, *, x_enc: torch.Tensor, input_mask: torch.Tensor) -> Any:
         """Forward pass returning an object with a `.forecast` tensor [B, C, H]."""
@@ -87,26 +85,6 @@ class SemanticFlowConfig:
     smooth_latent_alpha: float = 0.0
     output_aware_aggregation: Literal["l2", "sum"] = "l2"
     eps: float = 1e-12
-
-
-@dataclass(frozen=True)
-class EmbeddingStabilityReport:
-    """
-    Result of empirical embedding stability test.
-
-    Under small input perturbations, we measure ||Z' - Z|| and ||x' - x|| and report the
-    effective ratio (Lipschitz-style). Lower ratios indicate more stable embeddings.
-    `n_trials` counts perturbation runs that contributed a ratio; `n_unique_windows`
-    counts the number of distinct time windows covered by those runs.
-    """
-
-    lip_ratio_mean: float
-    lip_ratio_max: float
-    lip_ratio_p50: float
-    lip_ratio_p95: float
-    n_trials: int
-    n_unique_windows: int
-    step_delta_norm_mean: float  # mean ||Z_{t+1} - Z_t|| on unperturbed trajectory (for reference)
 
 
 @dataclass(frozen=True)
@@ -195,17 +173,11 @@ class ForecastExplanation:
       - lag_channel_horizon_attributions: [K, C, H] -- softmax-normalized
         joint lag x channel x horizon attribution.
       - channel_horizon_attributions: [C, H] -- channel-marginal of the
-        joint attribution; suitable for channel-axis faithfulness benchmarks.
-      - channel_coupling_matrix: [C, C] -- Harsanyi dividend matrix
-        diagnosing cross-channel interaction; symmetric, zero diagonal.
-      - channel_flow_method: which estimator produced the above
-        ("jacobian" / "shapley_exact" / "shapley_kernel").
+        joint attribution; suitable for feature-axis evaluations.
+      - channel_flow_method: which Jacobian estimator produced the above.
       - channel_flow_residual_ratio_mean / _p95: trust-region diagnostic for
         the Jacobian variant. ``|| Delta Z - sum_c Delta Z^(c) || / ||Delta Z||``
         averaged over transitions; lower is better.
-      - channel_coupling_off_diag_norm: Frobenius norm of the off-diagonal
-        coupling matrix; sharply distinguishes channel-mixing models (large)
-        from channel-independent ones (~0).
     """
 
     baseline_forecast: Array
@@ -225,11 +197,9 @@ class ForecastExplanation:
     lag_channel_horizon_scores: Array | None = None
     lag_channel_horizon_attributions: Array | None = None
     channel_horizon_attributions: Array | None = None
-    channel_coupling_matrix: Array | None = None
     channel_flow_method: str | None = None
     channel_flow_residual_ratio_mean: float | None = None
     channel_flow_residual_ratio_p95: float | None = None
-    channel_coupling_off_diag_norm: float | None = None
 
 
 def _flow_segment_ratios(
@@ -386,11 +356,18 @@ def _forecast_autoregressive(
     B, C, seq_len = x_enc.shape
     device = x_enc.device
 
+    def _finite_forecast(value: Array, *, stage: str) -> Array:
+        value = np.asarray(value, dtype=np.float32)
+        if not np.isfinite(value).all():
+            n_bad = int((~np.isfinite(value)).sum())
+            raise FloatingPointError(f"Model forecast produced {n_bad} non-finite value(s) during {stage}")
+        return value
+
     if target_horizon <= model_horizon:
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             out = model(x_enc=x_enc, input_mask=input_mask)
         forecast = _as_numpy(out.forecast[:, :, :target_horizon]).astype(np.float32, copy=False)
-        return np.nan_to_num(forecast, nan=0.0, posinf=0.0, neginf=0.0)
+        return _finite_forecast(forecast, stage="direct forecasting")
 
     num_iters = int(np.ceil(target_horizon / model_horizon))
     cur_x = x_enc.clone()
@@ -399,9 +376,14 @@ def _forecast_autoregressive(
     remaining = target_horizon
 
     for _ in range(num_iters):
-        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             out = model(x_enc=cur_x, input_mask=cur_mask)
-        chunk = torch.nan_to_num(out.forecast.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        chunk = out.forecast.detach()
+        if not bool(torch.isfinite(chunk).all()):
+            n_bad = int((~torch.isfinite(chunk)).sum().item())
+            raise FloatingPointError(
+                f"Model forecast produced {n_bad} non-finite value(s) during autoregressive forecasting"
+            )
         steps = min(model_horizon, remaining)
         chunk_trimmed = chunk[:, :, :steps]
         preds_chunks.append(chunk_trimmed.to(device="cpu", dtype=torch.float32).numpy())
@@ -461,36 +443,35 @@ def compute_target_channel_input_jacobian_importance(
         delta_t = torch.from_numpy(delta[None]).to(device=device, dtype=torch.float32)
         x_t = torch.from_numpy(arr[None]).to(device=device, dtype=torch.float32).requires_grad_(True)
         m_t = torch.from_numpy(mask[None]).to(device=device, dtype=torch.long)
-        with normalization_statistics_gradient(model, "frozen"):
-            with torch.enable_grad():
-                out = model(x_enc=x_t, input_mask=m_t)
-                forecast = out.forecast[:, target, :H]
-                if forecast.shape[-1] < H:
-                    raise ValueError(f"Model returned horizon={forecast.shape[-1]}, expected at least {H}")
-                if forecast.requires_grad:
-                    importance = np.zeros((C, H), dtype=np.float32)
-                    input_is_connected = True
-                    for h in range(H):
-                        grad = torch.autograd.grad(
-                            forecast[:, h].sum(),
-                            x_t,
-                            retain_graph=h < H - 1,
-                            create_graph=False,
-                            allow_unused=True,
-                        )[0]
-                        if grad is None:
-                            input_is_connected = False
-                            break
-                        score_c = (grad * delta_t).sum(dim=-1).abs()[0]
-                        active_t = torch.as_tensor(active_direction, dtype=torch.bool, device=score_c.device)
-                        score_c = torch.where(active_t, score_c, torch.zeros_like(score_c))
-                        importance[:, h] = score_c.detach().cpu().numpy().astype(np.float32)
-                    if input_is_connected:
-                        importance[target, :] = 0.0
-                        if not np.isfinite(importance).all():
-                            n_bad = int((~np.isfinite(importance)).sum())
-                            raise FloatingPointError(f"Jacobian attribution produced {n_bad} non-finite value(s)")
-                        return importance.astype(np.float32, copy=False)
+        with torch.enable_grad():
+            out = model(x_enc=x_t, input_mask=m_t)
+            forecast = out.forecast[:, target, :H]
+            if forecast.shape[-1] < H:
+                raise ValueError(f"Model returned horizon={forecast.shape[-1]}, expected at least {H}")
+            if forecast.requires_grad:
+                importance = np.zeros((C, H), dtype=np.float32)
+                input_is_connected = True
+                for h in range(H):
+                    grad = torch.autograd.grad(
+                        forecast[:, h].sum(),
+                        x_t,
+                        retain_graph=h < H - 1,
+                        create_graph=False,
+                        allow_unused=True,
+                    )[0]
+                    if grad is None:
+                        input_is_connected = False
+                        break
+                    score_c = (grad * delta_t).sum(dim=-1).abs()[0]
+                    active_t = torch.as_tensor(active_direction, dtype=torch.bool, device=score_c.device)
+                    score_c = torch.where(active_t, score_c, torch.zeros_like(score_c))
+                    importance[:, h] = score_c.detach().cpu().numpy().astype(np.float32)
+                if input_is_connected:
+                    importance[target, :] = 0.0
+                    if not np.isfinite(importance).all():
+                        n_bad = int((~np.isfinite(importance)).sum())
+                        raise FloatingPointError(f"Jacobian attribution produced {n_bad} non-finite value(s)")
+                    return importance.astype(np.float32, copy=False)
 
     eps = float(finite_difference_scale)
     if not (0.0 < eps <= 1.0):
@@ -514,6 +495,7 @@ def compute_target_channel_input_jacobian_importance(
             model_horizon=int(model_horizon),
             target_horizon=H,
         )[:, target, :]
+        yb = np.asarray(yb, dtype=np.float32)
         effects = np.abs(yb[len(chunk) :] - yb[: len(chunk)]) / (2.0 * eps)
         for i, c in enumerate(chunk):
             importance[c, :] = effects[i]
@@ -824,123 +806,6 @@ def compute_trajectory_stability(
         normalize=normalize,
         zero_band=zero_band,
         eps=eps,
-    )
-
-
-@torch.no_grad()
-def compute_embedding_stability(
-    model: ForecastModel,
-    series_ct: Array,  # [C, T]
-    *,
-    seq_len: int,
-    input_mask_t: Array | None = None,  # [T] optional observed mask for the series
-    device: torch.device,
-    n_trials: int = 50,
-    noise_scale: float = 0.01,
-    time_indices: Array | None = None,
-    batch_size: int = 16,
-    seed: int = 42,
-) -> EmbeddingStabilityReport:
-    """
-    Empirical stability test for the latent mapping Z_t = embed(x_{t-L+1:t}).
-
-    For each trial we perturb the input window slightly (Gaussian noise scaled by input std),
-    embed both original and perturbed windows, and compute the ratio:
-      ratio = ||Z' - Z||_2 / (||x' - x||_F + eps)
-    A bounded ratio (e.g. low mean/max) suggests Lipschitz-like behaviour; large ratios
-    indicate that small input changes cause large latent jumps (representation noise).
-
-    Returns:
-      EmbeddingStabilityReport with lip_ratio stats and mean step delta ||Z_{t+1}-Z_t||
-      on the unperturbed trajectory for comparison. `n_trials` counts perturbation
-      runs; `n_unique_windows` counts distinct valid windows used.
-    """
-    xw_view, m_view, T = _rolling_window_sources(series_ct, seq_len=seq_len, input_mask_t=input_mask_t)
-    if T < 2:
-        raise ValueError("Need at least 2 time steps for stability test")
-
-    rng = np.random.default_rng(seed)
-    if time_indices is None:
-        # Prefer indices where we have full windows. If we have fewer candidates than n_trials
-        # (e.g. single context window [C,L] gives only one full-window index), we repeat
-        # with different random perturbations to get n_trials ratios.
-        candidates = np.arange(seq_len - 1, T, dtype=np.int64)
-        if len(candidates) == 0:
-            candidates = np.arange(T, dtype=np.int64)
-        if len(candidates) >= n_trials:
-            time_indices = rng.choice(candidates, size=n_trials, replace=False)
-        else:
-            # Repeat indices so we can run n_trials perturbations (different noise each time)
-            n_repeats = int(np.ceil(n_trials / len(candidates)))
-            time_indices = np.tile(candidates, n_repeats)[:n_trials]
-            rng.shuffle(time_indices)
-    else:
-        time_indices = np.asarray(time_indices, dtype=np.int64).ravel()
-
-    ratios: list[float] = []
-    used_time_indices: set[int] = set()
-    for t in time_indices:
-        if t < 0 or t >= T:
-            continue
-        x_window, m_window = _rolling_window_batch(xw_view, m_view, start=int(t), stop=int(t) + 1)
-        x = x_window[0]  # [C, L]
-        win_mask = m_window[0].astype(np.float32, copy=False)  # [L]
-        obs = win_mask.astype(bool)
-        if not np.any(obs):
-            continue
-
-        # Perturb: additive Gaussian noise scaled by per-channel std (observed positions only)
-        std = np.std(x[:, obs], axis=1, keepdims=True)
-        std = np.where(std < 1e-8, 1.0, std)
-        noise = rng.standard_normal(x.shape).astype(np.float32) * float(noise_scale) * std
-        noise = noise * win_mask[None, :]
-        x_pert = x + noise
-
-        dx_norm = float(np.linalg.norm((x_pert - x) * win_mask[None, :], ord="fro")) + 1e-12
-        if dx_norm < 1e-12:
-            continue
-
-        x_batch = np.stack([x, x_pert], axis=0)  # [2, C, L]
-        m_batch = np.repeat(m_window, repeats=2, axis=0)
-        x_t = torch.from_numpy(x_batch).to(device=device, dtype=torch.float32)
-        m_t = torch.from_numpy(m_batch).to(device=device, dtype=torch.long)
-        Z_batch = _embed_batch(model, x_t, m_t)  # [2, D]
-        dz_norm = float(np.linalg.norm(Z_batch[1] - Z_batch[0], ord=2)) + 1e-12
-        ratios.append(dz_norm / dx_norm)
-        used_time_indices.add(int(t))
-
-    if not ratios:
-        return EmbeddingStabilityReport(
-            lip_ratio_mean=float("nan"),
-            lip_ratio_max=float("nan"),
-            lip_ratio_p50=float("nan"),
-            lip_ratio_p95=float("nan"),
-            n_trials=0,
-            n_unique_windows=0,
-            step_delta_norm_mean=float("nan"),
-        )
-
-    ratios_arr = np.array(ratios, dtype=np.float64)
-    # Unperturbed trajectory step deltas (consecutive pairs). Use nanmean in case some Z are NaN.
-    Z_full = extract_latent_trajectory(
-        model,
-        series_ct,
-        seq_len=seq_len,
-        input_mask_t=input_mask_t,
-        device=device,
-        batch_size=batch_size,
-    )
-    step_deltas = np.linalg.norm(Z_full[1:] - Z_full[:-1], ord=2, axis=1)
-    step_delta_mean = float(np.nanmean(step_deltas))
-
-    return EmbeddingStabilityReport(
-        lip_ratio_mean=float(np.mean(ratios_arr)),
-        lip_ratio_max=float(np.max(ratios_arr)),
-        lip_ratio_p50=float(np.percentile(ratios_arr, 50)),
-        lip_ratio_p95=float(np.percentile(ratios_arr, 95)),
-        n_trials=len(ratios),
-        n_unique_windows=len(used_time_indices),
-        step_delta_norm_mean=step_delta_mean,
     )
 
 
@@ -1520,15 +1385,12 @@ def explain_forecast(
       5) Optional horizon-specific local surrogates with structure-preserving perturbations
 
     When ``channel_axis=True`` (and the input has C > 1 channels) we additionally
-    run the v2 feature-axis stages: per-channel flow decomposition, joint
-    lag x channel x horizon attribution, and -- for the Shapley variant --
-    the cross-channel coupling matrix.
+    run the v2 feature-axis stages: per-channel Jacobian-flow decomposition
+    and joint lag x channel x horizon attribution.
 
     Pass ``chan_cfg`` to control the per-channel flow estimator. When
-    ``chan_cfg`` is None we default to ``ChannelFlowConfig()`` (Jacobian
-    variant), which is the fast O(C) estimator suitable for routine use.
-    Use ``ChannelFlowConfig(method="shapley")`` when you need the axiomatic
-    decomposition or the coupling matrix for a paper figure.
+    ``chan_cfg`` is None we default to ``ChannelFlowConfig()``, the fast O(C)
+    estimator suitable for routine use.
     """
     flow_cfg = flow_cfg or SemanticFlowConfig()
     pert_cfg = pert_cfg or PerturbationConfig()
@@ -1624,22 +1486,19 @@ def explain_forecast(
     lag_chan_scores = None
     lag_chan_attrib = None
     chan_horizon_attrib = None
-    coupling_mat = None
     chan_method = None
     chan_resid_mean = None
     chan_resid_p95 = None
-    coupling_norm = None
     if channel_axis:
         from channel_flow import (  # local import avoids circular dependency at module load
             ChannelFlowConfig,
             channel_horizon_marginal,
             compute_per_channel_flow,
             lag_channel_horizon_attribution,
-            make_target_forecast_value_fn,
         )
 
         chan_cfg_eff = chan_cfg if chan_cfg is not None else ChannelFlowConfig()
-        if channel_output_aware and chan_cfg_eff.method == "jacobian":
+        if channel_output_aware:
             if channel_target is None:
                 raise ValueError(
                     "channel_output_aware=True requires channel_target (the forecast "
@@ -1656,19 +1515,6 @@ def explain_forecast(
             )
             chan_method = "target_input_jacobian"
         else:
-            chan_value_fn = None
-            if channel_output_aware:
-                if channel_target is None:
-                    raise ValueError(
-                        "channel_output_aware=True requires channel_target (the forecast "
-                        "channel whose prediction the attribution should explain)."
-                    )
-                chan_value_fn = make_target_forecast_value_fn(
-                    target_channel=int(channel_target),
-                    model_horizon=int(model_horizon),
-                    forecast_horizon=int(forecast_horizon),
-                )
-            chan_protect = (int(channel_target),) if channel_output_aware and channel_target is not None else None
             report = compute_per_channel_flow(
                 model,
                 series_ext,
@@ -1676,16 +1522,11 @@ def explain_forecast(
                 input_mask_t=mask_ext,
                 device=device,
                 cfg=chan_cfg_eff,
-                value_fn=chan_value_fn,
-                protect_channels=chan_protect,
             )
             per_chan_flow = report.per_channel_flow
             chan_method = report.method
             chan_resid_mean = report.residual_ratio_mean
             chan_resid_p95 = report.residual_ratio_p95
-            coupling_mat = report.coupling_matrix
-            coupling_norm = report.coupling_off_diag_norm
-
             chan_tau = float(channel_softmax_tau) if channel_softmax_tau is not None else float(softmax_tau)
             lag_chan_scores, lag_chan_attrib = lag_channel_horizon_attribution(
                 per_chan_flow,
@@ -1714,9 +1555,7 @@ def explain_forecast(
         lag_channel_horizon_scores=lag_chan_scores,
         lag_channel_horizon_attributions=lag_chan_attrib,
         channel_horizon_attributions=chan_horizon_attrib,
-        channel_coupling_matrix=coupling_mat,
         channel_flow_method=chan_method,
         channel_flow_residual_ratio_mean=chan_resid_mean,
         channel_flow_residual_ratio_p95=chan_resid_p95,
-        channel_coupling_off_diag_norm=coupling_norm,
     )

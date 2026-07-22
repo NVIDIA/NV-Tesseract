@@ -29,27 +29,22 @@ By the completeness axiom,
 
 which is reported as a convergence diagnostic.
 
-Baseline choice (important for time-series foundation models)
-=============================================================
-MOMENT's RevIN applies
-**instance normalization** ``(x - mean) / std`` inside the encoder, which is
-invariant to shifting and scaling the input. A straight-line path from a *zero
-or constant* baseline to ``x`` is, after normalization, the **same** normalized
-series at every step -- so the embedding is flat along the path, the accumulated
-gradient is ~0, and IG fails completeness (it misses the jump at the degenerate
-endpoint). The fix is a **structured baseline** that carries its own shape; the
-default here is white-noise matched to the input's global mean/std, which breaks
-the invariance and restores completeness. Averaging over several such baselines
-(``n_baselines > 1``) is the Expected-Gradients estimator and reduces variance.
+Baseline choice (important for instance-normalized encoders)
+============================================================
+Instance normalization ``(x - mean) / std`` is invariant to shifting and scaling
+the input. A straight-line path from a *zero or constant* baseline to ``x`` can
+therefore become the same normalized series at every step, making the embedding
+flat along the path and degrading IG completeness at the degenerate endpoint.
+The default white-noise baseline is matched to the input's global mean/std, which
+breaks that invariance. Averaging several such baselines (``n_baselines > 1``)
+produces the Expected-Gradients estimator and reduces variance.
 
 Design
 ======
 * **Model-agnostic.** The core depends only on a differentiable
   ``embed_fn: Tensor[n, *feat] -> Tensor[n, D]`` that maps a *batch* of inputs
   to a batch of embeddings. Nothing here knows about channels, patches,
-  missingness, or any specific architecture. :func:`moment_embed_fn` builds
-  ``embed_fn`` for the SDK model, and any other encoder can be plugged in the
-  same way.
+  missingness, or any specific architecture.
 * **Real gradients.** Unlike the gradient-free probes elsewhere in
   this package, this uses autograd: interpolation points are pushed through the
   encoder in one or more batches and ``torch.autograd.grad`` yields the
@@ -57,16 +52,13 @@ Design
   only on its own row).
 * **Global, not per-axis.** The headline output is a single scalar effect over
   the whole embedding layer plus a saliency map in the input's own shape. No
-  channel/feature-axis decomposition (that is a MOMENT-specific notion).
+  channel/feature-axis decomposition is imposed by this primitive.
 
 Cost: one forward/gradient pass per interpolation chunk.
 """
 
-import sys
-import types
 import warnings
 from collections.abc import Callable
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
 
@@ -77,7 +69,6 @@ Array = np.ndarray
 EmbedFn = Callable[[torch.Tensor], torch.Tensor]
 Reduce = Literal["l2", "sum", "mean"]
 BaselineMode = Literal["noise", "zero", "mean"]
-NormalizationGradientMode = Literal["native", "full", "frozen"]
 
 
 @dataclass(frozen=True)
@@ -167,7 +158,7 @@ def _ig_single(
             g = _reduce_embedding(emb, reduce)  # [count]
             # Request only input-path gradients. Using .backward() here would
             # also materialize parameter gradients for large encoders and keep
-            # them resident across benchmark windows.
+            # them resident across integration batches.
             grad = torch.autograd.grad(g.sum(), x_interp, retain_graph=False, create_graph=False)[0]
 
         grad_sum += grad.detach().sum(dim=0)
@@ -202,8 +193,7 @@ def integrated_gradients_embedding(
     Args:
         embed_fn: differentiable map from a *batch* of inputs ``[n, *feat]`` to a
             batch of embeddings ``[n, D]`` (or any ``[n, ...]`` reduced to a
-            scalar per row). This is the only model-specific piece; build it with
-            :func:`moment_embed_fn` or your own.
+            scalar per row). This callable is the only model-specific input.
         x: a single input window, shape ``[*feat]`` (no batch dim).
         baseline: path start. Either a mode string or an explicit reference:
 
@@ -319,148 +309,7 @@ def integrated_gradients_embedding(
     )
 
 
-# ---------------------------------------------------------------------------
-# Thin model adapter (build an ``embed_fn`` for the SDK's MOMENT model).
-# ---------------------------------------------------------------------------
-
-
-def enable_grad_through_revin(model) -> int:
-    """Let gradients flow through RevIN normalization statistics (in place).
-
-    MOMENT-style RevIN computes ``(x - mean) / std`` but ``.detach()``-es ``mean``
-    and ``std``, so autograd treats them as constants and Integrated-Gradients
-    *cannot* satisfy completeness (the path integral misses the chain-rule term
-    through the statistics). This rebinds each RevIN module's ``_get_statistics``
-    to a non-detaching version.
-
-    This only changes the **backward** pass -- ``.detach()`` does not affect the
-    forward values -- so all forecasts / eval outputs are bit-for-bit unchanged;
-    it merely makes the embedding differentiable end-to-end for attribution.
-
-    Returns the number of normalizer modules patched. Idempotent.
-    """
-    patched = 0
-    for m in model.modules():
-        if getattr(m, "_grad_through_revin", False):
-            patched += 1
-            continue
-        # RevIN sets ``mean``/``stdev`` only during the forward, so detect by the
-        # always-present method + ``eps`` attribute instead.
-        if not (hasattr(m, "_get_statistics") and hasattr(m, "_normalize") and hasattr(m, "eps")):
-            continue
-        mod = sys.modules.get(type(m).__module__)
-        nanstd = getattr(mod, "nanstd", None)
-        if nanstd is None:
-            continue
-
-        def _make(nanstd_fn):
-            def _get_statistics(self, x, mask=None):
-                if mask is None:
-                    mask = torch.ones((x.shape[0], x.shape[-1]), device=x.device)
-                n_channels = x.shape[1]
-                mask = mask.unsqueeze(1).repeat(1, n_channels, 1).bool()
-                masked_x = torch.where(mask, x, torch.full_like(x, float("nan")))
-                self.mean = torch.nanmean(masked_x, dim=-1, keepdim=True)
-                self.stdev = nanstd_fn(masked_x, dim=-1, keepdim=True) + self.eps
-
-            return _get_statistics
-
-        m._get_statistics = types.MethodType(_make(nanstd), m)
-        m._grad_through_revin = True
-        patched += 1
-    return patched
-
-
-@contextmanager
-def normalization_statistics_gradient(model, mode: NormalizationGradientMode):
-    """Temporarily control gradients through supported input normalizers.
-
-    ``mode="full"`` differentiates through per-window location and scale for
-    Integrated Gradients completeness. ``mode="frozen"`` preserves the exact
-    forward values while treating those statistics as constants in backward,
-    which defines the local directional derivative in normalized coordinates.
-    ``mode="native"`` leaves the model untouched.
-    """
-    if mode not in ("native", "full", "frozen"):
-        raise ValueError(f"Unknown normalization gradient mode: {mode!r}")
-    if mode == "native":
-        yield 0
-        return
-
-    root = model if hasattr(model, "modules") else getattr(model, "model", None)
-    if root is None or not hasattr(root, "modules"):
-        yield 0
-        return
-
-    detach_statistics = mode == "frozen"
-    restores: list[tuple[object, str, object, bool]] = []
-
-    for module in root.modules():
-        if all(hasattr(module, name) for name in ("_get_statistics", "_normalize", "eps")):
-            original = module._get_statistics
-            had_instance_override = "_get_statistics" in vars(module)
-
-            def _make_revin_get_statistics(detach: bool):
-                def _get_statistics(self, x, mask=None):
-                    if mask is None:
-                        mask = torch.ones((x.shape[0], x.shape[-1]), device=x.device)
-                    expanded = mask.to(device=x.device).unsqueeze(1).expand(-1, x.shape[1], -1).bool()
-                    masked_x = torch.where(expanded, x, torch.full_like(x, float("nan")))
-                    mean = torch.nanmean(masked_x, dim=-1, keepdim=True)
-                    stdev = (masked_x - mean).square().nanmean(dim=-1, keepdim=True).sqrt()
-                    if detach:
-                        mean = mean.detach()
-                        stdev = stdev.detach()
-                    self.mean = mean
-                    self.stdev = stdev + self.eps
-
-                return _get_statistics
-
-            module._get_statistics = types.MethodType(_make_revin_get_statistics(detach_statistics), module)
-            restores.append((module, "_get_statistics", original, had_instance_override))
-
-    try:
-        yield len(restores)
-    finally:
-        for module, name, original, had_instance_override in reversed(restores):
-            if had_instance_override:
-                setattr(module, name, original)
-            else:
-                delattr(module, name)
-
-
-def moment_embed_fn(model, *, input_mask: torch.Tensor | None = None, grad_through_norm: bool = False) -> EmbedFn:
-    """``embed_fn`` for a MOMENT-style model exposing ``embed(x_enc=, input_mask=).embeddings``.
-
-    Input batch shape: ``[n, C, L]``. Returns embeddings ``[n, D]``.
-
-    Args:
-        grad_through_norm: if True, gradients flow through RevIN statistics so
-            IG stays faithful. The override is scoped to each embedding call
-            and restored immediately.
-    """
-
-    def _fn(x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"MOMENT embed_fn expects [n, C, L]; got {tuple(x.shape)}")
-        n, _, L = x.shape
-        mask = input_mask
-        if mask is None:
-            mask = torch.ones((n, L), dtype=torch.long, device=x.device)
-        elif mask.ndim == 1:
-            mask = mask.reshape(1, -1).expand(n, -1).to(device=x.device)
-        with normalization_statistics_gradient(model, "full" if grad_through_norm else "native"):
-            out = model.embed(x_enc=x, input_mask=mask)
-        emb = out.embeddings if hasattr(out, "embeddings") else out
-        return emb.reshape(emb.shape[0], -1)
-
-    return _fn
-
-
 __all__ = [
     "EmbeddingAttribution",
-    "enable_grad_through_revin",
     "integrated_gradients_embedding",
-    "moment_embed_fn",
-    "normalization_statistics_gradient",
 ]

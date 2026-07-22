@@ -10,18 +10,18 @@ logger = logging.getLogger(__name__)
 """
 Parallel-execution utilities for the interpretability framework.
 
-This module provides two complementary axes of speedup:
+This module provides reusable parallel-execution building blocks:
 
 * **Multi-GPU data parallelism**: a small fork-join helper
   (:func:`parallel_map_with_init`) that distributes a list of coarse work
   units across one process per visible GPU. Each worker initialises its own
-  model on its assigned device and pulls items off a shared queue. Used by
-  the high-level runners to spread per-window / per-method evaluations.
+  model on its assigned device and pulls items off a shared queue.
 
-* **Intra-call batching**: utility helpers (:func:`available_devices`,
-  :func:`recommend_num_workers`) plus a tiny generic chunker
-  (:func:`chunk_indices`) used by the per-channel-flow code to stack many
-  independent transitions into a single forward pass.
+* **CPU threading**: :func:`parallel_apply_threads` runs independent NumPy
+  workloads concurrently and is used by the optional local surrogate fit.
+
+Device discovery, worker-count selection, and generic chunking helpers are
+also available to callers that need to orchestrate larger workloads.
 
 Design notes
 ------------
@@ -31,10 +31,8 @@ execution when only one device is available, so the same code path works
 on CPU/MPS/single-GPU laptops without spawning subprocesses.
 
 We deliberately avoid ``DataParallel`` / ``DistributedDataParallel`` because
-the work units here (per-window faithfulness evaluation, per-method
-attribution, per-transition Jacobian probe) are coarse and highly
-heterogeneous in compute cost; a simple per-process model copy + work
-queue gives near-linear speedup with much less complexity than DDP.
+the worker-pool API targets coarse, independent work units. A per-process
+model copy and shared work queue fit that workload without DDP coordination.
 """
 
 import contextlib
