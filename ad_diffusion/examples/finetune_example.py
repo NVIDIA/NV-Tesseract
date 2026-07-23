@@ -23,7 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,9 +33,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import yaml
 from sklearn.decomposition import PCA
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +55,24 @@ from sdk.inference_ad import (
 )
 
 LOGGER = logging.getLogger("ad_diffusion_finetune")
+
+
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def init_distributed(rank: int, world_size: int) -> None:
+    if world_size <= 1:
+        return
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 class FeatureAdapter:
@@ -169,9 +193,9 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> torch.device:
+def get_device(local_rank: int = 0) -> torch.device:
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        return torch.device(f"cuda:{local_rank}")
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -370,6 +394,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-6)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use. Defaults to all available GPUs. Set to 1 to force single-GPU.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="artifacts/finetune")
 
@@ -402,11 +432,14 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    set_seed(args.seed)
-    device = get_device()
+def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
+    is_main = rank == 0
+    init_distributed(rank, world_size)
+
+    if is_main:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    set_seed(args.seed + rank)
+    device = get_device(rank if world_size > 1 else 0)
     output_dir = Path(args.output_dir)
 
     model_path, config_path = resolve_model_assets(args)
@@ -425,10 +458,13 @@ def main() -> None:
 
     train_dataset = MaskedWindowDataset(train_tensor, window_length, args.window_stride, split)
     val_dataset = MaskedWindowDataset(val_tensor, window_length, args.window_stride, split)
+
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -440,14 +476,17 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     )
 
-    LOGGER.info("Device: %s", device)
-    LOGGER.info("Target dimension: %s", target_dim)
-    LOGGER.info("Feature columns: %s", columns)
-    LOGGER.info("Train windows: %s", len(train_dataset))
-    LOGGER.info("Val windows: %s", len(val_dataset))
+    if is_main:
+        LOGGER.info("Device: %s | world_size: %s", device, world_size)
+        LOGGER.info("Target dimension: %s", target_dim)
+        LOGGER.info("Feature columns: %s", columns)
+        LOGGER.info("Train windows: %s", len(train_dataset))
+        LOGGER.info("Val windows: %s", len(val_dataset))
 
     model = TSDiffuser_Generic(config, device=device, target_dim=target_dim, ratio=args.mask_ratio).to(device)
     load_state_dict(model, checkpoint)
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     preprocessing = adapter.metadata()
@@ -457,16 +496,20 @@ def main() -> None:
     best_val = float("inf")
     metrics: list[dict[str, float]] = []
     for epoch in range(1, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_loss = train_one_epoch(model, train_loader, optimizer, device, args.grad_clip)
         val_loss = validate(model, val_loader, device)
         metrics.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        LOGGER.info("Epoch %s/%s | train loss %.6f | val loss %.6f", epoch, args.epochs, train_loss, val_loss)
+        if is_main:
+            LOGGER.info("Epoch %s/%s | train loss %.6f | val loss %.6f", epoch, args.epochs, train_loss, val_loss)
 
-        if val_loss < best_val:
+        if is_main and val_loss < best_val:
             best_val = val_loss
+            raw_model = model.module if isinstance(model, DDP) else model
             save_checkpoint(
                 output_dir / "best_finetuned_model.pth",
-                model,
+                raw_model,
                 optimizer,
                 config,
                 args,
@@ -477,29 +520,47 @@ def main() -> None:
             )
             LOGGER.info("Saved new best checkpoint to %s", output_dir / "best_finetuned_model.pth")
 
-    save_checkpoint(
-        output_dir / "final_finetuned_model.pth",
-        model,
-        optimizer,
-        config,
-        args,
-        args.epochs,
-        metrics[-1]["train_loss"],
-        metrics[-1]["val_loss"],
-        preprocessing,
-    )
-    # Per-epoch log for human inspection.
-    with (output_dir / "epoch_metrics.json").open("w") as f:
-        json.dump(metrics, f, indent=2)
-    # Scalar summary consumed by TAO AutoML runner metric extraction.
-    best_val_loss = min(m["val_loss"] for m in metrics) if metrics else float("inf")
-    with (output_dir / "metrics.json").open("w") as f:
-        json.dump({"val_loss": best_val_loss}, f)
-    with (output_dir / "finetune_config.yaml").open("w") as f:
-        yaml.safe_dump(config, f)
+    if is_main:
+        raw_model = model.module if isinstance(model, DDP) else model
+        save_checkpoint(
+            output_dir / "final_finetuned_model.pth",
+            raw_model,
+            optimizer,
+            config,
+            args,
+            args.epochs,
+            metrics[-1]["train_loss"],
+            metrics[-1]["val_loss"],
+            preprocessing,
+        )
+        # Per-epoch log for human inspection.
+        with (output_dir / "epoch_metrics.json").open("w") as f:
+            json.dump(metrics, f, indent=2)
+        # Scalar summary consumed by TAO AutoML runner metric extraction.
+        best_val_loss = min(m["val_loss"] for m in metrics) if metrics else float("inf")
+        with (output_dir / "metrics.json").open("w") as f:
+            json.dump({"val_loss": best_val_loss}, f)
+        with (output_dir / "finetune_config.yaml").open("w") as f:
+            yaml.safe_dump(config, f)
+        LOGGER.info("Fine-tuning complete. Best val loss %.6f", best_val)
+        LOGGER.info("Artifacts written to %s", output_dir)
 
-    LOGGER.info("Fine-tuning complete. Best val loss %.6f", best_val)
-    LOGGER.info("Artifacts written to %s", output_dir)
+    cleanup_distributed()
+
+
+def main() -> None:
+    args = parse_args()
+
+    available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    world_size = args.num_gpus if args.num_gpus is not None else max(available, 1)
+    world_size = max(1, world_size)
+
+    if world_size > 1:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        mp.spawn(main_worker, args=(world_size, args), nprocs=world_size, join=True)
+    else:
+        main_worker(0, 1, args)
 
 
 if __name__ == "__main__":
