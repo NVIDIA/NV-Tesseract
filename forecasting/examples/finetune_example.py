@@ -446,7 +446,9 @@ def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         LOGGER.info("Val windows: %s", len(val_dataset))
         LOGGER.info("Channels: %s", train_dataset.channels)
 
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
