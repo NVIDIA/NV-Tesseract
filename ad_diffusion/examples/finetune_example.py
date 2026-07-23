@@ -37,7 +37,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import yaml
 from sklearn.decomposition import PCA
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
@@ -459,7 +459,9 @@ def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     train_dataset = MaskedWindowDataset(train_tensor, window_length, args.window_stride, split)
     val_dataset = MaskedWindowDataset(val_tensor, window_length, args.window_stride, split)
 
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -486,7 +488,7 @@ def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     model = TSDiffuser_Generic(config, device=device, target_dim=target_dim, ratio=args.mask_ratio).to(device)
     load_state_dict(model, checkpoint)
     if world_size > 1:
-        model = DDP(model, device_ids=[rank])
+        model = DistributedDataParallel(model, device_ids=[rank])
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     preprocessing = adapter.metadata()
@@ -506,7 +508,7 @@ def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
         if is_main and val_loss < best_val:
             best_val = val_loss
-            raw_model = model.module if isinstance(model, DDP) else model
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             save_checkpoint(
                 output_dir / "best_finetuned_model.pth",
                 raw_model,
@@ -521,7 +523,7 @@ def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             LOGGER.info("Saved new best checkpoint to %s", output_dir / "best_finetuned_model.pth")
 
     if is_main:
-        raw_model = model.module if isinstance(model, DDP) else model
+        raw_model = model.module if isinstance(model, DistributedDataParallel) else model
         save_checkpoint(
             output_dir / "final_finetuned_model.pth",
             raw_model,

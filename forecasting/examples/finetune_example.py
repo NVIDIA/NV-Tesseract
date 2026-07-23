@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -485,7 +485,7 @@ def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         load_checkpoint(model, ckpt_init, device)
 
     if world_size > 1:
-        model = DDP(model, device_ids=[rank])
+        model = DistributedDataParallel(model, device_ids=[rank])
 
     if is_main:
         LOGGER.info("Trainable parameters: %s", f"{count_trainable_params(model):,}")
@@ -525,7 +525,7 @@ def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         if is_main and val_mse < best_val:
             best_val = val_mse
             best_epoch = epoch
-            raw_model = model.module if isinstance(model, DDP) else model
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             save_artifacts(
                 model=raw_model,
                 output_dir=output_dir,
