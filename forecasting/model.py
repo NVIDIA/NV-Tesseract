@@ -19,7 +19,7 @@ DEFAULT_MODEL_NAME = os.environ.get(
 def build_model(
     model_name: str = DEFAULT_MODEL_NAME,
     forecast_horizon: int = 96,
-    seq_len: int = 512,
+    seq_len: int = 2048,
     head_dropout: float = 0.1,
     weight_decay: float = 0.0,
     freeze_encoder: bool = True,
