@@ -147,6 +147,7 @@ ignore = [
     "PLR0912",
     "PLR0913",
     "PLR0915",
+    "PLR0917", # too-many-positional-arguments (ruff 0.8+ preview rule, mirrors PLR0913)
     "PLR1704",
     "PLR1714",
     "PLW2901",
