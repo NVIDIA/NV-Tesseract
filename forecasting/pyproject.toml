@@ -73,7 +73,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-exclude = ["__pycache__/**"]
+exclude = ["__pycache__/**", "*.md"]
 indent-width = 4
 
 [tool.ruff.lint]
