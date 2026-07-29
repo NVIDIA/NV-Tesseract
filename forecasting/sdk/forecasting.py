@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import types
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +70,10 @@ DEFAULT_BACKBONE_NAME = "AutonLab/MOMENT-1-large"
 _MODEL_CACHE: dict[str, torch.nn.Module] = {}
 
 
+def _checkpoint_uses_cross_channel(state: Mapping[str, Any]) -> bool:
+    return any(key.startswith("cross_channel_attn.") for key in state)
+
+
 def _load_standardizer_artifact(path: str) -> Standardizer:
     artifact = joblib.load(path)
     if isinstance(artifact, Standardizer):
@@ -92,7 +97,6 @@ def _get_model_cache_key(
     seq_len: int,
     model_horizon: int,
     device: str,
-    use_cross_channel: bool,
     cross_channel_heads: int,
     cross_channel_dropout: float,
 ) -> str:
@@ -103,7 +107,7 @@ def _get_model_cache_key(
 
     cache_data = (
         f"{model_name}_{ckpt}_{seq_len}_{model_horizon}_{device}_{ckpt_mtime}_"
-        f"{use_cross_channel}_{cross_channel_heads}_{cross_channel_dropout}"
+        f"{cross_channel_heads}_{cross_channel_dropout}"
     )
     return hashlib.md5(cache_data.encode()).hexdigest()
 
@@ -125,7 +129,6 @@ def _load_cached_model(
         seq_len,
         model_horizon,
         str(device),
-        use_cross_channel,
         cross_channel_heads,
         cross_channel_dropout,
     )
@@ -135,6 +138,16 @@ def _load_cached_model(
         return _MODEL_CACHE[cache_key]
 
     logger.info("Loading model from checkpoint: %s", ckpt)
+
+    state = torch.load(ckpt, map_location=device)
+    checkpoint_uses_cross_channel = _checkpoint_uses_cross_channel(state)
+    if checkpoint_uses_cross_channel != use_cross_channel:
+        logger.warning(
+            "Checkpoint cross-channel weights are %s but use_cross_channel=%s; using the checkpoint configuration.",
+            "present" if checkpoint_uses_cross_channel else "absent",
+            use_cross_channel,
+        )
+        use_cross_channel = checkpoint_uses_cross_channel
 
     model = build_model(
         model_name=model_name,
@@ -149,16 +162,13 @@ def _load_cached_model(
         local_files_only=local_files_only,
         device=str(device),
     )
-    state = torch.load(ckpt, map_location=device)
     load_result = model.load_state_dict(state, strict=False)
     missing = list(getattr(load_result, "missing_keys", [])) if load_result is not None else []
     unexpected = list(getattr(load_result, "unexpected_keys", [])) if load_result is not None else []
     if unexpected:
         raise RuntimeError(f"Unexpected checkpoint keys for forecasting model: {unexpected}")
     if missing:
-        non_cr_missing = [key for key in missing if "cross_channel" not in key]
-        if non_cr_missing:
-            raise RuntimeError(f"Missing non-cross-channel checkpoint keys: {non_cr_missing}")
+        raise RuntimeError(f"Missing checkpoint keys for forecasting model: {missing}")
     model.eval()
     _MODEL_CACHE[cache_key] = model
     logger.info("Model cached with key: %s...", cache_key[:8])
