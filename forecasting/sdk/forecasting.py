@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import os
-import sys
 import tempfile
 import types
 from contextlib import contextmanager
@@ -36,6 +35,10 @@ except ImportError:
 
 # Clean absolute imports - package is installed in editable mode
 from backbone.utils.utils import control_randomness
+from channel_stability import (
+    PerChannelEmbeddingStabilityReport,
+    compute_per_channel_embedding_stability,
+)
 from dataset_longhorizon import (
     CSVLongHorizonSimpleDataset,
     Standardizer,
@@ -763,17 +766,20 @@ def _semantic_flow_page(
     fig.text(
         0.06,
         0.90,
-        "Per-step latent flow m_t = ||Z_{t+1} - Z_t||_2 over the trajectory built on\n"
+        r"Per-step latent flow is $m_t = \Vert \mathbf{z}_{t+1} - \mathbf{z}_t \Vert_2$"
+        " over the trajectory built on\n"
         "[history; forecast]. This is the temporal signal that drives the lag x horizon\n"
         "heatmap; bigger spikes contribute more to attribution. Compare the history\n"
         "segment against the forecast segment to gauge representation-level stability.",
         ha="left",
         va="top",
         fontsize=9,
+        fontfamily="DejaVu Sans",
+        math_fontfamily="dejavusans",
         color="gray",
     )
 
-    ax = fig.add_axes((0.08, 0.57, 0.84, 0.23))
+    ax = fig.add_axes((0.08, 0.55, 0.84, 0.23))
     x_axis = np.arange(T_trans)
     ax.plot(x_axis, flow, linewidth=1.0, color="#1f77b4", label="flow magnitude")
     if 0 < boundary < T_trans:
@@ -802,8 +808,8 @@ def _semantic_flow_page(
             linewidth=1.2,
             label=f"forecast mean ({fcst_mean:.3f})",
         )
-    ax.set_xlabel("Latent transition index (t -> t+1)")
-    ax.set_ylabel("||Z_{t+1} - Z_t||_2")
+    ax.set_xlabel(r"Latent transition index ($t \rightarrow t+1$)")
+    ax.set_ylabel(r"$\Vert \mathbf{z}_{t+1} - \mathbf{z}_t \Vert_2$")
     ax.legend(loc="upper right", fontsize=8, framealpha=0.85)
 
     seg_rows = [
@@ -814,7 +820,7 @@ def _semantic_flow_page(
         ["Variance", hist_s[4], fcst_s[4]],
         ["Transitions", hist_s[5], fcst_s[5]],
     ]
-    ax_t1 = fig.add_axes((0.06, 0.34, 0.42, 0.15))
+    ax_t1 = fig.add_axes((0.06, 0.32, 0.42, 0.18))
     ax_t1.axis("off")
     table_seg = ax_t1.table(
         cellText=seg_rows,
@@ -825,7 +831,7 @@ def _semantic_flow_page(
     )
     table_seg.auto_set_font_size(False)
     table_seg.set_fontsize(8)
-    table_seg.scale(1.0, 1.2)
+    table_seg.scale(1.0, 1.3)
     for c in range(3):
         cell = table_seg[(0, c)]
         cell.set_facecolor("#dddddd")
@@ -833,27 +839,27 @@ def _semantic_flow_page(
 
     diag_rows = [
         [
-            "Flow ratio (fcst/hist)",
+            "Flow ratio (forecast/history)",
             _fmt(explanation.flow_ratio_forecast_vs_history),
-            "~1 healthy, >1.5 OOD-volatile",
+            r"$\approx 1$ healthy, $>1.5$ OOD-volatile",
         ],
         [
             "Flow variance ratio",
             _fmt(explanation.flow_variance_ratio_forecast_vs_history),
-            "~1 healthy, >2 noisy",
+            r"$\approx 1$ healthy, $>2$ noisy",
         ],
         [
             "Curvature ratio",
             _fmt(explanation.curvature_ratio_forecast_vs_history),
-            "~1 healthy, >1.5 jaggy",
+            r"$\approx 1$ healthy, $>1.5$ jaggy",
         ],
         [
             "Latent diag-Mahalanobis ratio",
             _fmt(explanation.latent_diag_mahalanobis_ratio_forecast_vs_history),
-            "~1 healthy, >>1 OOD shift",
+            r"$\approx 1$ healthy, $\gg 1$ OOD shift",
         ],
     ]
-    ax_t2 = fig.add_axes((0.52, 0.34, 0.42, 0.15))
+    ax_t2 = fig.add_axes((0.52, 0.32, 0.42, 0.18))
     ax_t2.axis("off")
     table_diag = ax_t2.table(
         cellText=diag_rows,
@@ -864,7 +870,7 @@ def _semantic_flow_page(
     )
     table_diag.auto_set_font_size(False)
     table_diag.set_fontsize(8)
-    table_diag.scale(1.0, 1.2)
+    table_diag.scale(1.0, 1.3)
     for c in range(3):
         cell = table_diag[(0, c)]
         cell.set_facecolor("#dddddd")
@@ -877,14 +883,14 @@ def _semantic_flow_page(
         "    flow magnitudes split into history (transitions fully inside the\n"
         "    input window) and forecast (transitions whose window touches the\n"
         "    model-generated future).\n"
-        "  - Flow ratio: mean(forecast flow) / mean(history flow). Values near 1\n"
-        "    mean the model's latent dynamics in the OOD segment match history.\n"
+        "  - Flow ratio: average forecast flow divided by average history flow. Values\n"
+        "    near 1 mean the model's latent dynamics in the OOD segment match history.\n"
         "    Large values flag attributions in that region as likely noisy.\n"
         "  - Flow variance ratio: same comparison on variance.\n"
         "  - Curvature ratio: second-difference energy of Z; spikes when the\n"
         "    forecast segment becomes much jaggier than history.\n"
         "  - Latent diag-Mahalanobis ratio: per-dim distance of forecast latents\n"
-        "    from the history mean (scaled by history variance). >>1 indicates a\n"
+        "    from the history mean (scaled by history variance). Values well above 1 indicate a\n"
         "    representation-level OOD shift.\n"
         "\n"
         "These scalars are also under explanation.diagnostics in explanation.json,\n"
@@ -1058,7 +1064,7 @@ def _channel_axis_page(
         + f"  - Right bar: each channel's {bar_note} summed across horizons -- a single\n"
         "    feature-importance score per input channel.\n"
         f"  - Most influential channel overall: {labels[top_c]}.\n" + resid_line + "\n"
-        "Full [C x H] values are exported as channel_horizon_attributions.csv."
+        "Full channel-by-horizon values are exported as channel_horizon_attributions.csv."
     )
     fig.text(
         0.06,
@@ -1071,6 +1077,133 @@ def _channel_axis_page(
         color="#333333",
         linespacing=1.05,
     )
+
+    pdf.savefig(fig)
+    plt.close(fig)
+
+
+def _feature_axis_embedding_stability_frame(
+    report: PerChannelEmbeddingStabilityReport,
+    channel_labels: list[str] | None = None,
+) -> pd.DataFrame:
+    """Return the complete feature-axis embedding-stability report."""
+    n_channels = int(report.n_channels)
+    labels = (
+        channel_labels
+        if channel_labels is not None and len(channel_labels) == n_channels
+        else [f"channel_{c}" for c in range(n_channels)]
+    )
+    return pd.DataFrame(
+        {
+            "feature": labels,
+            "lip_ratio_mean": np.asarray(report.lip_ratio_mean, dtype=np.float32),
+            "lip_ratio_p50": np.asarray(report.lip_ratio_p50, dtype=np.float32),
+            "lip_ratio_p95": np.asarray(report.lip_ratio_p95, dtype=np.float32),
+            "lip_ratio_max": np.asarray(report.lip_ratio_max, dtype=np.float32),
+            "n_trials_per_channel": np.asarray(report.n_trials_per_channel, dtype=np.int64),
+            "n_unique_windows": int(report.n_unique_windows),
+            "step_delta_norm_mean": float(report.step_delta_norm_mean),
+        }
+    )
+
+
+def _save_feature_axis_embedding_stability_csv(
+    out_dir: Path,
+    report: PerChannelEmbeddingStabilityReport,
+    channel_labels: list[str] | None = None,
+) -> Path:
+    """Write the complete feature-axis embedding-stability report."""
+    out_path = out_dir / "feature_axis_embedding_stability.csv"
+    _feature_axis_embedding_stability_frame(report, channel_labels).to_csv(out_path, index=False, na_rep="nan")
+    return out_path
+
+
+def _feature_axis_embedding_stability_page(
+    pdf: Any,
+    plt: Any,
+    *,
+    report: PerChannelEmbeddingStabilityReport,
+    channel_labels: list[str] | None = None,
+) -> None:
+    """Append the feature-axis embedding-stability summary."""
+    frame = _feature_axis_embedding_stability_frame(report, channel_labels)
+    shown = frame.sort_values("lip_ratio_p95", ascending=False, na_position="last").head(10)
+
+    def _fmt(value: Any) -> str:
+        numeric = float(value)
+        return f"{numeric:.4f}" if np.isfinite(numeric) else "n/a"
+
+    fig = plt.figure(figsize=(11, 8.5))
+    fig.text(
+        0.5,
+        0.95,
+        "Feature-axis embedding stability",
+        ha="center",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.text(
+        0.06,
+        0.90,
+        "This shows the delta between two embedding points after a small, controlled change to one feature.\n"
+        r"Each sensitivity score is $\Vert \Delta \mathbf{z} \Vert_2"
+        r"\,/\, \Vert \Delta \mathbf{x}_c \Vert_2$."
+        "\nLower values mean less latent movement per unit feature change; compare features\n"
+        "within the same model and dataset because embedding scales are model-specific.",
+        ha="left",
+        va="top",
+        fontsize=9,
+        fontfamily="DejaVu Sans",
+        math_fontfamily="dejavusans",
+        color="gray",
+    )
+
+    table_rows = [
+        [
+            row.feature,
+            _fmt(row.lip_ratio_mean),
+            _fmt(row.lip_ratio_p50),
+            _fmt(row.lip_ratio_p95),
+            _fmt(row.lip_ratio_max),
+            str(int(row.n_trials_per_channel)),
+        ]
+        for row in shown.itertuples(index=False)
+    ]
+    table_ax = fig.add_axes((0.06, 0.50, 0.88, 0.28))
+    table_ax.axis("off")
+    table = table_ax.table(
+        cellText=table_rows,
+        colLabels=["Feature", "Mean", "P50", "P95", "Max", "Trials"],
+        colWidths=[0.30, 0.14, 0.14, 0.14, 0.14, 0.14],
+        loc="upper center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.2)
+    for c in range(6):
+        cell = table[(0, c)]
+        cell.set_facecolor("#dddddd")
+        cell.set_text_props(weight="bold")
+
+    interp_text = (
+        "How to read these metrics\n"
+        "-------------------------\n"
+        "  - Mean / P50 / P95 / Max: summaries of the sensitivity score across\n"
+        "    small feature changes. Lower values mean the embedding\n"
+        "    moves less per unit change in that feature.\n"
+        "  - P95: conservative tail sensitivity. Rows are ranked by P95; the highest\n"
+        "    values identify features whose small changes can move the embedding most.\n"
+        "  - Trials: valid sensitivity measurements retained for that feature.\n"
+        f"  - Sample coverage: {int(report.n_unique_windows)} unique windows. Mean\n"
+        f"    baseline latent step: {_fmt(report.step_delta_norm_mean)} (reference only).\n"
+        "  - Compare values only within the same model and dataset because embedding\n"
+        "    scales are model-specific. A larger ratio is sensitivity, not by itself a defect.\n"
+        "\n"
+        "All features and raw report fields are exported to\n"
+        "feature_axis_embedding_stability.csv and explanation.json."
+    )
+    fig.text(0.06, 0.43, interp_text, ha="left", va="top", fontsize=9, family="monospace", color="#333333")
 
     pdf.savefig(fig)
     plt.close(fig)
@@ -1090,26 +1223,21 @@ def _normalization_statistics_gradient(model: torch.nn.Module, *, enabled: bool)
 
         original = module._get_statistics
         had_instance_override = "_get_statistics" in vars(module)
-        module_namespace = sys.modules.get(type(module).__module__)
-        nanstd = getattr(module_namespace, "nanstd", None)
 
-        def _make_get_statistics(nanstd_fn: Any):
-            def _get_statistics(self: Any, x: torch.Tensor, mask: torch.Tensor | None = None) -> None:
-                if mask is None:
-                    mask = torch.ones((x.shape[0], x.shape[-1]), device=x.device)
-                expanded = mask.to(device=x.device).unsqueeze(1).repeat(1, x.shape[1], 1).bool()
-                masked_x = torch.where(expanded, x, torch.full_like(x, float("nan")))
-                self.mean = torch.nanmean(masked_x, dim=-1, keepdim=True)
-                if nanstd_fn is None:
-                    centered = masked_x - torch.nanmean(masked_x, dim=-1, keepdim=True)
-                    stdev = centered.square().nanmean(dim=-1, keepdim=True).sqrt()
-                else:
-                    stdev = nanstd_fn(masked_x, dim=-1, keepdim=True)
-                self.stdev = stdev + self.eps
+        def _get_statistics(self: Any, x: torch.Tensor, mask: torch.Tensor | None = None) -> None:
+            if mask is None:
+                mask = torch.ones((x.shape[0], x.shape[-1]), device=x.device)
+            expanded = mask.to(device=x.device).unsqueeze(1).expand(-1, x.shape[1], -1).bool()
+            masked_x = torch.where(expanded, x, torch.full_like(x, float("nan")))
+            mean = torch.nanmean(masked_x, dim=-1, keepdim=True)
+            variance = (masked_x - mean).square().nanmean(dim=-1, keepdim=True)
+            raw_stdev = variance.sqrt()
+            eps_sq = torch.as_tensor(float(self.eps) ** 2, dtype=variance.dtype, device=variance.device)
+            safe_stdev = variance.clamp_min(eps_sq).sqrt()
+            self.mean = mean
+            self.stdev = raw_stdev.detach() + safe_stdev - safe_stdev.detach() + self.eps
 
-            return _get_statistics
-
-        module._get_statistics = types.MethodType(_make_get_statistics(nanstd), module)
+        module._get_statistics = types.MethodType(_get_statistics, module)
         restores.append((module, original, had_instance_override))
 
     try:
@@ -1335,7 +1463,7 @@ def _integrated_gradients_page(
     axb.set_yticks(y)
     axb.set_yticklabels([])
     axb.invert_yaxis()
-    axb.set_title("Channel effect\n(sum |IG|)", fontsize=9)
+    axb.set_title(r"Channel effect" "\n" r"($\sum |\mathrm{IG}|$)", fontsize=9, math_fontfamily="dejavusans")
     axb.set_xlabel("Absolute effect", fontsize=8)
     axb.tick_params(axis="both", labelsize=7)
 
@@ -1353,7 +1481,7 @@ def _integrated_gradients_page(
         "  - Heatmap cell (channel c, lag l): signed contribution of that input value\n"
         "    to the scalar embedding objective used by integrated gradients.\n"
         "  - Right bar: per-channel absolute effect, summed over all context timesteps.\n"
-        f"  - Most influential channel by |IG|: {labels[top_c]}.\n"
+        f"  - Most influential channel by absolute IG: {labels[top_c]}.\n"
         f"  - Config: baseline={baseline}, steps={steps}, baselines={n_baselines}, reduce={reduce}.\n"
         f"  - RevIN/statistics gradient path enabled: {grad_norm}.\n"
         f"  - Embedding delta: {emb_delta}; convergence delta: {convergence}.\n"
@@ -1379,6 +1507,7 @@ def _build_pdf_report(
     topk_rows: list[list[str]],
     top_k: int,
     trajectory_report: TrajectoryStabilityReport | None = None,
+    feature_axis_embedding_stability_report: PerChannelEmbeddingStabilityReport | None = None,
     context_len: int | None = None,
     forecast_horizon: int | None = None,
     channel_labels: list[str] | None = None,
@@ -1396,6 +1525,19 @@ def _build_pdf_report(
 
     attrib = np.asarray(explanation.lag_horizon_attributions)
     K, H = attrib.shape
+    flow_magnitudes = getattr(explanation, "flow_magnitudes", None)
+    show_heatmap = heatmap_path is not None and heatmap_path.exists()
+    show_topk = bool(topk_rows)
+    show_semantic_flow = (
+        context_len is not None
+        and forecast_horizon is not None
+        and flow_magnitudes is not None
+        and np.asarray(flow_magnitudes).size > 0
+    )
+    show_trajectory_stability = trajectory_report is not None
+    show_feature_axis = getattr(explanation, "channel_horizon_attributions", None) is not None
+    show_feature_axis_stability = feature_axis_embedding_stability_report is not None
+    show_integrated_gradients = integrated_gradients_report is not None
 
     with PdfPages(pdf_path) as pdf:
         fig = plt.figure(figsize=(8.5, 11))
@@ -1416,6 +1558,60 @@ def _build_pdf_report(
             color="gray",
         )
 
+        sections = [
+            section
+            for available, section in [
+                (True, ["Forecast preview: line chart of predicted target values."]),
+                (
+                    show_heatmap,
+                    [
+                        "Lag x Horizon attribution heatmap: how much each past step",
+                        "   contributes to each forecast step.",
+                        "   a) lag=0 is the most recent input.",
+                        "   b) Softmax-normalized weights; brighter cells = time steps",
+                        "      that contribute more to the forecast.",
+                    ],
+                ),
+                (show_topk, ["Top-k lag steps per horizon (marginal contributions)."]),
+                (
+                    show_semantic_flow,
+                    [
+                        "Semantic flow magnitudes: per-transition latent flow and",
+                        "   forecast-vs-history diagnostics.",
+                    ],
+                ),
+                (
+                    show_trajectory_stability,
+                    [
+                        "Latent trajectory stability: temporal-smoothness metrics",
+                        "   over the context window.",
+                    ],
+                ),
+                (
+                    show_feature_axis,
+                    [
+                        "Feature-axis attribution: which input channel drives each",
+                        "   forecast step (multivariate inputs only).",
+                    ],
+                ),
+                (
+                    show_feature_axis_stability,
+                    [
+                        "Feature-axis embedding stability: per-channel sensitivity",
+                        "   to small, controlled input changes (multivariate inputs only).",
+                    ],
+                ),
+                (
+                    show_integrated_gradients,
+                    [
+                        "Integrated gradients: signed input-channel/time",
+                        "   sensitivity for the model embedding.",
+                    ],
+                ),
+            ]
+            if available
+        ]
+
         summary = [
             "Overview",
             "--------",
@@ -1427,27 +1623,9 @@ def _build_pdf_report(
             "",
             "What is in this report",
             "----------------------",
-            "1. Forecast preview: line chart of predicted target values.",
-            "2. Lag x Horizon attribution heatmap: how much each past step",
-            "   contributes to each forecast step.",
-            "   a) lag=0 is the most recent input.",
-            "   b) Softmax-normalized weights; brighter cells = time steps",
-            "      that contribute more to the forecast.",
-            "3. Top-k lag steps per horizon (marginal contributions).",
-            "4. Semantic flow magnitudes: per-transition latent flow and",
-            "   forecast-vs-history diagnostics.",
-            "5. Latent trajectory stability: temporal-smoothness metrics",
-            "   over the context window.",
-            "6. Feature-axis attribution: which input channel drives each",
-            "   forecast step (multivariate inputs only).",
         ]
-        if integrated_gradients_report is not None:
-            summary.extend(
-                [
-                    "7. Integrated gradients: signed input-channel/time",
-                    "   sensitivity for the model embedding.",
-                ]
-            )
+        for number, section in enumerate(sections, start=1):
+            summary.extend([f"{number}. {section[0]}", *section[1:]])
         fig.text(0.08, 0.85, "\n".join(summary), ha="left", va="top", fontsize=10, family="monospace")
         pdf.savefig(fig)
         plt.close(fig)
@@ -1471,7 +1649,7 @@ def _build_pdf_report(
         pdf.savefig(fig)
         plt.close(fig)
 
-        if heatmap_path is not None and heatmap_path.exists():
+        if show_heatmap:
             try:
                 from matplotlib.image import imread
             except ImportError:
@@ -1507,7 +1685,7 @@ def _build_pdf_report(
             pdf.savefig(fig)
             plt.close(fig)
 
-        if topk_rows:
+        if show_topk:
             header = ["Horizon"]
             for r in range(1, top_k + 1):
                 header.extend([f"Rank-{r}\nLag", f"Rank-{r}\nProb"])
@@ -1567,7 +1745,7 @@ def _build_pdf_report(
                 pdf.savefig(fig)
                 plt.close(fig)
 
-        if context_len is not None and forecast_horizon is not None:
+        if show_semantic_flow:
             try:
                 _semantic_flow_page(
                     pdf,
@@ -1579,7 +1757,7 @@ def _build_pdf_report(
             except Exception as e:
                 logger.warning("Semantic flow page skipped: %s", e)
 
-        if trajectory_report is not None:
+        if show_trajectory_stability:
             r = trajectory_report
             rows = [
                 [
@@ -1619,10 +1797,14 @@ def _build_pdf_report(
                 0.90,
                 "Per-dimension temporal-smoothness metrics for the latent trajectory.\n"
                 "Lower zero-crossing, direction-flip, and relative-jitter values indicate\n"
-                "a smoother embedding (supports the framework's stability assumption).",
+                "a smoother embedding (supports the framework's stability assumption).\n"
+                r"Relative jitter compares $\mathrm{mean}(|\Delta z|)$ with "
+                r"$\mathrm{mean}(|z-z_{\mathrm{center}}|)$.",
                 ha="left",
                 va="top",
                 fontsize=9,
+                fontfamily="DejaVu Sans",
+                math_fontfamily="dejavusans",
                 color="gray",
             )
 
@@ -1649,10 +1831,10 @@ def _build_pdf_report(
                 "  - Zero-crossing rate: fraction of consecutive steps where the centered\n"
                 "    latent value flips sign. Lower => trajectory stays on one side of the\n"
                 "    reference for longer (less oscillation).\n"
-                "  - Direction-flip rate: fraction of steps where the step direction (delta z)\n"
+                "  - Direction-flip rate: fraction of steps where the latent step direction\n"
                 "    reverses sign. Lower => monotone, smoother dynamics.\n"
-                "  - Relative jitter: mean(|delta z|) / mean(|z - center|). Step size relative\n"
-                "    to typical displacement from the reference. Lower => small smooth steps\n"
+                "  - Relative jitter: average latent step size divided by average displacement\n"
+                "    from the reference. Lower => small smooth steps\n"
                 "    relative to overall amplitude.\n"
                 "  - Occupancy positive / negative: fraction of time the centered trajectory\n"
                 "    sits above / below the deadband. Asymmetry can flag regime drift.\n"
@@ -1679,7 +1861,7 @@ def _build_pdf_report(
 
         # Feature-axis page last (and only for multivariate inputs), matching
         # its position in the cover summary.
-        if getattr(explanation, "channel_horizon_attributions", None) is not None:
+        if show_feature_axis:
             try:
                 _channel_axis_page(
                     pdf,
@@ -1690,7 +1872,18 @@ def _build_pdf_report(
             except Exception as e:
                 logger.warning("Feature-axis page skipped: %s", e)
 
-        if integrated_gradients_report is not None:
+        if show_feature_axis_stability:
+            try:
+                _feature_axis_embedding_stability_page(
+                    pdf,
+                    plt,
+                    report=feature_axis_embedding_stability_report,
+                    channel_labels=channel_labels,
+                )
+            except Exception as e:
+                logger.warning("Feature-axis embedding-stability page skipped: %s", e)
+
+        if show_integrated_gradients:
             try:
                 _integrated_gradients_page(
                     pdf,
@@ -1743,6 +1936,27 @@ def _trajectory_report_to_dict(report: TrajectoryStabilityReport | None) -> dict
     }
 
 
+def _feature_axis_embedding_stability_to_dict(
+    report: PerChannelEmbeddingStabilityReport | None,
+    *,
+    channel_labels: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Convert a feature-axis embedding-stability report to JSON."""
+    if report is None:
+        return None
+    frame = _feature_axis_embedding_stability_frame(report, channel_labels)
+    return {
+        "channel_labels": frame["feature"].tolist(),
+        "lip_ratio_mean": _array_to_jsonable(frame["lip_ratio_mean"].to_numpy()),
+        "lip_ratio_p50": _array_to_jsonable(frame["lip_ratio_p50"].to_numpy()),
+        "lip_ratio_p95": _array_to_jsonable(frame["lip_ratio_p95"].to_numpy()),
+        "lip_ratio_max": _array_to_jsonable(frame["lip_ratio_max"].to_numpy()),
+        "n_trials_per_channel": _array_to_jsonable(frame["n_trials_per_channel"].to_numpy()),
+        "n_unique_windows": int(report.n_unique_windows),
+        "step_delta_norm_mean": _scalar_to_jsonable(report.step_delta_norm_mean),
+    }
+
+
 def _integrated_gradients_to_dict(
     integrated_gradients_report: dict[str, Any] | None,
     *,
@@ -1785,6 +1999,8 @@ def _explanation_to_dict(
     dataset_name: str | None = None,
     include_full_arrays: bool = True,
     trajectory_report: TrajectoryStabilityReport | None = None,
+    feature_axis_embedding_stability_report: PerChannelEmbeddingStabilityReport | None = None,
+    channel_labels: list[str] | None = None,
     integrated_gradients_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Render the (forecast, explanation) pair as a JSON-serializable dict."""
@@ -1837,16 +2053,27 @@ def _explanation_to_dict(
         "trajectory_stability": _trajectory_report_to_dict(trajectory_report),
     }
 
-    channel_attribution = getattr(explanation, "channel_horizon_attributions", None)
-    if channel_attribution is not None:
-        feature_axis: dict[str, Any] = {
-            "method": getattr(explanation, "channel_flow_method", None),
-            "channel_horizon_attributions": _array_to_jsonable(np.asarray(channel_attribution)),
-            "residual_ratio_mean": _scalar_to_jsonable(explanation.channel_flow_residual_ratio_mean),
-            "residual_ratio_p95": _scalar_to_jsonable(explanation.channel_flow_residual_ratio_p95),
-        }
+    # Feature-axis (channel) attribution -- only present for multivariate inputs.
+    chan_attrib = getattr(explanation, "channel_horizon_attributions", None)
+    stability_block = _feature_axis_embedding_stability_to_dict(
+        feature_axis_embedding_stability_report,
+        channel_labels=channel_labels,
+    )
+    if chan_attrib is not None or stability_block is not None:
+        feature_axis: dict[str, Any] = {}
+        if chan_attrib is not None:
+            feature_axis.update(
+                {
+                    "method": getattr(explanation, "channel_flow_method", None),
+                    "channel_horizon_attributions": _array_to_jsonable(np.asarray(chan_attrib)),
+                    "residual_ratio_mean": _scalar_to_jsonable(explanation.channel_flow_residual_ratio_mean),
+                    "residual_ratio_p95": _scalar_to_jsonable(explanation.channel_flow_residual_ratio_p95),
+                }
+            )
         if include_full_arrays and getattr(explanation, "per_channel_flow", None) is not None:
             feature_axis["per_channel_flow"] = _array_to_jsonable(np.asarray(explanation.per_channel_flow))
+        if stability_block is not None:
+            feature_axis["embedding_stability"] = stability_block
         explanation_block["feature_axis"] = feature_axis
 
     if include_full_arrays:
@@ -1884,6 +2111,8 @@ def _save_explanation_json(
     include_full_arrays: bool = True,
     indent: int | None = 2,
     trajectory_report: TrajectoryStabilityReport | None = None,
+    feature_axis_embedding_stability_report: PerChannelEmbeddingStabilityReport | None = None,
+    channel_labels: list[str] | None = None,
     integrated_gradients_report: dict[str, Any] | None = None,
 ) -> Path:
     """Persist the (forecast, explanation) pair as a JSON file."""
@@ -1898,6 +2127,8 @@ def _save_explanation_json(
         dataset_name=dataset_name,
         include_full_arrays=include_full_arrays,
         trajectory_report=trajectory_report,
+        feature_axis_embedding_stability_report=feature_axis_embedding_stability_report,
+        channel_labels=channel_labels,
         integrated_gradients_report=integrated_gradients_report,
     )
     with out_path.open("w", encoding="utf-8") as fh:
@@ -2065,6 +2296,26 @@ def _run_interpretability(
     except Exception as e:
         logger.warning("Trajectory stability skipped: %s", e)
 
+    feature_axis_embedding_stability_report: PerChannelEmbeddingStabilityReport | None = None
+    if channel_axis:
+        try:
+            feature_axis_embedding_stability_report = compute_per_channel_embedding_stability(
+                model,
+                x_context_ct,
+                seq_len=seq_len,
+                input_mask_t=input_mask_l,
+                device=device,
+            )
+        except Exception as e:
+            logger.warning("Feature-axis embedding stability skipped: %s", e)
+
+    if write_pdf and feature_axis_embedding_stability_report is not None:
+        _save_feature_axis_embedding_stability_csv(
+            run_dir,
+            feature_axis_embedding_stability_report,
+            columns_to_process,
+        )
+
     integrated_gradients_report: dict[str, Any] | None = None
     if integrated_gradients:
         model.eval()
@@ -2097,6 +2348,8 @@ def _run_interpretability(
             timestamp_column=timestamp_column,
             dataset_name=dataset_name,
             trajectory_report=trajectory_report,
+            feature_axis_embedding_stability_report=feature_axis_embedding_stability_report,
+            channel_labels=columns_to_process,
             integrated_gradients_report=integrated_gradients_report,
         )
         logger.info("Interpretability JSON written to: %s", run_dir / "explanation.json")
@@ -2114,6 +2367,7 @@ def _run_interpretability(
             top_k=interpretability_top_k,
             dataset_name=dataset_name,
             trajectory_report=trajectory_report,
+            feature_axis_embedding_stability_report=feature_axis_embedding_stability_report,
             context_len=seq_len,
             forecast_horizon=forecast_horizon,
             channel_labels=columns_to_process,

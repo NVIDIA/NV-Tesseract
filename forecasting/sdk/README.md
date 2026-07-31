@@ -10,8 +10,9 @@ Programmatic entry point for running `perform_forecasting()` on pandas DataFrame
 - **Robust preprocessing**: Converts timestamps, fills numeric NULLs with zeros, enforces minimum sequence length (`seq_len`), and standardizes input using saved standardizer metadata.
 - **Column alignment**: Automatically handles datasets with different feature sets by aligning to common columns, preventing broadcasting errors.
 - **Diverse output**: Produces hybrid, direct, and kNN forecasts when context is provided; otherwise returns only the direct forecast column.
-- **Built-in interpretability**: Opt-in `interpretability=True` produces horizon-resolved lag attribution, semantic-flow diagnostics, latent-trajectory stability, JSON/CSV/PNG artifacts, and a self-contained PDF report. Output format is selectable via `interpretability_output` (`"json"`, `"pdf"`, or `None` for both).
+- **Built-in interpretability**: Opt-in `interpretability=True` produces horizon-resolved lag attribution, semantic-flow diagnostics, latent-trajectory stability, JSON/CSV/PNG artifacts, and a self-contained PDF report with feature-axis embedding stability for multivariate inputs. Output format is selectable via `interpretability_output` (`"json"`, `"pdf"`, or `None` for both).
 - **Feature-axis interpretability**: For multivariate inputs, the SDK automatically adds batched Jacobian channel-by-horizon attribution to the PDF and artifact bundle.
+- **Feature-axis embedding stability**: Multivariate interpretability runs perturb one input feature at a time and report Lipschitz-style embedding sensitivity in the feature-axis JSON block, `feature_axis_embedding_stability.csv`, and a dedicated PDF page.
 
 ## Installation
 
@@ -131,10 +132,12 @@ interp_result = perform_forecasting(
 | Value | Files written under `<interpretability_out_dir>/run_<UTC>/` |
 |-------|-------------------------------------------------------------|
 | `"json"` | `forecast.csv`, `explanation.json` |
-| `"pdf"` | `forecast.csv`, lag/semantic-flow artifacts, feature-axis artifacts for multivariate input, optional integrated-gradients artifacts, `explanation_report.pdf` |
+| `"pdf"` | `forecast.csv`, lag/semantic-flow artifacts, feature-axis attribution and embedding-stability artifacts for multivariate input, optional integrated-gradients artifacts, `explanation_report.pdf` |
 | `None`  | All of the above |
 
 The returned DataFrame is the explanation-aligned forecast (single forward pass, so it lines up 1:1 with the attribution matrix). PDF / heatmap require `matplotlib`; if it's missing, those steps are skipped with a warning while JSON output continues to work.
+
+If the input DataFrame has more than one numeric column, the feature-axis decomposition runs automatically: the report gains channel-by-horizon attribution and feature-axis embedding-stability pages. By default attribution is measured in latent space (output-agnostic); set `channel_output_aware=True` to attribute the target channel's forecast directly.
 
 ## Function signature
 
@@ -262,17 +265,18 @@ When `interpretability=True`, the run directory contains the following files (se
 | File | Written when | Contents |
 |------|--------------|----------|
 | `forecast.csv` | json, pdf, both | The returned forecast DataFrame |
-| `explanation.json` | json, both | Forecast + full explanation payload, including lag×horizon values, semantic-flow diagnostics, trajectory stability, feature-axis results for multivariate input, optional Integrated Gradients, and dataset metadata |
+| `explanation.json` | json, both | Forecast + full explanation payload, including lag×horizon values, semantic-flow diagnostics, trajectory stability, a multivariate `feature_axis` block containing attribution and `embedding_stability` results, optional Integrated Gradients, and dataset metadata |
 | `lag_horizon_attributions.csv` | pdf, both | Wide K×H attribution matrix |
 | `lag_horizon_long.csv` | pdf, both | Tidy `(lag, horizon, attribution[, score])` table |
 | `lag_horizon_heatmap.png` | pdf, both *(needs matplotlib)* | Visual heatmap, viridis cmap |
 | `semantic_flow.csv` | pdf, both | Tidy `(transition_index, segment, flow_magnitude)` table, where `segment` is `history` for transitions fully inside the input window, `forecast` for transitions whose window extends into the model-generated future, and `tail` for any trailing transitions outside both segments |
 | `channel_horizon_attributions.csv` | multivariate pdf, both | Feature-axis `C×H` attribution matrix |
 | `channel_horizon_heatmap.png` | multivariate pdf, both *(needs matplotlib)* | Feature-axis channel-by-horizon heatmap |
+| `feature_axis_embedding_stability.csv` | multivariate pdf, both | Complete feature-level embedding-stability report: mean, p50, p95, and max Lipschitz-style ratios, retained trial counts, sampled-window count, and the unperturbed latent-step reference scale |
 | `integrated_gradients_attributions.csv` | `integrated_gradients=True` with pdf or both | Signed embedding IG value for every channel and context position |
 | `integrated_gradients_channel_summary.csv` | `integrated_gradients=True` with pdf or both | Signed effect, absolute effect, and absolute share by channel |
 | `integrated_gradients_heatmap.png` | `integrated_gradients=True` with pdf or both *(needs matplotlib)* | Signed channel-by-context IG heatmap |
-| `explanation_report.pdf` | pdf, both *(needs matplotlib)* | Multi-page report covering forecast, lag×horizon attribution, semantic flow, latent stability, feature-axis attribution for multivariate input, and optional embedding Integrated Gradients |
+| `explanation_report.pdf` | pdf, both *(needs matplotlib)* | Multi-page report covering forecast, lag×horizon attribution, semantic flow, latent stability, feature-axis attribution, feature-axis embedding stability, and optional embedding Integrated Gradients |
 
 The run directory path is printed on stdout when the call completes.
 

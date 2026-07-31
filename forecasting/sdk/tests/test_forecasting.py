@@ -377,6 +377,36 @@ def test_interpretability_sdk_defaults_match_algorithms():
     assert sdk_params["integrated_gradients_reduce"].default == ig_params["reduce"].default
 
 
+def test_feature_axis_embedding_stability_csv_contains_complete_report(tmp_path):
+    report = SimpleNamespace(
+        lip_ratio_mean=np.array([0.1, 0.2], dtype=np.float32),
+        lip_ratio_max=np.array([0.4, 0.5], dtype=np.float32),
+        lip_ratio_p50=np.array([0.08, 0.18], dtype=np.float32),
+        lip_ratio_p95=np.array([0.3, 0.4], dtype=np.float32),
+        n_trials_per_channel=np.array([7, 6], dtype=np.int64),
+        n_unique_windows=5,
+        step_delta_norm_mean=0.25,
+        n_channels=2,
+    )
+
+    path = forecasting._save_feature_axis_embedding_stability_csv(tmp_path, report, ["target", "feature"])
+    saved = pd.read_csv(path)
+
+    assert list(saved.columns) == [
+        "feature",
+        "lip_ratio_mean",
+        "lip_ratio_p50",
+        "lip_ratio_p95",
+        "lip_ratio_max",
+        "n_trials_per_channel",
+        "n_unique_windows",
+        "step_delta_norm_mean",
+    ]
+    assert saved["feature"].tolist() == ["target", "feature"]
+    assert saved["n_trials_per_channel"].tolist() == [7, 6]
+    assert saved["n_unique_windows"].tolist() == [5, 5]
+
+
 def test_explanation_json_groups_feature_axis_results():
     explanation = forecasting.ForecastExplanation(
         baseline_forecast=np.ones((2, 2), dtype=np.float32),
@@ -501,14 +531,35 @@ def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, t
             embedding_dim=1,
         )
 
+    def compute_per_channel_embedding_stability(model, series_ct, **kwargs):
+        captured["embedding_stability_model"] = model
+        captured["embedding_stability_series_ct"] = series_ct
+        captured["embedding_stability_kwargs"] = kwargs
+        return SimpleNamespace(
+            lip_ratio_mean=np.array([0.1, 0.2], dtype=np.float32),
+            lip_ratio_max=np.array([0.4, 0.5], dtype=np.float32),
+            lip_ratio_p50=np.array([0.08, 0.18], dtype=np.float32),
+            lip_ratio_p95=np.array([0.3, 0.4], dtype=np.float32),
+            n_trials_per_channel=np.array([7, 7], dtype=np.int64),
+            n_unique_windows=5,
+            step_delta_norm_mean=0.25,
+            n_channels=2,
+        )
+
     def build_pdf_report(pdf_path, **kwargs):
         captured["pdf_report"] = kwargs["integrated_gradients_report"]
+        captured["embedding_stability_report"] = kwargs["feature_axis_embedding_stability_report"]
         captured["channel_labels"] = kwargs["channel_labels"]
         pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
         return pdf_path
 
     monkeypatch.setattr(forecasting, "explain_forecast", lambda *args, **kwargs: explanation)
     monkeypatch.setattr(forecasting, "compute_trajectory_stability", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        forecasting,
+        "compute_per_channel_embedding_stability",
+        compute_per_channel_embedding_stability,
+    )
     monkeypatch.setattr(ig, "integrated_gradients_embedding", integrated_gradients_embedding)
     monkeypatch.setattr(forecasting, "_normalization_statistics_gradient", normalization_statistics_gradient)
     monkeypatch.setattr(forecasting, "_save_lag_horizon_artifacts", lambda *args, **kwargs: None)
@@ -554,8 +605,19 @@ def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, t
 
     payload = json.loads((run_dir / "explanation.json").read_text(encoding="utf-8"))
     ig_payload = payload["explanation"]["integrated_gradients"]
+    stability_payload = payload["explanation"]["feature_axis"]["embedding_stability"]
     assert ig_payload["channel_labels"] == ["target", "feature"]
     assert ig_payload["channel_abs_effect"] == [10.0, 10.0]
+    assert stability_payload["channel_labels"] == ["target", "feature"]
+    assert stability_payload["lip_ratio_mean"] == pytest.approx([0.1, 0.2])
+    assert stability_payload["n_trials_per_channel"] == [7, 7]
+    assert captured["embedding_stability_model"] is model
+    np.testing.assert_array_equal(
+        captured["embedding_stability_series_ct"],
+        df[["target", "feature"]].tail(4).to_numpy(dtype=np.float32).T,
+    )
+    assert captured["embedding_stability_kwargs"]["seq_len"] == 4
+    assert captured["embedding_stability_kwargs"]["device"] == torch.device("cpu")
     assert captured["input_mask"] == [1, 1, 1, 1]
     assert captured["ig_shape"] == (2, 4)
     assert captured["ig_kwargs"]["internal_batch_size"] == 3
@@ -563,8 +625,10 @@ def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, t
     assert captured["grad_through_norm"] is True
     assert captured["channel_labels"] == ["target", "feature"]
     assert captured["pdf_report"]["attribution"].shape == (2, 4)
+    assert captured["embedding_stability_report"].n_channels == 2
     assert (run_dir / "integrated_gradients_attributions.csv").exists()
     assert (run_dir / "integrated_gradients_channel_summary.csv").exists()
+    assert (run_dir / "feature_axis_embedding_stability.csv").exists()
 
 
 def test_normalization_statistics_gradient_is_scoped():
