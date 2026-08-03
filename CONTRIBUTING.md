@@ -18,6 +18,19 @@ We track bugs, feature requests, and questions in **[GitHub Issues](https://gith
 
 Maintainers may ask for more detail, a smaller reproducer, or a quick test under a different OS or Python version.
 
+## Branch and pull request workflow
+
+The active development branch is **`dev`**. Open pull requests against `dev` unless a maintainer explicitly asks you to target another branch.
+
+The `main` branch is protected and reserved for release-ready code. Changes should reach `main` through maintainer-managed promotion from `dev`, not through regular contributor pull requests.
+
+Before opening a pull request:
+
+1. Branch from the latest `dev`.
+2. Keep the change focused on one issue or feature.
+3. Include tests or documentation updates when behavior changes.
+4. Reference the related issue in the pull request description when one exists.
+
 ## Licensing
 
 **License for contributions:** This project **only** accepts contributions that you license under the **Apache License, Version 2.0**. Do not submit code under any other license terms (including proprietary, copyleft-only, or incompatible licenses). By opening a pull request or otherwise contributing, you agree that your contributions will be distributed under Apache-2.0 on the same terms as the rest of this repository (see [`LICENSE`](LICENSE) at the repository root).
@@ -109,4 +122,4 @@ Contributions consisting of commits without a valid sign-off cannot be merged.
 - Lint and format (Ruff): `make lint` / `make lint-fix` from the repository root.
 - Forecasting tests (example): `cd forecasting && uv run pytest sdk/tests`.
 
-Open a pull request against the default branch with a clear description of the change and any relevant issue references.
+Open a pull request against `dev` with a clear description of the change and any relevant issue references.
