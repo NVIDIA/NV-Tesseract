@@ -115,36 +115,40 @@ def main():
             model.load_state_dict(checkpoint)
         model = model.to(device).eval()
 
-        # Create dataloader for this chunk
-        if isinstance(data_chunk, dict) and data_chunk.get("window_shm"):
-            shm = shared_memory.SharedMemory(name=data_chunk["shm_name"])
-            # Convert JSON-serialized dtype (str) and shape (list) back to numpy types
-            shm_dtype = np.dtype(data_chunk["dtype"])
-            shm_shape = tuple(data_chunk["shape"])
-            windows = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
-            loader1, loader2 = get_dataloader_from_windows(
-                windows,
-                split=data_chunk["split"],
-                window_indices=data_chunk["window_indices"],
-            )
-            shm.close()
-        else:
-            loader1, loader2 = get_dataloader(
-                data_chunk,
-                target_dim,
-                scale_factor=scale_factor,
-                model_dir=preprocess_model_dir,
-            )
+        shm = None
+        try:
+            # Create dataloader for this chunk
+            if isinstance(data_chunk, dict) and data_chunk.get("window_shm"):
+                shm = shared_memory.SharedMemory(name=data_chunk["shm_name"])
+                # Convert JSON-serialized dtype (str) and shape (list) back to numpy types
+                shm_dtype = np.dtype(data_chunk["dtype"])
+                shm_shape = tuple(data_chunk["shape"])
+                windows = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
+                loader1, loader2 = get_dataloader_from_windows(
+                    windows,
+                    split=data_chunk["split"],
+                    window_indices=data_chunk["window_indices"],
+                )
+            else:
+                loader1, loader2 = get_dataloader(
+                    data_chunk,
+                    target_dim,
+                    scale_factor=scale_factor,
+                    model_dir=preprocess_model_dir,
+                )
 
-        # NEW: Run inference with DPM parameters
-        results = evaluate_ad_tesseract2(
-            model,
-            loader1,
-            loader2,
-            nsample=nsample,
-            use_dpm_solver=use_dpm_solver,  # NEW: Pass DPM parameters
-            dpm_steps=dpm_steps,  # NEW: Pass DPM parameters
-        )
+            # NEW: Run inference with DPM parameters
+            results = evaluate_ad_tesseract2(
+                model,
+                loader1,
+                loader2,
+                nsample=nsample,
+                use_dpm_solver=use_dpm_solver,  # NEW: Pass DPM parameters
+                dpm_steps=dpm_steps,  # NEW: Pass DPM parameters
+            )
+        finally:
+            if shm is not None:
+                shm.close()
 
         end_time = time.time()
         worker_logger.debug("Worker FINISHED at %.2f (took %.2fs)", end_time, end_time - start_time)

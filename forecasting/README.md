@@ -137,19 +137,20 @@ source .venv/bin/activate  # Activate environment (Unix)
 
 ```
 forecasting/
-├── pyproject.toml         # Project configuration and dependencies
-├── README.md             # This file
+├── pyproject.toml                    # Project configuration and dependencies
+├── README.md                         # This file
 ├── examples/
-│   └── finetune_example.py # CSV fine-tuning example
+│   └── finetune_example.py           # CSV fine-tuning example
 ├── sdk/
-│   ├── forecasting.py    # Main forecasting module (with auto-download)
-│   ├── quick_example.py  # Example usage script
-│   └── tests/            # Test files and datasets
-├── dataset_longhorizon.py # Dataset utilities
-├── interpretability.py   # Model-agnostic explanation engine (lag x horizon)
-├── model.py              # Model building utilities
-├── standardizer.pkl      # Normalization params (auto-downloaded on first use)
-└── moment_head_512_6hr.pt  # Head checkpoint (auto-downloaded on first use)
+│   ├── forecasting.py                # Main SDK entry point (with auto-download)
+│   ├── quick_example.py              # End-to-end demo script
+│   └── tests/                        # Test files and datasets
+├── dataset_longhorizon.py            # Dataset utilities and Standardizer
+├── interpretability.py               # Model-agnostic explanation engine (semantic flow, lag×horizon, trajectory stability, PDF report)
+├── channel_flow.py                   # Per-channel Jacobian flow
+├── integrated_gradients.py           # Embedding Integrated Gradients / Expected Gradients
+├── parallel.py                       # GPU worker pool + surrogate thread pool
+└── model.py                          # Model building utilities
 ```
 
 ## Dependencies
@@ -194,11 +195,11 @@ The forecasting model requires pre-trained weights from the Hugging Face reposit
 
 ## Interpretability
 
-Modern deep-learning forecasters predict but don't explain — they can't answer questions like *"Why did the model predict a spike tomorrow at 3pm?"* or *"Is it relying on a real pattern, or on noise?"*. Traditional tools like LIME and SHAP fall short for time-series because they destroy temporal continuity, lack forecast-horizon resolution, and cannot operate inside the latent space modern forecasters use.
+Modern deep-learning forecasters predict but don't explain — they can't answer questions like *"Why did the model predict a spike tomorrow at 3pm?"* or *"Is it relying on a real pattern, or on noise?"*. Time-series explanations need to preserve temporal continuity, resolve individual forecast horizons, and work with the latent representations used by modern forecasters.
 
 NV-Tesseract ships a **Model Agnostic Interpretability Framework** that produces localized, horizon-specific, time-aware explanations without modifying the underlying forecaster. It targets real-world deployments — finance risk, energy grids, manufacturing — where a black-box prediction is not enough.
 
-### The Lag–Horizon Attribution Engine
+### The Lag–Horizon Attribution Engine (v1)
 
 The framework's core component is the **Lag–Horizon Attribution Engine**, which turns the computed semantic flow (the step-by-step transformation of the model's internal state in latent space) into influence scores. Its output is the **Lag–Horizon Attribution Matrix** `F`:
 
@@ -208,9 +209,15 @@ The framework's core component is the **Lag–Horizon Attribution Engine**, whic
 
 Internally `F` is computed by composing the model's consecutive flow operators along the latent path from each past input to each future prediction; per horizon, the scores are softmax-normalized into attributions.
 
+### Feature-Axis Interpretability (multivariate)
+
+For multivariate inputs (`C > 1` channels), NV-Tesseract also decomposes how each input channel contributes to each forecast horizon. The SDK uses the batched Jacobian estimator automatically and adds the channel-by-horizon artifacts to its report.
+
+The estimator batches channel probes and transitions on the selected device. See `sdk/quick_example.py` and `sdk/README.md` for the SDK report path.
+
 ### What the SDK gives you
 
-When you call `perform_forecasting(..., interpretability=True)` the SDK runs the same loaded model on the trailing window and writes a self-contained explanation bundle: the K×H matrix as wide and long CSVs, a heatmap PNG, a per-transition `semantic_flow.csv` with a `history`/`forecast` segment label, a full `explanation.json` (baseline forecast, lag×horizon scores and attributions, latent trajectory, semantic-flow magnitudes, diagnostic ratios that flag whether the forecast segment is volatile relative to history, and a `trajectory_stability` block with temporal-smoothness metrics over the context window), and a multi-page PDF report whose final pages surface (a) the semantic-flow time series with a history/forecast split chart, per-segment summary statistics, and the forecast-vs-history diagnostic ratios, and (b) the latent-trajectory stability metrics. See the **Interpretability (Lag x Horizon Explanations)** example below for the call shape and `sdk/README.md` for the full parameter reference and on-disk artifact catalogue.
+When you call `perform_forecasting(..., interpretability=True)` the SDK runs the same loaded model on the trailing window and writes a self-contained explanation bundle: the K×H matrix as wide and long CSVs, a heatmap PNG, a per-transition `semantic_flow.csv` with a `history`/`forecast` segment label, a full `explanation.json` (baseline forecast, lag×horizon scores and attributions, latent trajectory, semantic-flow magnitudes, diagnostic ratios that flag whether the forecast segment is volatile relative to history, and trajectory-stability metrics), and a multi-page PDF report. Multivariate inputs also receive channel-by-horizon feature attribution. Optional embedding Integrated Gradients can be enabled with `integrated_gradients=True`. See the **Interpretability (Lag x Horizon Explanations)** example below for the call shape and `sdk/README.md` for the full parameter reference and on-disk artifact catalogue.
 
 ## Usage Examples
 

@@ -10,7 +10,9 @@ Programmatic entry point for running `perform_forecasting()` on pandas DataFrame
 - **Robust preprocessing**: Converts timestamps, fills numeric NULLs with zeros, enforces minimum sequence length (`seq_len`), and standardizes input using saved standardizer metadata.
 - **Column alignment**: Automatically handles datasets with different feature sets by aligning to common columns, preventing broadcasting errors.
 - **Diverse output**: Produces hybrid, direct, and kNN forecasts when context is provided; otherwise returns only the direct forecast column.
-- **Built-in interpretability**: Opt-in `interpretability=True` flag produces a horizon-resolved lag attribution matrix, supporting CSVs / heatmap PNG, a `semantic_flow.csv` of per-transition latent flow magnitudes labeled by history/forecast segment, an `explanation.json` (lag×horizon, latent trajectory, semantic-flow magnitudes, forecast-vs-history diagnostics, and a `trajectory_stability` block of temporal-smoothness metrics), and a self-contained PDF report whose final pages cover semantic-flow magnitudes (line chart over the history/forecast split with per-segment summary statistics and the four forecast-vs-history diagnostic ratios) and latent-trajectory stability. Output format is selectable via `interpretability_output` (`"json"`, `"pdf"`, or `None` for both).
+- **Built-in interpretability**: Opt-in `interpretability=True` produces horizon-resolved lag attribution, semantic-flow diagnostics, latent-trajectory stability, JSON/CSV/PNG artifacts, and a self-contained PDF report with feature-axis embedding stability for multivariate inputs. Output format is selectable via `interpretability_output` (`"json"`, `"pdf"`, or `None` for both).
+- **Feature-axis interpretability**: For multivariate inputs, the SDK automatically adds batched Jacobian channel-by-horizon attribution to the PDF and artifact bundle.
+- **Feature-axis embedding stability**: Multivariate interpretability runs perturb one input feature at a time and report Lipschitz-style embedding sensitivity in the feature-axis JSON block, `feature_axis_embedding_stability.csv`, and a dedicated PDF page.
 
 ## Installation
 
@@ -121,6 +123,7 @@ interp_result = perform_forecasting(
     interpretability_dataset_name="my_dataset.csv",
     n_lags=128,
     softmax_tau=1.0,
+    integrated_gradients=True,
 )
 ```
 
@@ -129,10 +132,12 @@ interp_result = perform_forecasting(
 | Value | Files written under `<interpretability_out_dir>/run_<UTC>/` |
 |-------|-------------------------------------------------------------|
 | `"json"` | `forecast.csv`, `explanation.json` |
-| `"pdf"` | `forecast.csv`, `lag_horizon_attributions.csv`, `lag_horizon_long.csv`, `lag_horizon_heatmap.png`, `semantic_flow.csv`, `explanation_report.pdf` |
+| `"pdf"` | `forecast.csv`, lag/semantic-flow artifacts, feature-axis attribution and embedding-stability artifacts for multivariate input, optional integrated-gradients artifacts, `explanation_report.pdf` |
 | `None`  | All of the above |
 
 The returned DataFrame is the explanation-aligned forecast (single forward pass, so it lines up 1:1 with the attribution matrix). PDF / heatmap require `matplotlib`; if it's missing, those steps are skipped with a warning while JSON output continues to work.
+
+If the input DataFrame has more than one numeric column, the feature-axis decomposition runs automatically: the report gains channel-by-horizon attribution and feature-axis embedding-stability pages. By default attribution is measured in latent space (output-agnostic); set `channel_output_aware=True` to attribute the target channel's forecast directly.
 
 ## Function signature
 
@@ -178,6 +183,17 @@ perform_forecasting(
     interpretability_dataset_name: Optional[str] = None,
     n_lags: int = 128,
     softmax_tau: float = 1.0,
+    channel_output_aware: bool = False,
+    integrated_gradients: bool = False,
+    integrated_gradients_baseline: Any = "noise",
+    integrated_gradients_steps: int = 64,
+    integrated_gradients_n_baselines: int = 1,
+    integrated_gradients_internal_batch_size: Optional[int] = None,
+    integrated_gradients_reduce: str = "l2",
+    integrated_gradients_grad_through_norm: bool = True,
+
+    # Multichannel output
+    return_all_channels: bool = False,
 ) -> pd.DataFrame
 ```
 
@@ -206,12 +222,22 @@ perform_forecasting(
 | `interpretability_dataset_name` | Free-form label embedded in the JSON metadata and the PDF cover page |
 | `n_lags` | Number of past steps the lag-attribution matrix resolves (default `128`) |
 | `softmax_tau` | Temperature applied when softmaxing scores into per-horizon attribution |
+| `channel_output_aware` | Use target-specific directional input-Jacobian effects for feature-axis attribution (default `False`) |
+| `integrated_gradients` | Add embedding integrated-gradients attribution to the JSON/PDF report and export its CSV/PNG artifacts |
+| `integrated_gradients_baseline` | IG reference input; `"noise"` is the default and avoids the constant-baseline degeneracy of instance normalization |
+| `integrated_gradients_steps` | Number of midpoint integration steps (default `64`) |
+| `integrated_gradients_n_baselines` | Number of noise baselines averaged as Expected Gradients (default `1`) |
+| `integrated_gradients_internal_batch_size` | Maximum interpolation points embedded per batch; `None` processes all steps together |
+| `integrated_gradients_reduce` | Embedding scalar objective: `"l2"`, `"sum"`, or `"mean"` |
+| `integrated_gradients_grad_through_norm` | Include RevIN statistics in the attribution gradient while leaving forward outputs unchanged |
+| `return_all_channels` | When `True`, the result contains one `{column}_forecast` column per processed channel (target column first, then the remaining numeric features) instead of only `{target_column}_forecast`, including in interpretability mode |
 
 ## Preprocessing expectations
 
 - Timestamp column must be parseable by pandas and free of NULLs.
 - Target column must be numeric; NULLs are filled with zeros.
 - All numeric features are automatically included; NULLs become zeros.
+- Numeric feature columns should match the set and order the checkpoint/standardizer was trained with; a different order silently misattributes forecasts, and a different column count fails at standardization with a broadcasting error.
 - Input length must be at least `seq_len`; otherwise `ValueError` is raised.
 
 ## Outputs
@@ -220,12 +246,17 @@ perform_forecasting(
 - **DARR mode**: Returns hybrid predictions in `{target_column}_forecast` (direct and kNN components are computed internally).
 - **Interpretability mode**: Returns the explanation-aligned forecast in `{target_column}_forecast` and writes the artifact bundle to `<interpretability_out_dir>/run_<UTC>/`.
 
+With `return_all_channels=True`, the single `{target_column}_forecast` column is replaced by one `{column}_forecast` column per processed channel (target column first, then the remaining numeric features in input-column order). Each forward pass already predicts every channel, so this avoids re-running the SDK once per column when downstream code needs multivariate forecasts. Autoregressive extension (`forecast_horizon > model_horizon`) and DARR blending apply to every channel the same way they apply to the target column; in DARR mode with mismatched input/context columns, only the aligned common columns are forecast (see Column Mismatch Handling).
+
+> **Channel order matters.** The checkpoint and standardizer are trained against a specific channel layout. At inference time the numeric columns of the input DataFrame should match the training-time set and order. With the same columns in a different order the model still runs, but the forecasts can be semantically wrong — especially visible with `return_all_channels=True`, where every channel becomes an output column. With extra or missing numeric columns the channel count no longer matches the standardizer, and the call fails at standardization with a broadcasting error before inference runs.
+
 ### Output DataFrame structure
 
 | Column | Description |
 |--------|-------------|
 | `{timestamp_column}` | Forecasted timestamps starting after the last input timestamp |
 | `{target_column}_forecast` | Predicted values for the forecast horizon |
+| `{column}_forecast` | (Only with `return_all_channels=True`) Predicted values for each additional numeric feature channel |
 
 ### Interpretability artifact bundle
 
@@ -234,12 +265,18 @@ When `interpretability=True`, the run directory contains the following files (se
 | File | Written when | Contents |
 |------|--------------|----------|
 | `forecast.csv` | json, pdf, both | The returned forecast DataFrame |
-| `explanation.json` | json, both | Forecast + full explanation payload (baseline forecast, lag×horizon scores and attributions, latent trajectory, semantic-flow magnitudes, `diagnostics` block including `latent_trajectory_shape` and the forecast-vs-history ratios, `trajectory_stability` block with temporal-smoothness metrics over the context window, and dataset metadata) |
+| `explanation.json` | json, both | Forecast + full explanation payload, including lag×horizon values, semantic-flow diagnostics, trajectory stability, a multivariate `feature_axis` block containing attribution and `embedding_stability` results, optional Integrated Gradients, and dataset metadata |
 | `lag_horizon_attributions.csv` | pdf, both | Wide K×H attribution matrix |
 | `lag_horizon_long.csv` | pdf, both | Tidy `(lag, horizon, attribution[, score])` table |
 | `lag_horizon_heatmap.png` | pdf, both *(needs matplotlib)* | Visual heatmap, viridis cmap |
 | `semantic_flow.csv` | pdf, both | Tidy `(transition_index, segment, flow_magnitude)` table, where `segment` is `history` for transitions fully inside the input window, `forecast` for transitions whose window extends into the model-generated future, and `tail` for any trailing transitions outside both segments |
-| `explanation_report.pdf` | pdf, both *(needs matplotlib)* | Multi-page report: (1) cover with metadata, (2) forecast preview, (3) lag×horizon heatmap, (4) top-`interpretability_top_k` lag-step tables, (5) semantic-flow magnitudes page with the per-transition flow time series (history/forecast split annotated), a per-segment summary (mean / median / p95 / max / variance / transition count) and the four forecast-vs-history diagnostic ratios (`flow_ratio`, `flow_variance_ratio`, `curvature_ratio`, `latent_diag_mahalanobis_ratio`), (6) latent-trajectory stability table with per-dimension zero-crossing / direction-flip / relative-jitter (mean & p95) and occupancy metrics |
+| `channel_horizon_attributions.csv` | multivariate pdf, both | Feature-axis `C×H` attribution matrix |
+| `channel_horizon_heatmap.png` | multivariate pdf, both *(needs matplotlib)* | Feature-axis channel-by-horizon heatmap |
+| `feature_axis_embedding_stability.csv` | multivariate pdf, both | Complete feature-level embedding-stability report: mean, p50, p95, and max Lipschitz-style ratios, retained trial counts, sampled-window count, and the unperturbed latent-step reference scale |
+| `integrated_gradients_attributions.csv` | `integrated_gradients=True` with pdf or both | Signed embedding IG value for every channel and context position |
+| `integrated_gradients_channel_summary.csv` | `integrated_gradients=True` with pdf or both | Signed effect, absolute effect, and absolute share by channel |
+| `integrated_gradients_heatmap.png` | `integrated_gradients=True` with pdf or both *(needs matplotlib)* | Signed channel-by-context IG heatmap |
+| `explanation_report.pdf` | pdf, both *(needs matplotlib)* | Multi-page report covering forecast, lag×horizon attribution, semantic flow, latent stability, feature-axis attribution, feature-axis embedding stability, and optional embedding Integrated Gradients |
 
 The run directory path is printed on stdout when the call completes.
 
@@ -257,13 +294,14 @@ The SDK automatically detects and handles column mismatches between input and co
 Warning: Column mismatch detected between input and context datasets
   Input dataset columns: ['HUFL', 'HULL', 'MUFL', 'MULL', 'LUFL', 'OT']
   Context dataset columns: ['HULL', 'MULL', 'LUFL']
-  Common columns: ['HULL', 'MULL', 'LUFL']
+  Common columns (input order): ['HULL', 'MULL', 'LUFL']
   Using only common columns for consistent predictions: ['HULL', 'MULL', 'LUFL']
 ```
 
 **Behavior**:
 - **Automatic detection**: Identifies when datasets have different feature sets
-- **Intelligent alignment**: Uses intersection of feature columns for consistent shapes
+- **Order-sensitive alignment**: Realignment also triggers when both datasets contain the same columns in a different order — otherwise the direct and kNN predictions would blend mismatched channels
+- **One canonical order**: Both temporary datasets are rewritten with the common feature columns in input-DataFrame order (target column first), so the caller-facing channel layout is preserved for the channels that remain
 - **Clear warnings**: Reports what columns are being used and why
 - **Graceful fallback**: Prevents cryptic NumPy broadcasting errors
 
@@ -272,7 +310,7 @@ Warning: Column mismatch detected between input and context datasets
 | Error | Cause | Solution |
 |-------|-------|----------|
 | `ValueError: No common numeric columns found between input and context datasets` | Datasets share no feature columns (only target) | Ensure context dataset has at least one feature column in common with input |
-| `ValueError: Shape mismatch between direct and kNN predictions` | Column alignment failed internally | Check that both datasets have valid numeric columns |
+| `ValueError: Shape mismatch between direct and kNN predictions` | Input and context columns could not be aligned | Check that both datasets have valid numeric columns |
 | `ValueError: DataFrame has X rows but seq_len requires at least Y rows` | Insufficient data points | Provide more data or reduce `seq_len` |
 | `ValueError: Context DataFrame has X rows but requires at least Y rows` | Context dataset too small | Context needs `seq_len + max(model_horizon, forecast_horizon)` rows minimum |
 | `ValueError: forecast_horizon must be <= 512` | Forecast horizon too large | Reduce `forecast_horizon` or make multiple calls |
@@ -295,4 +333,4 @@ Common safeguards raised as `ValueError` include:
 
 ## Examples and tests
 
-See `tesseract_forecasting/sdk/tests/test_forecasting.py` for unit test coverage with mockers and `sdk/quick_example.py` for an end-to-end script.
+See `sdk/tests/test_forecasting.py` for unit test coverage with mockers and `sdk/quick_example.py` for an end-to-end script.

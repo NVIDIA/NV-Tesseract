@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import inspect
+import json
+import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -32,6 +38,33 @@ class DummyModel:
         return
 
 
+class ChannelIndexedModel(DummyModel):
+    """DummyModel variant whose forecast value equals the channel index.
+
+    Makes channel/column mix-ups observable: every output column must carry
+    the value of the channel it claims to represent.
+    """
+
+    def __call__(self, x_enc: torch.Tensor, input_mask: torch.Tensor):
+        batch_size, channels, _ = x_enc.shape
+        forecast = torch.arange(channels, dtype=torch.float32).reshape(1, channels, 1)
+        forecast = forecast.repeat(batch_size, 1, self.model_horizon).to(x_enc.device)
+        return SimpleNamespace(forecast=forecast)
+
+
+class LastValueModel(DummyModel):
+    """DummyModel variant that repeats each channel's last observed value.
+
+    Makes the direct-prediction path sensitive to the channel layout of the
+    (rewritten) input CSV: each forecast channel reproduces the constant of
+    the input channel it was built from.
+    """
+
+    def __call__(self, x_enc: torch.Tensor, input_mask: torch.Tensor):
+        forecast = x_enc[:, :, -1:].repeat(1, 1, self.model_horizon)
+        return SimpleNamespace(forecast=forecast)
+
+
 @pytest.fixture(autouse=True)
 def patch_external_dependencies(monkeypatch):
     build_calls = []
@@ -57,7 +90,7 @@ def patch_external_dependencies(monkeypatch):
 
 
 def make_timeseries(num_rows: int = 10) -> pd.DataFrame:
-    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="H")
+    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="h")
     return pd.DataFrame(
         {
             "timestamp": timestamps,
@@ -67,12 +100,31 @@ def make_timeseries(num_rows: int = 10) -> pd.DataFrame:
     )
 
 
+def make_constant_feature_df(num_rows: int, feature_values: dict[str, float]) -> pd.DataFrame:
+    """Create a timeseries DataFrame whose feature columns are constants.
+
+    With uniform stub embeddings, the kNN retrieval forecast is the mean of the
+    context continuations, so each forecast channel reproduces the constant of
+    the context channel it was built from — which makes channel misalignment
+    observable as a wrong constant in the output. Column order follows the
+    insertion order of ``feature_values``.
+    """
+    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="h")
+    data = {
+        "timestamp": timestamps,
+        "target": np.zeros(num_rows, dtype=np.float32),
+    }
+    for name, value in feature_values.items():
+        data[name] = np.full(num_rows, value, dtype=np.float32)
+    return pd.DataFrame(data)
+
+
 def make_timeseries_with_columns(num_rows: int = 10, columns: list[str] | None = None) -> pd.DataFrame:
     """Create a timeseries DataFrame with specified columns."""
     if columns is None:
         columns = ["feature1", "feature2"]
 
-    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="H")
+    timestamps = pd.date_range("2024-01-01", periods=num_rows, freq="h")
     data = {
         "timestamp": timestamps,
         "target": np.arange(num_rows, dtype=np.float32),
@@ -101,6 +153,76 @@ def test_perform_forecasting_generates_forecast_when_horizon_exceeds_model_horiz
     assert "target_forecast" in result.columns
     assert len(result) == 3
     assert result["target_forecast"].tolist() == [1.0, 1.0, 1.0]
+
+
+def test_perform_forecasting_uses_distinct_temp_csvs_for_concurrent_calls(monkeypatch):
+    """Same-process calls must not select the same temporary input path."""
+
+    class StopAfterTempCsvError(RuntimeError):
+        pass
+
+    paths = []
+    paths_lock = threading.Lock()
+    both_calls_reached_csv = threading.Barrier(2)
+
+    def capture_temp_csv(self, path, *args: object, **kwargs: object):
+        with paths_lock:
+            paths.append(str(path))
+        both_calls_reached_csv.wait(timeout=5)
+        raise StopAfterTempCsvError
+
+    def invoke(_):
+        with pytest.raises(StopAfterTempCsvError):
+            forecasting.perform_forecasting(
+                make_timeseries(num_rows=10),
+                seq_len=5,
+                forecast_horizon=2,
+                model_horizon=2,
+                standardizer_pkl="fake_std.pkl",
+                ckpt="fake_ckpt.pt",
+            )
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", capture_temp_csv)
+    monkeypatch.setattr(
+        forecasting,
+        "download_model_weights",
+        lambda standardizer_pkl, ckpt: (standardizer_pkl, ckpt),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(invoke, range(2)))
+
+    assert len(paths) == 2
+    assert len(set(paths)) == 2
+
+
+@pytest.mark.parametrize("with_context, expected_temp_files", [(False, 1), (True, 2)])
+def test_perform_forecasting_uses_and_cleans_owned_temp_csvs(monkeypatch, tmp_path, with_context, expected_temp_files):
+    """Standard and DARR calls clean up every unique CSV allocated for them."""
+    created_paths = []
+
+    def create_temp_csv_path(prefix: str) -> str:
+        path = tmp_path / f"{prefix}{len(created_paths)}.csv"
+        path.touch()
+        created_paths.append(path)
+        return str(path)
+
+    monkeypatch.setattr(forecasting, "_create_temp_csv_path", create_temp_csv_path)
+
+    result = forecasting.perform_forecasting(
+        make_timeseries(num_rows=10),
+        context_df=make_timeseries(num_rows=10) if with_context else None,
+        seq_len=5,
+        forecast_horizon=2,
+        model_horizon=2,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        num_workers=0,
+    )
+
+    assert len(result) == 2
+    assert len(created_paths) == expected_temp_files
+    assert all(not path.exists() for path in created_paths)
 
 
 def test_perform_forecasting_uses_cross_channel_model_by_default(patch_external_dependencies):
@@ -139,6 +261,419 @@ def test_perform_forecasting_allows_cross_channel_configuration_override(patch_e
     assert build_kwargs["use_cross_channel"] is False
     assert build_kwargs["cross_channel_heads"] == 4
     assert build_kwargs["cross_channel_dropout"] == 0.25
+
+
+def test_perform_forecasting_return_all_channels_emits_per_channel_forecasts(monkeypatch):
+    monkeypatch.setattr(
+        forecasting,
+        "build_model",
+        lambda *, forecast_horizon, **kwargs: ChannelIndexedModel(model_horizon=forecast_horizon),
+    )
+    forecasting.clear_model_cache()
+
+    df = make_timeseries(num_rows=10)
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=3,
+        model_horizon=3,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        seed=42,
+        return_all_channels=True,
+    )
+
+    # Channel order matches columns_to_process: target column first, then the
+    # remaining numeric features in input-column order.
+    assert list(result.columns) == ["timestamp", "target_forecast", "feature_forecast"]
+    assert len(result) == 3
+    # The stub model encodes the channel index in the forecast value, so each
+    # column must carry its own channel's value (a mix-up fails here).
+    assert result["target_forecast"].tolist() == [0.0, 0.0, 0.0]
+    assert result["feature_forecast"].tolist() == [1.0, 1.0, 1.0]
+
+
+def test_perform_forecasting_return_all_channels_with_autoregressive_horizon():
+    df = make_timeseries(num_rows=10)
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=6,
+        model_horizon=2,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        seed=42,
+        return_all_channels=True,
+    )
+
+    assert list(result.columns) == ["timestamp", "target_forecast", "feature_forecast"]
+    assert len(result) == 6
+    assert result["target_forecast"].notna().all()
+    assert result["feature_forecast"].notna().all()
+
+
+def test_perform_forecasting_return_all_channels_darr_mode():
+    df = make_timeseries(num_rows=12)
+    context_df = make_timeseries(num_rows=12)
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=3,
+        model_horizon=3,
+        context_df=context_df,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        seed=42,
+        return_all_channels=True,
+    )
+
+    assert list(result.columns) == ["timestamp", "target_forecast", "feature_forecast"]
+    assert len(result) == 3
+    assert result["target_forecast"].notna().all()
+    assert result["feature_forecast"].notna().all()
+
+
+def test_perform_forecasting_return_all_channels_supports_interpretability(monkeypatch, tmp_path):
+    def run_interpretability(**kwargs):
+        assert kwargs["return_all_channels"] is True
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-02", periods=3, freq="h"),
+                "target_forecast": np.ones(3, dtype=np.float32),
+                "feature_forecast": np.full(3, 2.0, dtype=np.float32),
+            }
+        ), tmp_path
+
+    monkeypatch.setattr(forecasting, "_run_interpretability", run_interpretability)
+    df = make_timeseries(num_rows=10)
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=3,
+        model_horizon=3,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        return_all_channels=True,
+        interpretability=True,
+    )
+
+    assert list(result.columns) == ["timestamp", "target_forecast", "feature_forecast"]
+
+
+def test_interpretability_sdk_defaults_match_algorithms():
+    from integrated_gradients import integrated_gradients_embedding
+
+    sdk_params = inspect.signature(forecasting.perform_forecasting).parameters
+    explain_params = inspect.signature(forecasting.explain_forecast).parameters
+    ig_params = inspect.signature(integrated_gradients_embedding).parameters
+
+    assert sdk_params["n_lags"].default == explain_params["n_lags"].default
+    assert sdk_params["softmax_tau"].default == explain_params["softmax_tau"].default
+    assert sdk_params["channel_output_aware"].default == explain_params["channel_output_aware"].default
+    assert sdk_params["integrated_gradients_baseline"].default == ig_params["baseline"].default
+    assert sdk_params["integrated_gradients_steps"].default == ig_params["n_steps"].default
+    assert sdk_params["integrated_gradients_n_baselines"].default == ig_params["n_baselines"].default
+    assert sdk_params["integrated_gradients_internal_batch_size"].default == ig_params["internal_batch_size"].default
+    assert sdk_params["integrated_gradients_reduce"].default == ig_params["reduce"].default
+
+
+def test_feature_axis_embedding_stability_csv_contains_complete_report(tmp_path):
+    report = SimpleNamespace(
+        lip_ratio_mean=np.array([0.1, 0.2], dtype=np.float32),
+        lip_ratio_max=np.array([0.4, 0.5], dtype=np.float32),
+        lip_ratio_p50=np.array([0.08, 0.18], dtype=np.float32),
+        lip_ratio_p95=np.array([0.3, 0.4], dtype=np.float32),
+        n_trials_per_channel=np.array([7, 6], dtype=np.int64),
+        n_unique_windows=5,
+        step_delta_norm_mean=0.25,
+        n_channels=2,
+    )
+
+    path = forecasting._save_feature_axis_embedding_stability_csv(tmp_path, report, ["target", "feature"])
+    saved = pd.read_csv(path)
+
+    assert list(saved.columns) == [
+        "feature",
+        "lip_ratio_mean",
+        "lip_ratio_p50",
+        "lip_ratio_p95",
+        "lip_ratio_max",
+        "n_trials_per_channel",
+        "n_unique_windows",
+        "step_delta_norm_mean",
+    ]
+    assert saved["feature"].tolist() == ["target", "feature"]
+    assert saved["n_trials_per_channel"].tolist() == [7, 6]
+    assert saved["n_unique_windows"].tolist() == [5, 5]
+
+
+def test_explanation_json_groups_feature_axis_results():
+    explanation = forecasting.ForecastExplanation(
+        baseline_forecast=np.ones((2, 2), dtype=np.float32),
+        lag_horizon_scores=np.ones((2, 2), dtype=np.float32),
+        lag_horizon_attributions=np.full((2, 2), 0.5, dtype=np.float32),
+        flow_magnitudes=np.ones(3, dtype=np.float32),
+        latent_trajectory=np.ones((4, 2), dtype=np.float32),
+        per_channel_flow=np.ones((3, 2), dtype=np.float32),
+        lag_channel_horizon_attributions=np.ones((2, 2, 2), dtype=np.float32),
+        channel_horizon_attributions=np.full((2, 2), 0.25, dtype=np.float32),
+        channel_flow_method="jacobian",
+        channel_flow_residual_ratio_mean=0.1,
+        channel_flow_residual_ratio_p95=0.2,
+    )
+    forecast_df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=2, freq="h"),
+            "target_forecast": np.ones(2, dtype=np.float32),
+        }
+    )
+
+    payload = forecasting._explanation_to_dict(
+        forecast_df,
+        explanation,
+        target_column="target",
+    )
+
+    explanation_payload = payload["explanation"]
+    assert explanation_payload["feature_axis"] == {
+        "method": "jacobian",
+        "channel_horizon_attributions": [[0.25, 0.25], [0.25, 0.25]],
+        "residual_ratio_mean": 0.1,
+        "residual_ratio_p95": 0.2,
+        "per_channel_flow": [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+    }
+    assert "lag_channel_horizon_attributions" not in explanation_payload
+    assert "channel_horizon_attributions" not in explanation_payload
+
+
+def test_perform_forecasting_forwards_output_aware_mode(monkeypatch, tmp_path):
+    captured = {}
+
+    def run_interpretability(**kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-02", periods=2, freq="h"),
+                "target_forecast": np.ones(2, dtype=np.float32),
+            }
+        ), tmp_path
+
+    monkeypatch.setattr(forecasting, "_run_interpretability", run_interpretability)
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=10, freq="h"),
+            "target": np.arange(10, dtype=np.float32),
+            "feature": np.linspace(0.0, 1.0, 10, dtype=np.float32),
+        }
+    )
+    forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=2,
+        model_horizon=2,
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        interpretability=True,
+        channel_output_aware=True,
+    )
+
+    assert captured["channel_output_aware"] is True
+
+
+def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, tmp_path):
+    import integrated_gradients as ig
+
+    explanation = SimpleNamespace(
+        baseline_forecast=np.ones((2, 2), dtype=np.float32),
+        lag_horizon_scores=np.ones((3, 2), dtype=np.float32),
+        lag_horizon_attributions=np.ones((3, 2), dtype=np.float32) / 3.0,
+        flow_magnitudes=None,
+        latent_trajectory=None,
+        surrogate_coef=None,
+        surrogate_intercept=None,
+        surrogate_feature_layout=None,
+        flow_ratio_forecast_vs_history=None,
+        flow_variance_ratio_forecast_vs_history=None,
+        curvature_ratio_forecast_vs_history=None,
+        latent_diag_mahalanobis_ratio_forecast_vs_history=None,
+        per_channel_flow=None,
+        lag_channel_horizon_attributions=None,
+        channel_horizon_attributions=None,
+        channel_flow_method=None,
+    )
+    captured = {}
+
+    class EmbedModel(torch.nn.Module):
+        def embed(self, *, x_enc, input_mask):
+            captured["input_mask"] = input_mask[0].detach().cpu().tolist()
+            return SimpleNamespace(embeddings=x_enc.reshape(x_enc.shape[0], -1).sum(dim=1, keepdim=True))
+
+    @contextmanager
+    def normalization_statistics_gradient(model, *, enabled):
+        captured["grad_through_norm"] = enabled
+        yield 0
+
+    def integrated_gradients_embedding(embed_fn, x, **kwargs):
+        captured["ig_shape"] = tuple(x.shape)
+        captured["ig_kwargs"] = kwargs
+        assert tuple(embed_fn(torch.zeros((2, *x.shape), dtype=torch.float32)).shape) == (2, 1)
+        return SimpleNamespace(
+            attribution=np.array([[1.0, 2.0, 3.0, 4.0], [-1.0, -2.0, -3.0, -4.0]], dtype=np.float32),
+            overall_effect=0.0,
+            abs_effect=20.0,
+            embedding_delta=0.5,
+            embedding_delta_abs_mean=0.5,
+            convergence_delta=0.1,
+            n_steps=kwargs["n_steps"],
+            n_baselines=kwargs["n_baselines"],
+            baseline=kwargs["baseline"],
+            reduce=kwargs["reduce"],
+            embedding_dim=1,
+        )
+
+    def compute_per_channel_embedding_stability(model, series_ct, **kwargs):
+        captured["embedding_stability_model"] = model
+        captured["embedding_stability_series_ct"] = series_ct
+        captured["embedding_stability_kwargs"] = kwargs
+        return SimpleNamespace(
+            lip_ratio_mean=np.array([0.1, 0.2], dtype=np.float32),
+            lip_ratio_max=np.array([0.4, 0.5], dtype=np.float32),
+            lip_ratio_p50=np.array([0.08, 0.18], dtype=np.float32),
+            lip_ratio_p95=np.array([0.3, 0.4], dtype=np.float32),
+            n_trials_per_channel=np.array([7, 7], dtype=np.int64),
+            n_unique_windows=5,
+            step_delta_norm_mean=0.25,
+            n_channels=2,
+        )
+
+    def build_pdf_report(pdf_path, **kwargs):
+        captured["pdf_report"] = kwargs["integrated_gradients_report"]
+        captured["embedding_stability_report"] = kwargs["feature_axis_embedding_stability_report"]
+        captured["channel_labels"] = kwargs["channel_labels"]
+        pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        return pdf_path
+
+    monkeypatch.setattr(forecasting, "explain_forecast", lambda *args, **kwargs: explanation)
+    monkeypatch.setattr(forecasting, "compute_trajectory_stability", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        forecasting,
+        "compute_per_channel_embedding_stability",
+        compute_per_channel_embedding_stability,
+    )
+    monkeypatch.setattr(ig, "integrated_gradients_embedding", integrated_gradients_embedding)
+    monkeypatch.setattr(forecasting, "_normalization_statistics_gradient", normalization_statistics_gradient)
+    monkeypatch.setattr(forecasting, "_save_lag_horizon_artifacts", lambda *args, **kwargs: None)
+    monkeypatch.setattr(forecasting, "_build_pdf_report", build_pdf_report)
+
+    model = EmbedModel()
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2024-01-01", periods=6, freq="h"),
+            "target": np.arange(6, dtype=np.float32),
+            "feature": np.linspace(0.0, 1.0, 6, dtype=np.float32),
+        }
+    )
+    standardizer = forecasting.Standardizer(
+        mean=np.zeros(2, dtype=np.float32),
+        std=np.ones(2, dtype=np.float32),
+    )
+    _, run_dir = forecasting._run_interpretability(
+        model=model,
+        standardizer=standardizer,
+        working_df=df,
+        columns_to_process=["target", "feature"],
+        timestamp_column="timestamp",
+        target_column="target",
+        seq_len=4,
+        forecast_horizon=2,
+        model_horizon=2,
+        device=torch.device("cpu"),
+        n_lags=3,
+        softmax_tau=1.0,
+        interpretability_output=None,
+        interpretability_out_dir=tmp_path,
+        interpretability_run_name="integrated_gradients",
+        interpretability_top_k=2,
+        dataset_name="unit",
+        integrated_gradients=True,
+        integrated_gradients_steps=7,
+        integrated_gradients_n_baselines=2,
+        integrated_gradients_internal_batch_size=3,
+        integrated_gradients_reduce="mean",
+        integrated_gradients_seed=123,
+    )
+
+    payload = json.loads((run_dir / "explanation.json").read_text(encoding="utf-8"))
+    ig_payload = payload["explanation"]["integrated_gradients"]
+    stability_payload = payload["explanation"]["feature_axis"]["embedding_stability"]
+    assert ig_payload["channel_labels"] == ["target", "feature"]
+    assert ig_payload["channel_abs_effect"] == [10.0, 10.0]
+    assert stability_payload["channel_labels"] == ["target", "feature"]
+    assert stability_payload["lip_ratio_mean"] == pytest.approx([0.1, 0.2])
+    assert stability_payload["n_trials_per_channel"] == [7, 7]
+    assert captured["embedding_stability_model"] is model
+    np.testing.assert_array_equal(
+        captured["embedding_stability_series_ct"],
+        df[["target", "feature"]].tail(4).to_numpy(dtype=np.float32).T,
+    )
+    assert captured["embedding_stability_kwargs"]["seq_len"] == 4
+    assert captured["embedding_stability_kwargs"]["device"] == torch.device("cpu")
+    assert captured["input_mask"] == [1, 1, 1, 1]
+    assert captured["ig_shape"] == (2, 4)
+    assert captured["ig_kwargs"]["internal_batch_size"] == 3
+    assert captured["ig_kwargs"]["seed"] == 123
+    assert captured["grad_through_norm"] is True
+    assert captured["channel_labels"] == ["target", "feature"]
+    assert captured["pdf_report"]["attribution"].shape == (2, 4)
+    assert captured["embedding_stability_report"].n_channels == 2
+    assert (run_dir / "integrated_gradients_attributions.csv").exists()
+    assert (run_dir / "integrated_gradients_channel_summary.csv").exists()
+    assert (run_dir / "feature_axis_embedding_stability.csv").exists()
+
+
+def test_normalization_statistics_gradient_is_scoped():
+    class Normalizer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.eps = 1e-5
+
+        def _get_statistics(self, x, mask=None):
+            self.mean = x.mean(dim=-1, keepdim=True).detach()
+            self.stdev = x.std(dim=-1, keepdim=True, correction=0).detach() + self.eps
+
+        def _normalize(self, x):
+            return (x - self.mean) / self.stdev
+
+    model = torch.nn.Sequential(Normalizer())
+    normalizer = model[0]
+    x = torch.arange(12, dtype=torch.float32).reshape(1, 2, 6).requires_grad_(True)
+
+    assert "_get_statistics" not in vars(normalizer)
+    with forecasting._normalization_statistics_gradient(model, enabled=True) as patched:
+        normalizer._get_statistics(x)
+        assert patched == 1
+        assert normalizer.mean.requires_grad
+        assert normalizer.stdev.requires_grad
+
+    assert "_get_statistics" not in vars(normalizer)
+    normalizer._get_statistics(x)
+    assert not normalizer.mean.requires_grad
+    assert not normalizer.stdev.requires_grad
+
+
+def test_perform_forecasting_return_all_channels_rejects_timestamp_collision():
+    df = make_timeseries(num_rows=10).rename(columns={"timestamp": "feature_forecast"})
+    with pytest.raises(ValueError, match="collides"):
+        forecasting.perform_forecasting(
+            df,
+            timestamp_column="feature_forecast",
+            seq_len=5,
+            forecast_horizon=3,
+            model_horizon=3,
+            standardizer_pkl="fake_std.pkl",
+            ckpt="fake_ckpt.pt",
+            return_all_channels=True,
+        )
 
 
 def test_perform_forecasting_requires_timestamp_column():
@@ -847,3 +1382,119 @@ def test_perform_forecasting_darr_mode_column_alignment_with_autoregression():
 
     assert len(result) == 6
     assert result["target_forecast"].notna().all()
+
+
+def test_perform_forecasting_darr_mode_same_columns_different_order(caplog):
+    """An order-only difference must trigger realignment of the context CSV.
+
+    The target channel is first in both layouts, so this test observes the
+    realignment through the warning log; the value-level alignment is covered
+    by the return_all_channels tests below.
+    """
+    df = make_constant_feature_df(12, {"f1": 10.0, "f2": 20.0})
+    context_df = make_constant_feature_df(12, {"f2": 20.0, "f1": 10.0})
+
+    with caplog.at_level(logging.WARNING):
+        result = forecasting.perform_forecasting(
+            df,
+            seq_len=5,
+            forecast_horizon=3,
+            model_horizon=3,
+            context_df=context_df,
+            alpha=0.0,  # pure kNN: forecasts reproduce the context channel constants
+            standardizer_pkl="fake_std.pkl",
+            ckpt="fake_ckpt.pt",
+            seed=42,
+        )
+
+    assert len(result) == 3
+    assert result["target_forecast"].tolist() == pytest.approx([0.0, 0.0, 0.0])
+    # A set-based comparison would treat the two layouts as identical and skip
+    # realignment silently; the order-only warning proves the branch fired.
+    assert any("same numeric columns in a different order" in rec.getMessage() for rec in caplog.records)
+
+
+def test_perform_forecasting_darr_mode_different_order_return_all_channels_aligned():
+    """With return_all_channels=True, every output column must carry the value of
+    its own channel even when the context lists the same columns in another order."""
+    df = make_constant_feature_df(12, {"f1": 10.0, "f2": 20.0})
+    context_df = make_constant_feature_df(12, {"f2": 20.0, "f1": 10.0})
+
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=3,
+        model_horizon=3,
+        context_df=context_df,
+        alpha=0.0,  # pure kNN: forecasts reproduce the context channel constants
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        seed=42,
+        return_all_channels=True,
+    )
+
+    assert list(result.columns) == ["timestamp", "target_forecast", "f1_forecast", "f2_forecast"]
+    # A channel mix-up would surface the other channel's constant here.
+    assert result["f1_forecast"].tolist() == pytest.approx([10.0, 10.0, 10.0])
+    assert result["f2_forecast"].tolist() == pytest.approx([20.0, 20.0, 20.0])
+
+
+def test_perform_forecasting_darr_mode_column_mismatch_uses_input_order_common_subset():
+    """Missing/extra context features fall back to the aligned common subset,
+    anchored to the input-DataFrame column order (not sorted order)."""
+    # Input feature order [zz, beta, alpha] differs from sorted order; the
+    # context is missing `zz` and lists the common features in another order.
+    df = make_constant_feature_df(12, {"zz": 30.0, "beta": 20.0, "alpha": 10.0})
+    context_df = make_constant_feature_df(12, {"alpha": 10.0, "beta": 20.0})
+
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=3,
+        model_horizon=3,
+        context_df=context_df,
+        alpha=0.0,  # pure kNN: forecasts reproduce the context channel constants
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        seed=42,
+        return_all_channels=True,
+    )
+
+    # Only the aligned common subset survives, in input-DataFrame order.
+    assert list(result.columns) == ["timestamp", "target_forecast", "beta_forecast", "alpha_forecast"]
+    assert result["beta_forecast"].tolist() == pytest.approx([20.0, 20.0, 20.0])
+    assert result["alpha_forecast"].tolist() == pytest.approx([10.0, 10.0, 10.0])
+
+
+def test_perform_forecasting_darr_mode_column_mismatch_direct_predictions_aligned(monkeypatch):
+    """With alpha=1.0 (pure direct) the forecasts come from the rewritten input
+    CSV, so this guards the main-CSV side of the canonical-order rewrite (the
+    kNN-side tests above run with alpha=0.0 and cannot observe it)."""
+    monkeypatch.setattr(
+        forecasting,
+        "build_model",
+        lambda *, forecast_horizon, **kwargs: LastValueModel(model_horizon=forecast_horizon),
+    )
+    forecasting.clear_model_cache()
+
+    df = make_constant_feature_df(12, {"zz": 30.0, "beta": 20.0, "alpha": 10.0})
+    context_df = make_constant_feature_df(12, {"alpha": 10.0, "beta": 20.0})
+
+    result = forecasting.perform_forecasting(
+        df,
+        seq_len=5,
+        forecast_horizon=3,
+        model_horizon=3,
+        context_df=context_df,
+        alpha=1.0,  # pure direct: forecasts reproduce the input channel constants
+        standardizer_pkl="fake_std.pkl",
+        ckpt="fake_ckpt.pt",
+        seed=42,
+        return_all_channels=True,
+    )
+
+    assert list(result.columns) == ["timestamp", "target_forecast", "beta_forecast", "alpha_forecast"]
+    # If the rewritten input CSV used a different order than the output naming,
+    # each column would carry the other channel's constant.
+    assert result["beta_forecast"].tolist() == pytest.approx([20.0, 20.0, 20.0])
+    assert result["alpha_forecast"].tolist() == pytest.approx([10.0, 10.0, 10.0])

@@ -9,7 +9,7 @@ This example demonstrates:
 1. Auto-downloading model weights from Hugging Face (on first run)
 2. Standard forecasting mode
 3. DARR mode (context-enhanced forecasting)
-4. Interpretability mode (forecast explanations, JSON + PDF report)
+4. Interpretability mode (lag and feature attributions, JSON + PDF report)
 
 Model weights download automatically from the public Hugging Face repo on first run.
 """
@@ -90,8 +90,16 @@ if __name__ == "__main__":
     #   - "pdf"  -> writes forecast.csv + lag_horizon_*.csv/png + explanation_report.pdf
     #   - None   -> writes both (full bundle)
     interp_out_dir = Path(__file__).resolve().parent / "interpretability_output"
+    # Add two derived channels so the feature-attribution and feature-axis
+    # embedding-stability pages are included. The run also writes the complete
+    # feature_axis_embedding_stability.csv report. Replace these with the actual
+    # feature columns used by your model in production.
+    df_interp = df.copy()
+    df_interp[f"{target_col}_diff"] = df_interp[target_col].diff().fillna(0.0)
+    df_interp[f"{target_col}_roll12"] = df_interp[target_col].rolling(window=12, min_periods=1).mean()
+
     interp_df = perform_forecasting(
-        df=df,
+        df=df_interp,
         seq_len=seq_len,
         forecast_horizon=forecast_horizon,
         timestamp_column=timestamp_col,
@@ -103,6 +111,7 @@ if __name__ == "__main__":
         interpretability_dataset_name=csv_path.name,
         n_lags=128,
         softmax_tau=1.0,
+        integrated_gradients=True,
         save_preds="forecast_ETTh_with_explanations.csv",
     )
     logger.info(
@@ -111,3 +120,4 @@ if __name__ == "__main__":
         interp_df.head().to_string(index=False),
     )
     logger.info("\nReport bundle written under: %s", interp_out_dir)
+    logger.info("Multivariate input includes feature-axis attribution and stability pages.")

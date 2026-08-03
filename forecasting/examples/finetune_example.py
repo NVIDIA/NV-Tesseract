@@ -25,7 +25,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,8 +35,12 @@ from typing import Any
 import joblib
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +57,24 @@ from sdk.forecasting import (
 LOGGER = logging.getLogger("forecasting_finetune")
 
 
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def init_distributed(rank: int, world_size: int) -> None:
+    if world_size <= 1:
+        return
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
+
+
+def cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def parse_column_list(value: str | None) -> list[str] | None:
     if value is None or value.strip() == "":
         return None
@@ -64,9 +88,9 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def get_device() -> torch.device:
+def get_device(local_rank: int = 0) -> torch.device:
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        return torch.device(f"cuda:{local_rank}")
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -263,9 +287,9 @@ def save_artifacts(
         json.dump(metadata, f, indent=2)
 
 
-def parse_args() -> argparse.Namespace:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fine-tune NV-Tesseract forecasting on a CSV dataset.")
-    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group = parser.add_mutually_exclusive_group()
     data_group.add_argument("--csv", type=str, help="Single CSV to split temporally into train/val/test.")
     data_group.add_argument("--train-csv", type=str, help="Training CSV. Requires --val-csv.")
     parser.add_argument("--val-csv", type=str, help="Validation CSV when --train-csv is used.")
@@ -309,14 +333,105 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-cross-channel", action="store_true")
     parser.add_argument("--cross-channel-heads", type=int, default=8)
     parser.add_argument("--cross-channel-dropout", type=float, default=0.1)
-    return parser.parse_args()
+
+    parser.add_argument("--run-config", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs to use. Defaults to all available GPUs. Set to 1 to force single-GPU.",
+    )
+    return parser
 
 
-def main() -> None:
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    set_seed(args.seed)
-    device = get_device()
+def _load_run_config(path: str) -> dict:
+    import yaml
+
+    text = Path(path).read_text()
+    return yaml.safe_load(text) or {}
+
+
+def _run_config_defaults(cfg: dict) -> list[str]:
+    """Flatten a nested YAML run-config into CLI-style --key value pairs."""
+    _BOOL_FLAGS = {
+        "no_standardize",
+        "local_files_only",
+        "unfreeze_encoder",
+        "unfreeze_embedder",
+        "use_cross_channel",
+    }
+    mapping = {
+        "dataset": {
+            "csv": "--csv",
+            "train_csv": "--train-csv",
+            "val_csv": "--val-csv",
+            "timestamp_col": "--timestamp-col",
+            "target_cols": "--target-cols",
+            "val_ratio": "--val-ratio",
+            "test_ratio": "--test-ratio",
+            "stride": "--stride",
+            "no_standardize": "--no-standardize",
+        },
+        "model": {
+            "seq_len": "--seq-len",
+            "forecast_horizon": "--forecast-horizon",
+            "ckpt_init": "--ckpt-init",
+            "use_cross_channel": "--use-cross-channel",
+            "cross_channel_heads": "--cross-channel-heads",
+            "cross_channel_dropout": "--cross-channel-dropout",
+            "unfreeze_encoder": "--unfreeze-encoder",
+            "unfreeze_embedder": "--unfreeze-embedder",
+        },
+        "train": {
+            "epochs": "--epochs",
+            "batch_size": "--batch-size",
+            "lr": "--lr",
+            "weight_decay": "--weight-decay",
+            "head_dropout": "--head-dropout",
+            "max_norm": "--max-norm",
+            "seed": "--seed",
+            "output_dir": "--output-dir",
+            "local_files_only": "--local-files-only",
+        },
+    }
+    extras: list[str] = []
+    for section, keys in mapping.items():
+        section_cfg = cfg.get(section, {}) or {}
+        for key, flag in keys.items():
+            val = section_cfg.get(key)
+            if val is None or val == "":
+                continue
+            if key in _BOOL_FLAGS:
+                if val:
+                    extras.append(flag)
+            else:
+                extras.extend([flag, str(val)])
+    return extras
+
+
+def parse_args() -> argparse.Namespace:
+    parser = _build_parser()
+    # First pass: detect --run-config without requiring --csv/--train-csv yet.
+    pre, _ = parser.parse_known_args()
+    defaults: list[str] = []
+    if pre.run_config:
+        cfg = _load_run_config(pre.run_config)
+        defaults = _run_config_defaults(cfg)
+    # Second pass: config defaults first, then CLI overrides.
+    args = parser.parse_args(defaults + sys.argv[1:])
+    if args.csv is None and args.train_csv is None:
+        parser.error("one of --csv or --train-csv is required (or supply both via --run-config)")
+    return args
+
+
+def main_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
+    is_main = rank == 0
+    init_distributed(rank, world_size)
+
+    if is_main:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    set_seed(args.seed + rank)
+    device = get_device(rank if world_size > 1 else 0)
     output_dir = Path(args.output_dir)
 
     train_dataset, val_dataset = build_datasets(args)
@@ -325,15 +440,20 @@ def main() -> None:
     if len(val_dataset) == 0:
         raise ValueError("No validation windows were created. Reduce --seq-len/--forecast-horizon or use more data.")
 
-    LOGGER.info("Device: %s", device)
-    LOGGER.info("Train windows: %s", len(train_dataset))
-    LOGGER.info("Val windows: %s", len(val_dataset))
-    LOGGER.info("Channels: %s", train_dataset.channels)
+    if is_main:
+        LOGGER.info("Device: %s | world_size: %s", device, world_size)
+        LOGGER.info("Train windows: %s", len(train_dataset))
+        LOGGER.info("Val windows: %s", len(val_dataset))
+        LOGGER.info("Channels: %s", train_dataset.channels)
 
+    train_sampler = (
+        DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -362,13 +482,19 @@ def main() -> None:
     )
     ckpt_init = resolve_checkpoint_init(args)
     if ckpt_init:
-        LOGGER.info("Warm-starting from checkpoint: %s", ckpt_init)
+        if is_main:
+            LOGGER.info("Warm-starting from checkpoint: %s", ckpt_init)
         load_checkpoint(model, ckpt_init, device)
 
-    LOGGER.info("Trainable parameters: %s", f"{count_trainable_params(model):,}")
+    if world_size > 1:
+        model = DistributedDataParallel(model, device_ids=[rank])
+
+    if is_main:
+        LOGGER.info("Trainable parameters: %s", f"{count_trainable_params(model):,}")
 
     criterion = torch.nn.MSELoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # total_steps is per-GPU because each rank sees 1/world_size of the data
     scheduler = OneCycleLR(
         optimizer,
         max_lr=args.lr,
@@ -382,24 +508,28 @@ def main() -> None:
     best_epoch = -1
 
     for epoch in range(1, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         train_mse = train_one_epoch(model, train_loader, optimizer, scheduler, scaler, criterion, device, args.max_norm)
         val_mse, val_mae = evaluate(model, val_loader, criterion, device)
         row = {"epoch": epoch, "train_mse": train_mse, "val_mse": val_mse, "val_mae": val_mae}
         metrics.append(row)
-        LOGGER.info(
-            "Epoch %s/%s | train MSE %.6f | val MSE %.6f | val MAE %.6f",
-            epoch,
-            args.epochs,
-            train_mse,
-            val_mse,
-            val_mae,
-        )
+        if is_main:
+            LOGGER.info(
+                "Epoch %s/%s | train MSE %.6f | val MSE %.6f | val MAE %.6f",
+                epoch,
+                args.epochs,
+                train_mse,
+                val_mse,
+                val_mae,
+            )
 
-        if val_mse < best_val:
+        if is_main and val_mse < best_val:
             best_val = val_mse
             best_epoch = epoch
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             save_artifacts(
-                model=model,
+                model=raw_model,
                 output_dir=output_dir,
                 standardizer=getattr(train_dataset, "standardizer", None),
                 args=args,
@@ -409,10 +539,35 @@ def main() -> None:
             )
             LOGGER.info("Saved new best checkpoint to %s", output_dir / "best_model.pt")
 
-    LOGGER.info("Fine-tuning complete. Best val MSE %.6f at epoch %s", best_val, best_epoch)
-    with (output_dir / "metrics.json").open("w") as f:
-        json.dump(metrics, f, indent=2)
-    LOGGER.info("Artifacts written to %s", output_dir)
+    if is_main:
+        LOGGER.info("Fine-tuning complete. Best val MSE %.6f at epoch %s", best_val, best_epoch)
+        # Per-epoch log for human inspection.
+        with (output_dir / "epoch_metrics.json").open("w") as f:
+            json.dump(metrics, f, indent=2)
+        # Scalar summary consumed by TAO AutoML runner metric extraction.
+        best_row = min(metrics, key=lambda r: r["val_mse"]) if metrics else {}
+        with (output_dir / "metrics.json").open("w") as f:
+            json.dump(
+                {"val_mse": best_row.get("val_mse", float("inf")), "val_mae": best_row.get("val_mae", float("inf"))}, f
+            )
+        LOGGER.info("Artifacts written to %s", output_dir)
+
+    cleanup_distributed()
+
+
+def main() -> None:
+    args = parse_args()
+
+    available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    world_size = args.num_gpus if args.num_gpus is not None else max(available, 1)
+    world_size = max(1, world_size)
+
+    if world_size > 1:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        mp.spawn(main_worker, args=(world_size, args), nprocs=world_size, join=True)
+    else:
+        main_worker(0, 1, args)
 
 
 if __name__ == "__main__":

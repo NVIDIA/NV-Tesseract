@@ -312,19 +312,7 @@ class TSDiffuser_base(nn.Module):
         # Clamp alpha to prevent numerical issues
         current_alpha = torch.clamp(current_alpha, min=1e-6, max=1.0 - 1e-6)
 
-        # Add input validation and normalization
-        if torch.isnan(observed_data).any():
-            logger.warning("NaN detected in observed_data!")
-            observed_data = torch.nan_to_num(observed_data, nan=0.0)
-
-        # Normalize input data to prevent extreme values
-        # Use instance normalization to handle each sample independently
-        data_mean = observed_data.mean(dim=(1, 2), keepdim=True)
-        data_std = observed_data.std(dim=(1, 2), keepdim=True) + 1e-5
-        observed_data = (observed_data - data_mean) / data_std
-
-        # Final safety clamp after normalization
-        observed_data = torch.clamp(observed_data, min=-10.0, max=10.0)
+        observed_data, _, _ = self._normalize_observed_data(observed_data)
 
         # Generate noise with slight reduction to prevent overflow
         noise = torch.randn_like(observed_data) * 0.999
@@ -422,6 +410,24 @@ class TSDiffuser_base(nn.Module):
             }
         total_loss = loss
         return total_loss
+
+    @staticmethod
+    def _normalize_observed_data(observed_data):
+        """Apply the per-window scale used by diffusion training."""
+        if torch.isnan(observed_data).any():
+            logger.warning("NaN detected in observed_data!")
+            observed_data = torch.nan_to_num(observed_data, nan=0.0)
+
+        data_mean = observed_data.mean(dim=(1, 2), keepdim=True)
+        data_std = observed_data.std(dim=(1, 2), keepdim=True) + 1e-5
+        normalized_data = (observed_data - data_mean) / data_std
+        normalized_data = torch.clamp(normalized_data, min=-10.0, max=10.0)
+        return normalized_data, data_mean, data_std
+
+    @staticmethod
+    def _denormalize_samples(samples, data_mean, data_std):
+        """Return generated samples to the input scale used by SDK residuals."""
+        return samples * data_std.unsqueeze(1) + data_mean.unsqueeze(1)
 
     def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask):
         if self.is_unconditional:
@@ -764,7 +770,9 @@ class TSDiffuser_base(nn.Module):
 
             side_info = self.get_side_info(observed_tp, cond_mask)
 
-            samples = self.impute(observed_data, cond_mask, side_info, n_samples, strategy_type)
+            normalized_data, data_mean, data_std = self._normalize_observed_data(observed_data)
+            samples = self.impute(normalized_data, cond_mask, side_info, n_samples, strategy_type)
+            samples = self._denormalize_samples(samples, data_mean, data_std)
 
             for i in range(len(cut_length)):  # to avoid double evaluation
                 target_mask[i, ..., 0 : cut_length[i].item()] = 0
@@ -802,10 +810,12 @@ class TSDiffuser_base(nn.Module):
 
             side_info = self.get_side_info(observed_tp, cond_mask)
 
+            normalized_data, data_mean, data_std = self._normalize_observed_data(observed_data)
             # Use DPM-Solver for fast sampling
             samples = self.dpm_solver_impute(
-                observed_data, cond_mask, side_info, n_samples, strategy_type, num_steps=dpm_steps
+                normalized_data, cond_mask, side_info, n_samples, strategy_type, num_steps=dpm_steps
             )
+            samples = self._denormalize_samples(samples, data_mean, data_std)
 
             for i in range(len(cut_length)):  # to avoid double evaluation
                 target_mask[i, ..., 0 : cut_length[i].item()] = 0
