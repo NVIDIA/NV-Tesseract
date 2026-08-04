@@ -196,9 +196,8 @@ def compute_per_channel_flow_jacobian(
     _n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     if _n_gpus > 1 and value_fn is None:
         import logging as _log
-        _log.getLogger(__name__).info(
-            "channel flow Jacobian: using %d GPUs via DataParallel", _n_gpus
-        )
+
+        _log.getLogger(__name__).info("channel flow Jacobian: using %d GPUs via DataParallel", _n_gpus)
         model = torch.nn.DataParallel(_ChannelFlowEmbedDP(model))
     vf = value_fn if value_fn is not None else _embed_windows_batched
 

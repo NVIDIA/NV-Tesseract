@@ -2790,11 +2790,7 @@ def perform_forecasting(
             # loader has real batch depth so splitting across GPUs gives a meaningful
             # speedup, especially with cross-channel attention enabled.
             n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-            darr_embedder = (
-                torch.nn.DataParallel(_DARREmbedWrapper(model))
-                if n_gpus > 1
-                else model
-            )
+            darr_embedder = torch.nn.DataParallel(_DARREmbedWrapper(model)) if n_gpus > 1 else model
             if n_gpus > 1:
                 logger.info("DARR context build: using %d GPUs via DataParallel", n_gpus)
             DB_E, DB_Y = build_context_memory(darr_embedder, context_loader, device, cosine=True)
