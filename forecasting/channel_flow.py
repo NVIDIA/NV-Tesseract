@@ -105,7 +105,7 @@ class _ChannelFlowEmbedDP(torch.nn.Module):
     DataParallel only intercepts forward(), not arbitrary named methods.
     """
 
-    def __init__(self, model: "ForecastModel") -> None:
+    def __init__(self, model: ForecastModel) -> None:
         super().__init__()
         self._m = model
 
