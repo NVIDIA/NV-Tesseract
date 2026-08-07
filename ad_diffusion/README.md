@@ -53,6 +53,37 @@ results = perform_anomaly_analysis_with_diffusion(
 print(f"Detected {results['Anomaly'].sum()} anomalies")
 ```
 
+Generate a PDF report with the original signals, detected anomalies, MAE, and
+ground truth when a conventional label column such as `GT` is present:
+
+```python
+results = perform_anomaly_analysis_with_diffusion(
+    df=df,
+    threshold_strategy="scs",
+    report_path="output/pdf/anomaly_detection_report.pdf",
+    timestamp_column="timestamp",
+    ground_truth_column="GT",
+)
+```
+
+Timestamp and ground-truth columns used for the report are excluded from model
+features but preserved in the returned DataFrame. Existing callers are unchanged
+because PDF generation is disabled unless `report_path` is supplied.
+
+An existing AD result or CSV can also be rendered after inference:
+
+```python
+from sdk.reporting import generate_anomaly_detection_report
+
+generate_anomaly_detection_report(
+    results,
+    "output/pdf/anomaly_detection_report.pdf",
+)
+```
+
+The standalone reporter auto-detects common timestamp and ground-truth names
+(`timestamp`, `GT`, `ground_truth`, `is_anomaly`, and `label`).
+
 ## Pretrained Weights
 
 The pretrained Tesseract AD Diffusion model is hosted on Hugging Face:

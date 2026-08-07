@@ -16,6 +16,11 @@ from sdk.inference_ad import (
     get_model_target_dim,
     inference_ad_tesseract2_mp,
 )
+from sdk.reporting import (
+    generate_anomaly_detection_report,
+    infer_ground_truth_column,
+    infer_timestamp_column,
+)
 from sdk.thresholds import MACSThresholdStrategy, SCSThresholdStrategy
 
 # Set up logging
@@ -30,6 +35,10 @@ def perform_anomaly_analysis_with_diffusion(
     config_path: str | Path = "",
     nsample: int = 15,
     preprocess_model_dir: str | Path | None = None,
+    report_path: str | Path | None = None,
+    timestamp_column: str | None = None,
+    ground_truth_column: str | None = None,
+    report_title: str = "Anomaly Detection Report",
 ) -> pd.DataFrame:
     """
     Perform anomaly analysis using Tesseract AD Diffusion Model.
@@ -47,13 +56,34 @@ def perform_anomaly_analysis_with_diffusion(
         config_path: Path to the model config file (optional if config is in checkpoint)
         nsample: Number of samples for diffusion model inference
         preprocess_model_dir: Directory containing preprocessing model (optional)
+        report_path: Optional PDF destination. No report is generated when omitted.
+        timestamp_column: Optional timestamp column used only for report plotting.
+            When report_path is set, conventional timestamp names are auto-detected.
+        ground_truth_column: Optional binary-label column used only for report
+            plotting. When report_path is set, conventional label names are auto-detected.
+        report_title: Title shown on the generated PDF report.
 
     Returns:
         DataFrame with original data and anomaly detection results
     """
     # Prepare data for diffusion model
     # The diffusion model expects all numeric columns
-    input_df = df.copy()
+    resolved_timestamp_column = None
+    resolved_ground_truth_column = None
+    metadata_columns = []
+    if report_path is not None:
+        resolved_timestamp_column = timestamp_column or infer_timestamp_column(df)
+        resolved_ground_truth_column = ground_truth_column or infer_ground_truth_column(df)
+        metadata_columns = [
+            column for column in (resolved_timestamp_column, resolved_ground_truth_column) if column is not None
+        ]
+        missing_metadata = [column for column in metadata_columns if column not in df.columns]
+        if missing_metadata:
+            raise ValueError(f"Report metadata columns were not found: {missing_metadata}.")
+
+    input_df = df.drop(columns=metadata_columns).copy()
+    if input_df.empty and len(input_df.columns) == 0:
+        raise ValueError("No feature columns remain after excluding report metadata.")
 
     # Validate all columns are numeric by attempting to convert the entire DataFrame
     original_columns = input_df.columns.tolist()
@@ -138,5 +168,15 @@ def perform_anomaly_analysis_with_diffusion(
 
     result_df["Anomaly"] = anomalies
     result_df["MAE"] = residual_scores  # Using residual (MAE) as anomaly score
+
+    if report_path is not None:
+        generate_anomaly_detection_report(
+            result_df,
+            report_path,
+            feature_columns=list(input_df.columns),
+            timestamp_column=resolved_timestamp_column,
+            ground_truth_column=resolved_ground_truth_column,
+            title=report_title,
+        )
 
     return result_df
