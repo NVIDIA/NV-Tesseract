@@ -152,3 +152,69 @@ def test_perform_anomaly_analysis_truncates_long_model_outputs(monkeypatch, nume
     threshold_args, _ = mock_thresholder.detect_anomalies.call_args
     assert len(threshold_args[0]) == len(numeric_df)
     assert len(threshold_args[1]) == len(numeric_df)
+
+
+def test_optional_pdf_report_excludes_metadata_from_inference(monkeypatch, inference_results, tmp_path):
+    """Report metadata should be preserved in output but excluded from model features."""
+    input_df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=5, freq="min"),
+            "feature_1": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "feature_2": [2.0, 2.5, 3.0, 3.5, 4.0],
+            "GT": [0, 1, 0, 0, 1],
+        }
+    )
+    destination = tmp_path / "anomaly_report.pdf"
+    mock_inference = Mock(return_value=inference_results)
+    monkeypatch.setattr(anomaly_analysis, "inference_ad_tesseract2_mp", mock_inference)
+
+    mock_thresholder = Mock()
+    mock_thresholder.detect_anomalies.return_value = np.array([False, True, False, True, False])
+    mock_strategy = Mock()
+    mock_strategy.scs_thresholder = mock_thresholder
+    monkeypatch.setattr(anomaly_analysis, "SCSThresholdStrategy", Mock(return_value=mock_strategy))
+
+    result = anomaly_analysis.perform_anomaly_analysis_with_diffusion(
+        input_df,
+        threshold_strategy="scs",
+        model_path="model.pth",
+        config_path="config.yaml",
+        report_path=destination,
+    )
+
+    inference_df = mock_inference.call_args.kwargs["data"]
+    assert list(inference_df.columns) == ["feature_1", "feature_2"]
+    assert {"timestamp", "GT", "Anomaly", "MAE"}.issubset(result.columns)
+    assert destination.read_bytes().startswith(b"%PDF")
+
+
+def test_report_metadata_arguments_are_ignored_without_report_path(monkeypatch, inference_results):
+    """Report-only arguments must not alter the default inference feature set."""
+    input_df = pd.DataFrame(
+        {
+            "sample_time": [1, 2, 3, 4, 5],
+            "feature_1": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "feature_2": [2.0, 2.5, 3.0, 3.5, 4.0],
+            "expected_anomaly": [0, 1, 0, 0, 1],
+        }
+    )
+    mock_inference = Mock(return_value=inference_results)
+    monkeypatch.setattr(anomaly_analysis, "inference_ad_tesseract2_mp", mock_inference)
+
+    mock_thresholder = Mock()
+    mock_thresholder.detect_anomalies.return_value = np.array([False, True, False, True, False])
+    mock_strategy = Mock()
+    mock_strategy.scs_thresholder = mock_thresholder
+    monkeypatch.setattr(anomaly_analysis, "SCSThresholdStrategy", Mock(return_value=mock_strategy))
+
+    anomaly_analysis.perform_anomaly_analysis_with_diffusion(
+        input_df,
+        threshold_strategy="scs",
+        model_path="model.pth",
+        config_path="config.yaml",
+        timestamp_column="sample_time",
+        ground_truth_column="expected_anomaly",
+    )
+
+    inference_df = mock_inference.call_args.kwargs["data"]
+    assert list(inference_df.columns) == list(input_df.columns)
