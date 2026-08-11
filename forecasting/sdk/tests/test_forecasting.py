@@ -638,11 +638,13 @@ def test_normalization_statistics_gradient_is_scoped():
             self.eps = 1e-5
 
         def _get_statistics(self, x, mask=None):
-            self.mean = x.mean(dim=-1, keepdim=True).detach()
-            self.stdev = x.std(dim=-1, keepdim=True, correction=0).detach() + self.eps
+            mean = x.mean(dim=-1, keepdim=True).detach()
+            stdev = x.std(dim=-1, keepdim=True, correction=0).detach() + self.eps
+            return mean, stdev
 
-        def _normalize(self, x):
-            return (x - self.mean) / self.stdev
+        def _normalize(self, x, statistics):
+            mean, stdev = statistics
+            return (x - mean) / stdev
 
     model = torch.nn.Sequential(Normalizer())
     normalizer = model[0]
@@ -650,15 +652,15 @@ def test_normalization_statistics_gradient_is_scoped():
 
     assert "_get_statistics" not in vars(normalizer)
     with forecasting._normalization_statistics_gradient(model, enabled=True) as patched:
-        normalizer._get_statistics(x)
+        mean, stdev = normalizer._get_statistics(x)
         assert patched == 1
-        assert normalizer.mean.requires_grad
-        assert normalizer.stdev.requires_grad
+        assert mean.requires_grad
+        assert stdev.requires_grad
 
     assert "_get_statistics" not in vars(normalizer)
-    normalizer._get_statistics(x)
-    assert not normalizer.mean.requires_grad
-    assert not normalizer.stdev.requires_grad
+    mean, stdev = normalizer._get_statistics(x)
+    assert not mean.requires_grad
+    assert not stdev.requires_grad
 
 
 def test_perform_forecasting_return_all_channels_rejects_timestamp_collision():

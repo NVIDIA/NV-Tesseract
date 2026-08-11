@@ -1245,7 +1245,11 @@ def _normalization_statistics_gradient(model: torch.nn.Module, *, enabled: bool)
         original = module._get_statistics
         had_instance_override = "_get_statistics" in vars(module)
 
-        def _get_statistics(self: Any, x: torch.Tensor, mask: torch.Tensor | None = None) -> None:
+        def _get_statistics(
+            self: Any,
+            x: torch.Tensor,
+            mask: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             if mask is None:
                 mask = torch.ones((x.shape[0], x.shape[-1]), device=x.device)
             expanded = mask.to(device=x.device).unsqueeze(1).expand(-1, x.shape[1], -1).bool()
@@ -1255,8 +1259,8 @@ def _normalization_statistics_gradient(model: torch.nn.Module, *, enabled: bool)
             raw_stdev = variance.sqrt()
             eps_sq = torch.as_tensor(float(self.eps) ** 2, dtype=variance.dtype, device=variance.device)
             safe_stdev = variance.clamp_min(eps_sq).sqrt()
-            self.mean = mean
-            self.stdev = raw_stdev.detach() + safe_stdev - safe_stdev.detach() + self.eps
+            stdev = raw_stdev.detach() + safe_stdev - safe_stdev.detach() + self.eps
+            return mean, stdev
 
         module._get_statistics = types.MethodType(_get_statistics, module)
         restores.append((module, original, had_instance_override))
