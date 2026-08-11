@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from backbone import RevIN
 from sdk import forecasting
 
 
@@ -632,33 +633,19 @@ def test_run_interpretability_integrated_gradients_reaches_report(monkeypatch, t
 
 
 def test_normalization_statistics_gradient_is_scoped():
-    class Normalizer(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.eps = 1e-5
-
-        def _get_statistics(self, x, mask=None):
-            mean = x.mean(dim=-1, keepdim=True).detach()
-            stdev = x.std(dim=-1, keepdim=True, correction=0).detach() + self.eps
-            return mean, stdev
-
-        def _normalize(self, x, statistics):
-            mean, stdev = statistics
-            return (x - mean) / stdev
-
-    model = torch.nn.Sequential(Normalizer())
+    model = torch.nn.Sequential(RevIN(num_features=1))
     normalizer = model[0]
     x = torch.arange(12, dtype=torch.float32).reshape(1, 2, 6).requires_grad_(True)
 
     assert "_get_statistics" not in vars(normalizer)
     with forecasting._normalization_statistics_gradient(model, enabled=True) as patched:
-        mean, stdev = normalizer._get_statistics(x)
+        _, (mean, stdev) = normalizer(x, mode="norm", return_statistics=True)
         assert patched == 1
         assert mean.requires_grad
         assert stdev.requires_grad
 
     assert "_get_statistics" not in vars(normalizer)
-    mean, stdev = normalizer._get_statistics(x)
+    _, (mean, stdev) = normalizer(x, mode="norm", return_statistics=True)
     assert not mean.requires_grad
     assert not stdev.requires_grad
 

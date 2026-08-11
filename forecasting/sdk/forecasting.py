@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import tempfile
-import types
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +33,7 @@ except ImportError:
 
 
 # Clean absolute imports - package is installed in editable mode
+from backbone import RevIN
 from backbone.utils.utils import control_randomness
 from channel_stability import (
     PerChannelEmbeddingStabilityReport,
@@ -1232,47 +1232,10 @@ def _feature_axis_embedding_stability_page(
 
 @contextmanager
 def _normalization_statistics_gradient(model: torch.nn.Module, *, enabled: bool):
-    """Temporarily include supported normalization statistics in autograd."""
-    if not enabled:
-        yield 0
-        return
-
-    restores: list[tuple[object, object, bool]] = []
-    for module in model.modules():
-        if not all(hasattr(module, name) for name in ("_get_statistics", "_normalize", "eps")):
-            continue
-
-        original = module._get_statistics
-        had_instance_override = "_get_statistics" in vars(module)
-
-        def _get_statistics(
-            self: Any,
-            x: torch.Tensor,
-            mask: torch.Tensor | None = None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            if mask is None:
-                mask = torch.ones((x.shape[0], x.shape[-1]), device=x.device)
-            expanded = mask.to(device=x.device).unsqueeze(1).expand(-1, x.shape[1], -1).bool()
-            masked_x = torch.where(expanded, x, torch.full_like(x, float("nan")))
-            mean = torch.nanmean(masked_x, dim=-1, keepdim=True)
-            variance = (masked_x - mean).square().nanmean(dim=-1, keepdim=True)
-            raw_stdev = variance.sqrt()
-            eps_sq = torch.as_tensor(float(self.eps) ** 2, dtype=variance.dtype, device=variance.device)
-            safe_stdev = variance.clamp_min(eps_sq).sqrt()
-            stdev = raw_stdev.detach() + safe_stdev - safe_stdev.detach() + self.eps
-            return mean, stdev
-
-        module._get_statistics = types.MethodType(_get_statistics, module)
-        restores.append((module, original, had_instance_override))
-
-    try:
-        yield len(restores)
-    finally:
-        for module, original, had_instance_override in reversed(restores):
-            if had_instance_override:
-                module._get_statistics = original
-            else:
-                delattr(module, "_get_statistics")
+    """Select request-local RevIN statistics autograd without mutating models."""
+    normalizer_count = sum(isinstance(module, RevIN) for module in model.modules())
+    with RevIN.statistics_gradient_context(enabled=enabled):
+        yield normalizer_count if enabled else 0
 
 
 def _compute_integrated_gradients_report(

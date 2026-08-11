@@ -26,9 +26,12 @@ import sys
 import types
 import warnings
 from argparse import Namespace
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+from weakref import WeakKeyDictionary
 
 logger = logging.getLogger(__name__)
 
@@ -206,15 +209,30 @@ def nanstd(tensor, dim=None, keepdim=False):
 
 
 RevINStatistics = tuple[torch.Tensor, torch.Tensor]
+_RevINGradientContexts = tuple[tuple[object, bool], ...]
+_REVIN_GRADIENT_CONTEXTS: ContextVar[_RevINGradientContexts] = ContextVar(
+    "revin_gradient_contexts",
+    default=(),
+)
+_REVIN_LEGACY_STATISTICS: ContextVar[WeakKeyDictionary[nn.Module, RevINStatistics] | None] = ContextVar(
+    "revin_legacy_statistics",
+    default=None,
+)
+
+
+def _revin_statistics_gradients_enabled() -> bool:
+    contexts = _REVIN_GRADIENT_CONTEXTS.get()
+    return bool(contexts and contexts[-1][1])
 
 
 class RevIN(nn.Module):
     """Reversible instance normalization with request-local statistics.
 
     A caller that later denormalizes must request the statistics produced by
-    the matching normalization call and pass them back explicitly. Keeping
-    these tensors out of module state allows one model instance to serve
-    concurrent requests safely.
+    the matching normalization call and pass them back explicitly. Legacy
+    callers that omit return_statistics keep their latest statistics in the
+    current thread/task context instead of module state, so the original
+    sequential norm then denorm API remains safe across requests.
     """
 
     def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = False):
@@ -240,14 +258,34 @@ class RevIN(nn.Module):
             normalized = self._normalize(x, statistics)
             if return_statistics:
                 return normalized, statistics
+            self._remember_legacy_statistics(statistics)
             return normalized
         if mode == "denorm":
             if statistics is None:
-                raise ValueError("RevIN denormalization requires statistics from the matching normalization call")
+                statistics = self._legacy_statistics()
             if return_statistics:
                 raise ValueError("return_statistics is only supported when mode='norm'")
             return self._denormalize(x, statistics)
         raise NotImplementedError
+
+    @staticmethod
+    @contextmanager
+    def statistics_gradient_context(*, enabled: bool):
+        """Select statistics autograd behavior for the current thread/task.
+
+        Entries are removed by identity instead of reset with a ContextVar
+        token. That keeps overlapping contexts correct even if callers exit
+        them out of LIFO order.
+        """
+
+        marker = object()
+        contexts = _REVIN_GRADIENT_CONTEXTS.get()
+        _REVIN_GRADIENT_CONTEXTS.set((*contexts, (marker, enabled)))
+        try:
+            yield
+        finally:
+            contexts = _REVIN_GRADIENT_CONTEXTS.get()
+            _REVIN_GRADIENT_CONTEXTS.set(tuple(context for context in contexts if context[0] is not marker))
 
     def _init_params(self):
         self.affine_weight = nn.Parameter(torch.ones(1, self.num_features, 1))
@@ -259,9 +297,34 @@ class RevIN(nn.Module):
         n_channels = x.shape[1]
         mask = mask.to(device=x.device).unsqueeze(1).expand(-1, n_channels, -1).bool()
         masked_x = torch.where(mask, x, torch.nan)
-        mean = torch.nanmean(masked_x, dim=-1, keepdim=True).detach()
-        stdev = nanstd(masked_x, dim=-1, keepdim=True).detach() + self.eps
+        mean = torch.nanmean(masked_x, dim=-1, keepdim=True)
+        detached_stdev = nanstd(masked_x, dim=-1, keepdim=True).detach()
+
+        if not _revin_statistics_gradients_enabled():
+            return mean.detach(), detached_stdev + self.eps
+
+        variance = (masked_x - mean).square().nanmean(dim=-1, keepdim=True)
+        eps_sq = torch.as_tensor(float(self.eps) ** 2, dtype=variance.dtype, device=variance.device)
+        safe_stdev = variance.clamp_min(eps_sq).sqrt()
+        stdev = detached_stdev + safe_stdev - safe_stdev.detach() + self.eps
         return mean, stdev
+
+    def _remember_legacy_statistics(self, statistics: RevINStatistics) -> None:
+        statistics_by_module = _REVIN_LEGACY_STATISTICS.get()
+        updated: WeakKeyDictionary[nn.Module, RevINStatistics] = WeakKeyDictionary()
+        if statistics_by_module is not None:
+            updated.update(statistics_by_module)
+        updated[self] = statistics
+        _REVIN_LEGACY_STATISTICS.set(updated)
+
+    def _legacy_statistics(self) -> RevINStatistics:
+        statistics_by_module = _REVIN_LEGACY_STATISTICS.get()
+        if statistics_by_module is None or self not in statistics_by_module:
+            raise ValueError(
+                "RevIN denormalization requires statistics from a matching normalization call "
+                "in the current thread/task context"
+            )
+        return statistics_by_module[self]
 
     def _normalize(self, x, statistics: RevINStatistics):
         mean, stdev = statistics
@@ -605,7 +668,7 @@ class BackboneModel(nn.Module):
         if input_mask is None:
             input_mask = torch.ones((batch_size, seq_len)).to(x_enc.device)
 
-        x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
+        x_enc, _ = self.normalizer(x=x_enc, mask=input_mask, mode="norm", return_statistics=True)
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
 
         input_mask_patch_view = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
@@ -708,7 +771,7 @@ class BackboneModel(nn.Module):
         if input_mask is None:
             input_mask = torch.ones((batch_size, seq_len)).to(x_enc.device)
 
-        x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
+        x_enc, _ = self.normalizer(x=x_enc, mask=input_mask, mode="norm", return_statistics=True)
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
         x_enc = self.tokenizer(x=x_enc)
         enc_in = self.patch_embedding(x_enc, mask=input_mask)
