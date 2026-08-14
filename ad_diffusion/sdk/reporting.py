@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,8 @@ EXPLANATION_COLUMNS = {
     "ExplanationCoverage",
     "ExplanationMethod",
 }
+REQUIRED_EXPLANATION_COLUMNS = ("TopContributors", "ContributionShares", "ExplanationCoverage")
+MAX_EXPLANATIONS_PER_PAGE = 7
 
 
 def infer_ground_truth_column(df: pd.DataFrame) -> str | None:
@@ -121,6 +124,63 @@ def _classification_summary(detected: np.ndarray, ground_truth: np.ndarray | Non
             ("Precision / Recall / F1", f"{precision:.3f} / {recall:.3f} / {f1:.3f}"),
         ]
     )
+    return rows
+
+
+def _parse_explanation_list(value, *, name: str) -> list:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{name} must contain a valid JSON list.") from error
+    if not isinstance(value, (list, tuple, np.ndarray)):
+        raise TypeError(f"{name} must contain a list for each detected anomaly.")
+    return list(value)
+
+
+def _format_explanation_sample(value, *, is_datetime: bool) -> str:
+    if is_datetime:
+        return pd.Timestamp(value).strftime("%Y-%m-%d\n%H:%M:%S")
+    return str(value)
+
+
+def _resolve_explanation_rows(
+    result_df: pd.DataFrame,
+    detected: np.ndarray,
+    x_values,
+    *,
+    is_datetime: bool,
+) -> list[tuple[str, str, str, str]] | None:
+    present = [column for column in REQUIRED_EXPLANATION_COLUMNS if column in result_df.columns]
+    if not present:
+        return None
+    missing = [column for column in REQUIRED_EXPLANATION_COLUMNS if column not in result_df.columns]
+    if missing:
+        raise ValueError(f"Explainability report data is missing columns: {missing}.")
+
+    rows = []
+    x_array = np.asarray(x_values)
+    for row_index in np.flatnonzero(detected):
+        contributors = _parse_explanation_list(result_df.iloc[row_index]["TopContributors"], name="TopContributors")
+        shares = _parse_explanation_list(result_df.iloc[row_index]["ContributionShares"], name="ContributionShares")
+        if len(contributors) != len(shares):
+            raise ValueError("TopContributors and ContributionShares must have matching lengths.")
+
+        numeric_shares = np.asarray(shares, dtype=float)
+        if not np.isfinite(numeric_shares).all() or ((numeric_shares < 0) | (numeric_shares > 1)).any():
+            raise ValueError("ContributionShares must contain only finite values between 0 and 1.")
+        coverage = pd.to_numeric(result_df.iloc[row_index]["ExplanationCoverage"], errors="coerce")
+        if not np.isfinite(coverage) or not 0 <= coverage <= 1:
+            raise ValueError("ExplanationCoverage must contain only finite values between 0 and 1.")
+
+        rows.append(
+            (
+                _format_explanation_sample(x_array[row_index], is_datetime=is_datetime),
+                "\n".join(map(str, contributors)) or "Not available",
+                "\n".join(f"{share:.1%}" for share in numeric_shares) or "Not available",
+                f"{coverage:.1%}",
+            )
+        )
     return rows
 
 
@@ -272,6 +332,82 @@ def _create_feature_page(
     return figure
 
 
+def _create_explanation_page(
+    rows: Sequence[tuple[str, str, str, str]],
+    *,
+    page_number: int,
+    explanation_page_number: int,
+    explanation_page_count: int,
+) -> Figure:
+    figure = Figure(figsize=(11.0, 8.5), facecolor="white")
+    axis = figure.add_axes((0.07, 0.10, 0.86, 0.76))
+    axis.axis("off")
+    figure.suptitle(
+        f"Anomaly explanations ({explanation_page_number}/{explanation_page_count})",
+        x=0.07,
+        y=0.955,
+        ha="left",
+        fontsize=18,
+        fontweight="bold",
+        color="#17365D",
+    )
+    figure.text(
+        0.07,
+        0.895,
+        "Reconstruction-error attribution for each detected anomaly",
+        fontsize=10,
+        color="#667085",
+    )
+
+    if rows:
+        table_height = min(0.90, 0.115 * (len(rows) + 1))
+        table = axis.table(
+            cellText=rows,
+            colLabels=("Sample / time", "Top contributors", "Contribution share", "Explanation coverage"),
+            colWidths=(0.18, 0.34, 0.22, 0.20),
+            cellLoc="left",
+            colLoc="left",
+            loc="upper left",
+            bbox=(0.0, 0.98 - table_height, 1.0, table_height),
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        row_height = table_height / (len(rows) + 1)
+        for (row_index, _), cell in table.get_celld().items():
+            cell.set_height(row_height)
+            cell.set_edgecolor("#D0D5DD")
+            cell.set_linewidth(0.6)
+            cell.PAD = 0.08
+            cell.get_text().set_verticalalignment("center")
+            if row_index == 0:
+                cell.set_facecolor("#EAF2F8")
+                cell.get_text().set_color("#17365D")
+                cell.get_text().set_fontweight("bold")
+            else:
+                cell.set_facecolor("#FFFFFF" if row_index % 2 else "#F9FAFB")
+                cell.get_text().set_color("#344054")
+    else:
+        axis.text(
+            0.0,
+            0.88,
+            "No detected anomalies were available to explain.",
+            fontsize=11,
+            color="#475467",
+            va="top",
+        )
+
+    figure.text(
+        0.07,
+        0.065,
+        "Contribution shares correspond to the contributors in the same order. Coverage is the fraction of total "
+        "reconstruction error represented by the listed contributors.",
+        fontsize=7.5,
+        color="#667085",
+    )
+    _add_footer(figure, page_number)
+    return figure
+
+
 def _create_mae_note_page(*, page_number: int) -> Figure:
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
     axis = figure.add_axes((0.09, 0.12, 0.82, 0.76))
@@ -369,6 +505,12 @@ def generate_anomaly_detection_report(
     if not np.isfinite(scores).all():
         raise ValueError(f"{score_column} must contain only finite numeric values.")
     x_values, x_label, is_datetime = _resolve_x_axis(result_df, resolved_timestamp)
+    explanation_rows = _resolve_explanation_rows(
+        result_df,
+        detected,
+        x_values,
+        is_datetime=is_datetime,
+    )
 
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -376,7 +518,15 @@ def generate_anomaly_detection_report(
         resolved_features[index : index + max_features_per_page]
         for index in range(0, len(resolved_features), max_features_per_page)
     ]
-    page_count = 2 + len(feature_groups)
+    explanation_groups = (
+        [
+            explanation_rows[index : index + MAX_EXPLANATIONS_PER_PAGE]
+            for index in range(0, len(explanation_rows), MAX_EXPLANATIONS_PER_PAGE)
+        ]
+        if explanation_rows
+        else ([[]] if explanation_rows is not None else [])
+    )
+    page_count = 2 + len(feature_groups) + len(explanation_groups)
 
     with PdfPages(destination, metadata={"Title": title, "Subject": "Time-series anomaly detection report"}) as pdf:
         pdf.savefig(
@@ -404,6 +554,16 @@ def generate_anomaly_detection_report(
                     page_number=page_number,
                     feature_page_number=feature_page_number,
                     feature_page_count=len(feature_groups),
+                )
+            )
+        for explanation_page_number, group in enumerate(explanation_groups, start=1):
+            page_number = 1 + len(feature_groups) + explanation_page_number
+            pdf.savefig(
+                _create_explanation_page(
+                    group,
+                    page_number=page_number,
+                    explanation_page_number=explanation_page_number,
+                    explanation_page_count=len(explanation_groups),
                 )
             )
         pdf.savefig(_create_mae_note_page(page_number=page_count))

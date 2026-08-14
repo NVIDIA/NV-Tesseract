@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from sdk.reporting import generate_anomaly_detection_report
+from sdk.reporting import _resolve_explanation_rows, generate_anomaly_detection_report
 
 
 def _report_frame() -> pd.DataFrame:
@@ -84,3 +84,50 @@ def test_generate_report_preserves_non_string_feature_labels(tmp_path: Path) -> 
     generate_anomaly_detection_report(frame, destination, feature_columns=[10, 20])
 
     assert destination.read_bytes().startswith(b"%PDF")
+
+
+def test_generate_report_includes_explainability_metrics(tmp_path: Path) -> None:
+    """Explainability output should add anomaly-detail metrics to the PDF."""
+    frame = _report_frame()
+    frame["TopContributors"] = ["[]"] * len(frame)
+    frame["ContributionShares"] = ["[]"] * len(frame)
+    frame["ExplanationCoverage"] = 0.0
+    frame.loc[3, ["TopContributors", "ContributionShares", "ExplanationCoverage"]] = [
+        '["temperature","pressure"]',
+        "[0.75,0.25]",
+        1.0,
+    ]
+    frame.loc[7, ["TopContributors", "ContributionShares", "ExplanationCoverage"]] = [
+        '["pressure"]',
+        "[0.6]",
+        0.6,
+    ]
+    destination = tmp_path / "explainable_report.pdf"
+
+    generate_anomaly_detection_report(frame, destination)
+
+    rows = _resolve_explanation_rows(
+        frame,
+        frame["Anomaly"].to_numpy(dtype=bool),
+        frame["timestamp"],
+        is_datetime=True,
+    )
+    assert rows == [
+        ("2026-01-01\n00:03:00", "temperature\npressure", "75.0%\n25.0%", "100.0%"),
+        ("2026-01-01\n00:07:00", "pressure", "60.0%", "60.0%"),
+    ]
+    assert destination.read_bytes().startswith(b"%PDF")
+
+
+def test_generate_report_without_explanations_keeps_metrics_optional() -> None:
+    """Reports without explanation columns should preserve the existing path."""
+    frame = _report_frame()
+
+    rows = _resolve_explanation_rows(
+        frame,
+        frame["Anomaly"].to_numpy(dtype=bool),
+        frame["timestamp"],
+        is_datetime=True,
+    )
+
+    assert rows is None
