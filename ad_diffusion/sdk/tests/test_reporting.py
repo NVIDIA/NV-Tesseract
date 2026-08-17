@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sdk.reporting import (
+    _create_contribution_graph_page,
     _create_explanation_page,
     _resolve_explanation_rows,
     generate_anomaly_detection_report,
@@ -148,3 +149,19 @@ def test_explanation_table_labels_anomalous_timestamp() -> None:
 
     table = figure.axes[0].tables[0]
     assert table.get_celld()[(0, 0)].get_text().get_text() == "Anomalous timestamp"
+
+
+def test_contribution_graph_visualizes_shares_and_coverage() -> None:
+    """The contribution graph should stack contributors plus uncovered error."""
+    figure = _create_contribution_graph_page(
+        [("2026-01-01\n00:03:00", "temperature\npressure", "75.0%\n15.0%", "90.0%")],
+        page_number=3,
+        graph_page_number=1,
+        graph_page_count=1,
+    )
+
+    axis = figure.axes[0]
+    assert len(axis.patches) == 3  # Two contributor segments plus uncovered error.
+    assert axis.get_title() == ""
+    assert axis.get_yticklabels()[0].get_text().startswith("2026-01-01 00:03:00")
+    assert any(text.get_text() == "90.0% covered" for text in axis.texts)

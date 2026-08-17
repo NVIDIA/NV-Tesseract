@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 
 if TYPE_CHECKING:
     from collections.abc import Hashable, Sequence
@@ -28,6 +29,7 @@ EXPLANATION_COLUMNS = {
 }
 REQUIRED_EXPLANATION_COLUMNS = ("TopContributors", "ContributionShares", "ExplanationCoverage")
 MAX_EXPLANATIONS_PER_PAGE = 7
+CONTRIBUTOR_RANK_COLORS = ("#175CD3", "#12B76A", "#F79009", "#7F56D9", "#06AED4")
 
 
 def infer_ground_truth_column(df: pd.DataFrame) -> str | None:
@@ -408,6 +410,120 @@ def _create_explanation_page(
     return figure
 
 
+def _create_contribution_graph_page(
+    rows: Sequence[tuple[str, str, str, str]],
+    *,
+    page_number: int,
+    graph_page_number: int,
+    graph_page_count: int,
+) -> Figure:
+    figure = Figure(figsize=(11.0, 8.5), facecolor="white")
+    axis = figure.add_axes((0.28, 0.14, 0.64, 0.66))
+    figure.suptitle(
+        f"Feature contributions by anomaly ({graph_page_number}/{graph_page_count})",
+        x=0.07,
+        y=0.955,
+        ha="left",
+        fontsize=18,
+        fontweight="bold",
+        color="#17365D",
+    )
+    figure.text(
+        0.07,
+        0.895,
+        "Stacked shares of total reconstruction error; gray shows error outside the displayed contributors",
+        fontsize=10,
+        color="#667085",
+    )
+    if not rows:
+        axis.axis("off")
+        axis.text(
+            0.0,
+            0.88,
+            "No detected anomalies were available to graph.",
+            fontsize=11,
+            color="#475467",
+            va="top",
+        )
+        _add_footer(figure, page_number)
+        return figure
+
+    y_positions = np.arange(
+        MAX_EXPLANATIONS_PER_PAGE - 1,
+        MAX_EXPLANATIONS_PER_PAGE - len(rows) - 1,
+        -1,
+    )
+    y_labels = []
+    max_contributors = 0
+    for y_position, (timestamp, contributor_text, share_text, coverage_text) in zip(y_positions, rows, strict=True):
+        contributors = contributor_text.splitlines() if contributor_text != "Not available" else []
+        shares = (
+            [float(value.removesuffix("%")) / 100 for value in share_text.splitlines()]
+            if share_text != "Not available"
+            else []
+        )
+        max_contributors = max(max_contributors, len(contributors))
+        left = 0.0
+        for rank, share in enumerate(shares):
+            color = CONTRIBUTOR_RANK_COLORS[rank % len(CONTRIBUTOR_RANK_COLORS)]
+            axis.barh(y_position, share, left=left, height=0.58, color=color, edgecolor="white", linewidth=0.8)
+            if share >= 0.055:
+                axis.text(
+                    left + share / 2,
+                    y_position,
+                    f"{share:.0%}",
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                    fontweight="bold",
+                    color="white" if rank != 2 else "#101828",
+                )
+            left += share
+
+        uncovered = max(0.0, 1.0 - left)
+        axis.barh(
+            y_position,
+            uncovered,
+            left=left,
+            height=0.58,
+            color="#D0D5DD",
+            edgecolor="white",
+            linewidth=0.8,
+        )
+        axis.text(1.015, y_position, f"{coverage_text} covered", va="center", fontsize=7.5, color="#475467")
+        ranked_names = (
+            " > ".join(f"{rank + 1}. {name[:18]}" for rank, name in enumerate(contributors)) or "No contributors"
+        )
+        y_labels.append(f"{timestamp.replace(chr(10), ' ')}\n{ranked_names}")
+
+    axis.set_yticks(y_positions, labels=y_labels)
+    axis.set_ylim(-0.75, MAX_EXPLANATIONS_PER_PAGE - 0.25)
+    axis.set_xlim(0.0, 1.15)
+    axis.set_xticks(np.linspace(0.0, 1.0, 6), labels=[f"{value:.0%}" for value in np.linspace(0.0, 1.0, 6)])
+    axis.set_xlabel("Contribution share of total reconstruction error", fontsize=9, color="#344054")
+    axis.grid(axis="x", color="#D8DEE9", linewidth=0.6, alpha=0.8)
+    axis.set_axisbelow(True)
+    axis.spines[["top", "right", "left"]].set_visible(False)
+    axis.tick_params(axis="y", length=0, labelsize=7.5, colors="#344054", pad=8)
+    axis.tick_params(axis="x", labelsize=8, colors="#667085")
+
+    legend_handles = [
+        Patch(color=CONTRIBUTOR_RANK_COLORS[rank], label=f"Contributor rank {rank + 1}")
+        for rank in range(max_contributors)
+    ]
+    legend_handles.append(Patch(color="#D0D5DD", label="Uncovered"))
+    axis.legend(
+        handles=legend_handles,
+        loc="lower left",
+        bbox_to_anchor=(0.0, 1.03),
+        frameon=False,
+        fontsize=8,
+        ncols=min(4, len(legend_handles)),
+    )
+    _add_footer(figure, page_number)
+    return figure
+
+
 def _create_mae_note_page(*, page_number: int) -> Figure:
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
     axis = figure.add_axes((0.09, 0.12, 0.82, 0.76))
@@ -526,7 +642,7 @@ def generate_anomaly_detection_report(
         if explanation_rows
         else ([[]] if explanation_rows is not None else [])
     )
-    page_count = 2 + len(feature_groups) + len(explanation_groups)
+    page_count = 2 + len(feature_groups) + 2 * len(explanation_groups)
 
     with PdfPages(destination, metadata={"Title": title, "Subject": "Time-series anomaly detection report"}) as pdf:
         pdf.savefig(
@@ -556,8 +672,18 @@ def generate_anomaly_detection_report(
                     feature_page_count=len(feature_groups),
                 )
             )
+        for graph_page_number, group in enumerate(explanation_groups, start=1):
+            page_number = 1 + len(feature_groups) + graph_page_number
+            pdf.savefig(
+                _create_contribution_graph_page(
+                    group,
+                    page_number=page_number,
+                    graph_page_number=graph_page_number,
+                    graph_page_count=len(explanation_groups),
+                )
+            )
         for explanation_page_number, group in enumerate(explanation_groups, start=1):
-            page_number = 1 + len(feature_groups) + explanation_page_number
+            page_number = 1 + len(feature_groups) + len(explanation_groups) + explanation_page_number
             pdf.savefig(
                 _create_explanation_page(
                     group,
