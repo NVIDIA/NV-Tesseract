@@ -180,6 +180,7 @@ ad_diffusion/
 │   └── utils.py               # Model evaluation utilities
 ├── utils/                      # Utility functions and tools
 │   ├── tsb_ad_preprocessor.py # Data preprocessing
+│   ├── adaptive_normalizer.py # Distribution-aware normalization
 │   ├── json_utils.py          # Model loading/saving
 │   ├── adaptive_threshold.py  # SCS and MACS implementations
 │   └── dpm_solver_pytorch.py  # DPM-Solver for fast inference
