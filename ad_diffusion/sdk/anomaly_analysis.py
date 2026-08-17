@@ -39,6 +39,7 @@ def perform_anomaly_analysis_with_diffusion(
     timestamp_column: str | None = None,
     ground_truth_column: str | None = None,
     report_title: str = "Anomaly Detection Report",
+    report_explanation_csv_path: str | Path | None = None,
 ) -> pd.DataFrame:
     """
     Perform anomaly analysis using Tesseract AD Diffusion Model.
@@ -62,6 +63,8 @@ def perform_anomaly_analysis_with_diffusion(
         ground_truth_column: Optional binary-label column used only for report
             plotting. When report_path is set, conventional label names are auto-detected.
         report_title: Title shown on the generated PDF report.
+        report_explanation_csv_path: Optional destination for the full
+            explainability CSV. When omitted, it is written beside the PDF.
 
     Returns:
         DataFrame with original data and anomaly detection results
@@ -177,6 +180,7 @@ def perform_anomaly_analysis_with_diffusion(
             timestamp_column=resolved_timestamp_column,
             ground_truth_column=resolved_ground_truth_column,
             title=report_title,
+            explanation_csv_path=report_explanation_csv_path,
         )
 
     return result_df

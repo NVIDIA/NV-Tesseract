@@ -334,82 +334,6 @@ def _create_feature_page(
     return figure
 
 
-def _create_explanation_page(
-    rows: Sequence[tuple[str, str, str, str]],
-    *,
-    page_number: int,
-    explanation_page_number: int,
-    explanation_page_count: int,
-) -> Figure:
-    figure = Figure(figsize=(11.0, 8.5), facecolor="white")
-    axis = figure.add_axes((0.07, 0.10, 0.86, 0.76))
-    axis.axis("off")
-    figure.suptitle(
-        f"Anomaly explanations ({explanation_page_number}/{explanation_page_count})",
-        x=0.07,
-        y=0.955,
-        ha="left",
-        fontsize=18,
-        fontweight="bold",
-        color="#17365D",
-    )
-    figure.text(
-        0.07,
-        0.895,
-        "Reconstruction-error attribution for each detected anomaly",
-        fontsize=10,
-        color="#667085",
-    )
-
-    if rows:
-        table_height = min(0.90, 0.115 * (len(rows) + 1))
-        table = axis.table(
-            cellText=rows,
-            colLabels=("Anomalous timestamp", "Top contributors", "Contribution share", "Explanation coverage"),
-            colWidths=(0.18, 0.34, 0.22, 0.20),
-            cellLoc="left",
-            colLoc="left",
-            loc="upper left",
-            bbox=(0.0, 0.98 - table_height, 1.0, table_height),
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        row_height = table_height / (len(rows) + 1)
-        for (row_index, _), cell in table.get_celld().items():
-            cell.set_height(row_height)
-            cell.set_edgecolor("#D0D5DD")
-            cell.set_linewidth(0.6)
-            cell.PAD = 0.08
-            cell.get_text().set_verticalalignment("center")
-            if row_index == 0:
-                cell.set_facecolor("#EAF2F8")
-                cell.get_text().set_color("#17365D")
-                cell.get_text().set_fontweight("bold")
-            else:
-                cell.set_facecolor("#FFFFFF" if row_index % 2 else "#F9FAFB")
-                cell.get_text().set_color("#344054")
-    else:
-        axis.text(
-            0.0,
-            0.88,
-            "No detected anomalies were available to explain.",
-            fontsize=11,
-            color="#475467",
-            va="top",
-        )
-
-    figure.text(
-        0.07,
-        0.065,
-        "Contribution shares correspond to the contributors in the same order. Coverage is the fraction of total "
-        "reconstruction error represented by the listed contributors.",
-        fontsize=7.5,
-        color="#667085",
-    )
-    _add_footer(figure, page_number)
-    return figure
-
-
 def _create_contribution_graph_page(
     rows: Sequence[tuple[str, str, str, str]],
     *,
@@ -524,6 +448,42 @@ def _create_contribution_graph_page(
     return figure
 
 
+def _write_explanation_csv(
+    result_df: pd.DataFrame,
+    detected: np.ndarray,
+    x_values,
+    output_path: Path,
+    *,
+    is_datetime: bool,
+) -> Path:
+    columns = (
+        "Anomalous timestamp",
+        "Top contributors",
+        "Contribution shares",
+        "Explanation coverage",
+    )
+    records = []
+    x_array = np.asarray(x_values)
+    for row_index in np.flatnonzero(detected):
+        contributors = _parse_explanation_list(result_df.iloc[row_index]["TopContributors"], name="TopContributors")
+        shares = _parse_explanation_list(result_df.iloc[row_index]["ContributionShares"], name="ContributionShares")
+        coverage = float(result_df.iloc[row_index]["ExplanationCoverage"])
+        records.append(
+            {
+                "Anomalous timestamp": _format_explanation_sample(x_array[row_index], is_datetime=is_datetime).replace(
+                    "\n", " "
+                ),
+                "Top contributors": json.dumps([str(value) for value in contributors], separators=(",", ":")),
+                "Contribution shares": json.dumps([float(value) for value in shares], separators=(",", ":")),
+                "Explanation coverage": coverage,
+            }
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame.from_records(records, columns=columns).to_csv(output_path, index=False)
+    return output_path
+
+
 def _create_mae_note_page(*, page_number: int) -> Figure:
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
     axis = figure.add_axes((0.09, 0.12, 0.82, 0.76))
@@ -575,11 +535,14 @@ def generate_anomaly_detection_report(
     score_column: str = "MAE",
     title: str = "Anomaly Detection Report",
     max_features_per_page: int = 4,
+    explanation_csv_path: str | Path | None = None,
 ) -> Path:
     """Create a PDF report from an anomaly-analysis result DataFrame.
 
     The report contains a score overview followed by original-signal plots with
     detected anomalies and, when available, ground-truth anomalies overlaid.
+    Explainability metrics are plotted in the PDF and exported in full to a
+    companion CSV when explanation columns are available.
     Timestamp and ground-truth columns are inferred from conventional names when
     they are not supplied explicitly.
     """
@@ -630,6 +593,19 @@ def generate_anomaly_detection_report(
 
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if explanation_rows is not None:
+        csv_destination = (
+            Path(explanation_csv_path)
+            if explanation_csv_path is not None
+            else destination.with_name(f"{destination.stem}_explanations.csv")
+        )
+        _write_explanation_csv(
+            result_df,
+            detected,
+            x_values,
+            csv_destination,
+            is_datetime=is_datetime,
+        )
     feature_groups = [
         resolved_features[index : index + max_features_per_page]
         for index in range(0, len(resolved_features), max_features_per_page)
@@ -642,7 +618,7 @@ def generate_anomaly_detection_report(
         if explanation_rows
         else ([[]] if explanation_rows is not None else [])
     )
-    page_count = 2 + len(feature_groups) + 2 * len(explanation_groups)
+    page_count = 2 + len(feature_groups) + len(explanation_groups)
 
     with PdfPages(destination, metadata={"Title": title, "Subject": "Time-series anomaly detection report"}) as pdf:
         pdf.savefig(
@@ -680,16 +656,6 @@ def generate_anomaly_detection_report(
                     page_number=page_number,
                     graph_page_number=graph_page_number,
                     graph_page_count=len(explanation_groups),
-                )
-            )
-        for explanation_page_number, group in enumerate(explanation_groups, start=1):
-            page_number = 1 + len(feature_groups) + len(explanation_groups) + explanation_page_number
-            pdf.savefig(
-                _create_explanation_page(
-                    group,
-                    page_number=page_number,
-                    explanation_page_number=explanation_page_number,
-                    explanation_page_count=len(explanation_groups),
                 )
             )
         pdf.savefig(_create_mae_note_page(page_number=page_count))

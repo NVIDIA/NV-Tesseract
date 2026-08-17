@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sdk.reporting import (
     _create_contribution_graph_page,
-    _create_explanation_page,
     _resolve_explanation_rows,
     generate_anomaly_detection_report,
 )
@@ -122,6 +121,19 @@ def test_generate_report_includes_explainability_metrics(tmp_path: Path) -> None
         ("2026-01-01\n00:07:00", "pressure", "60.0%", "60.0%"),
     ]
     assert destination.read_bytes().startswith(b"%PDF")
+    csv_destination = tmp_path / "explainable_report_explanations.csv"
+    exported = pd.read_csv(csv_destination)
+    assert list(exported.columns) == [
+        "Anomalous timestamp",
+        "Top contributors",
+        "Contribution shares",
+        "Explanation coverage",
+    ]
+    assert len(exported) == 2
+    assert exported.loc[0, "Anomalous timestamp"] == "2026-01-01 00:03:00"
+    assert exported.loc[0, "Top contributors"] == '["temperature","pressure"]'
+    assert exported.loc[0, "Contribution shares"] == "[0.75,0.25]"
+    assert exported.loc[0, "Explanation coverage"] == 1.0
 
 
 def test_generate_report_without_explanations_keeps_metrics_optional() -> None:
@@ -136,19 +148,6 @@ def test_generate_report_without_explanations_keeps_metrics_optional() -> None:
     )
 
     assert rows is None
-
-
-def test_explanation_table_labels_anomalous_timestamp() -> None:
-    """The first explanation column should identify anomalous timestamps."""
-    figure = _create_explanation_page(
-        [("2026-01-01\n00:03:00", "temperature", "75.0%", "75.0%")],
-        page_number=3,
-        explanation_page_number=1,
-        explanation_page_count=1,
-    )
-
-    table = figure.axes[0].tables[0]
-    assert table.get_celld()[(0, 0)].get_text().get_text() == "Anomalous timestamp"
 
 
 def test_contribution_graph_visualizes_shares_and_coverage() -> None:
