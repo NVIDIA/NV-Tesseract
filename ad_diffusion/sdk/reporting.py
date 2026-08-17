@@ -134,7 +134,7 @@ def _parse_explanation_list(value, *, name: str) -> list:
             value = json.loads(value)
         except json.JSONDecodeError as error:
             raise ValueError(f"{name} must contain a valid JSON list.") from error
-    if not isinstance(value, (list, tuple, np.ndarray)):
+    if not isinstance(value, list | tuple | np.ndarray):
         raise TypeError(f"{name} must contain a list for each detected anomaly.")
     return list(value)
 
