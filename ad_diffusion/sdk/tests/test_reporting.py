@@ -151,7 +151,7 @@ def test_generate_report_without_explanations_keeps_metrics_optional() -> None:
 
 
 def test_contribution_graph_visualizes_shares_and_coverage() -> None:
-    """The contribution graph should stack contributors plus uncovered error."""
+    """The graph should label feature shares and retain timestamp-only row labels."""
     figure = _create_contribution_graph_page(
         [("2026-01-01\n00:03:00", "temperature\npressure", "75.0%\n15.0%", "90.0%")],
         page_number=3,
@@ -162,5 +162,7 @@ def test_contribution_graph_visualizes_shares_and_coverage() -> None:
     axis = figure.axes[0]
     assert len(axis.patches) == 3  # Two contributor segments plus uncovered error.
     assert axis.get_title() == ""
-    assert axis.get_yticklabels()[0].get_text().startswith("2026-01-01 00:03:00")
+    assert axis.get_yticklabels()[0].get_text() == "2026-01-01 00:03:00"
+    assert any(text.get_text() == "temperature\n75%" for text in axis.texts)
+    assert any(text.get_text() == "pressure\n15%" for text in axis.texts)
     assert any(text.get_text() == "90.0% covered" for text in axis.texts)

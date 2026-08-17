@@ -14,7 +14,6 @@ import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
-from matplotlib.patches import Patch
 
 if TYPE_CHECKING:
     from collections.abc import Hashable, Sequence
@@ -29,7 +28,7 @@ EXPLANATION_COLUMNS = {
 }
 REQUIRED_EXPLANATION_COLUMNS = ("TopContributors", "ContributionShares", "ExplanationCoverage")
 MAX_EXPLANATIONS_PER_PAGE = 7
-CONTRIBUTOR_RANK_COLORS = ("#175CD3", "#12B76A", "#F79009", "#7F56D9", "#06AED4")
+FEATURE_COLORS = ("#175CD3", "#039855", "#F79009", "#7F56D9", "#0E9384", "#D92D20", "#444CE7", "#C11574")
 
 
 def infer_ground_truth_column(df: pd.DataFrame) -> str | None:
@@ -340,6 +339,7 @@ def _create_contribution_graph_page(
     page_number: int,
     graph_page_number: int,
     graph_page_count: int,
+    feature_colors: dict[str, str] | None = None,
 ) -> Figure:
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
     axis = figure.add_axes((0.28, 0.14, 0.64, 0.66))
@@ -355,7 +355,7 @@ def _create_contribution_graph_page(
     figure.text(
         0.07,
         0.895,
-        "Stacked shares of total reconstruction error; gray shows error outside the displayed contributors",
+        "Each segment shows the contributing feature and its share; gray shows error outside the displayed features",
         fontsize=10,
         color="#667085",
     )
@@ -378,7 +378,18 @@ def _create_contribution_graph_page(
         -1,
     )
     y_labels = []
-    max_contributors = 0
+    if feature_colors is None:
+        ordered_features = list(
+            dict.fromkeys(
+                feature
+                for _, contributor_text, _, _ in rows
+                for feature in contributor_text.splitlines()
+                if contributor_text != "Not available"
+            )
+        )
+        feature_colors = {
+            feature: FEATURE_COLORS[index % len(FEATURE_COLORS)] for index, feature in enumerate(ordered_features)
+        }
     for y_position, (timestamp, contributor_text, share_text, coverage_text) in zip(y_positions, rows, strict=True):
         contributors = contributor_text.splitlines() if contributor_text != "Not available" else []
         shares = (
@@ -386,21 +397,22 @@ def _create_contribution_graph_page(
             if share_text != "Not available"
             else []
         )
-        max_contributors = max(max_contributors, len(contributors))
         left = 0.0
-        for rank, share in enumerate(shares):
-            color = CONTRIBUTOR_RANK_COLORS[rank % len(CONTRIBUTOR_RANK_COLORS)]
+        for contributor, share in zip(contributors, shares, strict=True):
+            color = feature_colors[contributor]
             axis.barh(y_position, share, left=left, height=0.58, color=color, edgecolor="white", linewidth=0.8)
-            if share >= 0.055:
+            if share >= 0.075:
+                display_name = contributor if len(contributor) <= 14 else f"{contributor[:12]}..."
                 axis.text(
                     left + share / 2,
                     y_position,
-                    f"{share:.0%}",
+                    f"{display_name}\n{share:.0%}",
                     ha="center",
                     va="center",
-                    fontsize=7,
+                    fontsize=6.5,
                     fontweight="bold",
-                    color="white" if rank != 2 else "#101828",
+                    color="#101828" if color == "#F79009" else "white",
+                    linespacing=0.9,
                 )
             left += share
 
@@ -415,10 +427,7 @@ def _create_contribution_graph_page(
             linewidth=0.8,
         )
         axis.text(1.015, y_position, f"{coverage_text} covered", va="center", fontsize=7.5, color="#475467")
-        ranked_names = (
-            " > ".join(f"{rank + 1}. {name[:18]}" for rank, name in enumerate(contributors)) or "No contributors"
-        )
-        y_labels.append(f"{timestamp.replace(chr(10), ' ')}\n{ranked_names}")
+        y_labels.append(timestamp.replace("\n", " "))
 
     axis.set_yticks(y_positions, labels=y_labels)
     axis.set_ylim(-0.75, MAX_EXPLANATIONS_PER_PAGE - 0.25)
@@ -430,20 +439,6 @@ def _create_contribution_graph_page(
     axis.spines[["top", "right", "left"]].set_visible(False)
     axis.tick_params(axis="y", length=0, labelsize=7.5, colors="#344054", pad=8)
     axis.tick_params(axis="x", labelsize=8, colors="#667085")
-
-    legend_handles = [
-        Patch(color=CONTRIBUTOR_RANK_COLORS[rank], label=f"Contributor rank {rank + 1}")
-        for rank in range(max_contributors)
-    ]
-    legend_handles.append(Patch(color="#D0D5DD", label="Uncovered"))
-    axis.legend(
-        handles=legend_handles,
-        loc="lower left",
-        bbox_to_anchor=(0.0, 1.03),
-        frameon=False,
-        fontsize=8,
-        ncols=min(4, len(legend_handles)),
-    )
     _add_footer(figure, page_number)
     return figure
 
@@ -618,6 +613,17 @@ def generate_anomaly_detection_report(
         if explanation_rows
         else ([[]] if explanation_rows is not None else [])
     )
+    explanation_features = list(
+        dict.fromkeys(
+            feature
+            for _, contributor_text, _, _ in (explanation_rows or [])
+            for feature in contributor_text.splitlines()
+            if contributor_text != "Not available"
+        )
+    )
+    explanation_feature_colors = {
+        feature: FEATURE_COLORS[index % len(FEATURE_COLORS)] for index, feature in enumerate(explanation_features)
+    }
     page_count = 2 + len(feature_groups) + len(explanation_groups)
 
     with PdfPages(destination, metadata={"Title": title, "Subject": "Time-series anomaly detection report"}) as pdf:
@@ -656,6 +662,7 @@ def generate_anomaly_detection_report(
                     page_number=page_number,
                     graph_page_number=graph_page_number,
                     graph_page_count=len(explanation_groups),
+                    feature_colors=explanation_feature_colors,
                 )
             )
         pdf.savefig(_create_mae_note_page(page_number=page_count))
