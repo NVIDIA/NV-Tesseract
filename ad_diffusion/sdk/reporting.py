@@ -363,7 +363,7 @@ def _create_explanation_page(
         table_height = min(0.90, 0.115 * (len(rows) + 1))
         table = axis.table(
             cellText=rows,
-            colLabels=("Sample / time", "Top contributors", "Contribution share", "Explanation coverage"),
+            colLabels=("Anomalous timestamp", "Top contributors", "Contribution share", "Explanation coverage"),
             colWidths=(0.18, 0.34, 0.22, 0.20),
             cellLoc="left",
             colLoc="left",

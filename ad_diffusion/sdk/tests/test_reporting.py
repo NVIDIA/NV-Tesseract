@@ -12,7 +12,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from sdk.reporting import _resolve_explanation_rows, generate_anomaly_detection_report
+from sdk.reporting import (
+    _create_explanation_page,
+    _resolve_explanation_rows,
+    generate_anomaly_detection_report,
+)
 
 
 def _report_frame() -> pd.DataFrame:
@@ -131,3 +135,16 @@ def test_generate_report_without_explanations_keeps_metrics_optional() -> None:
     )
 
     assert rows is None
+
+
+def test_explanation_table_labels_anomalous_timestamp() -> None:
+    """The first explanation column should identify anomalous timestamps."""
+    figure = _create_explanation_page(
+        [("2026-01-01\n00:03:00", "temperature", "75.0%", "75.0%")],
+        page_number=3,
+        explanation_page_number=1,
+        explanation_page_count=1,
+    )
+
+    table = figure.axes[0].tables[0]
+    assert table.get_celld()[(0, 0)].get_text().get_text() == "Anomalous timestamp"
