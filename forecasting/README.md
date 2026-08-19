@@ -104,7 +104,7 @@ results = perform_forecasting(
     model_horizon=72,
     standardizer_pkl="artifacts/finetune_my_data/standardizer.pkl",
     ckpt="artifacts/finetune_my_data/best_model.pt",
-    use_cross_channel=False,  # set True if trained with --use-cross-channel
+    # use_cross_channel is inferred automatically from the checkpoint contents
 )
 ```
 
