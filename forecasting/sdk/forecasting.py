@@ -2720,7 +2720,7 @@ def perform_forecasting(
             batch_size=1,  # Always 1 for inference-only
             shuffle=False,
             num_workers=0,  # Set to 0 for single sample
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
         )
 
         model = _load_cached_model(
