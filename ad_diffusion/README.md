@@ -59,9 +59,11 @@ print(f"Detected {results['Anomaly'].sum()} anomalies")
 With `explain=True`, the result also includes `TopContributors`,
 `ContributionShares`, `ExplanationCoverage`, and `ExplanationMethod`. These
 columns are derived from the existing target and reconstruction, so explanation
-does not run the detector again. When preprocessing changes the feature space,
-contributors use conservative `component_N` labels instead of claiming an
-incorrect mapping to the original signals.
+does not run the detector again. Inputs with any feature count up to the model's
+target dimension retain their original column names; right-padded model dimensions
+remain part of the MAE denominator but are not presented as input features. When
+PCA or feature engineering changes the feature space, contributors use conservative
+`component_N` labels instead of claiming an incorrect mapping to original signals.
 
 Generate a PDF report with the original signals, detected anomalies, MAE, and
 ground truth when a conventional label column such as `GT` is present:

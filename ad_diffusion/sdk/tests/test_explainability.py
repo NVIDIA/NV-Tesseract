@@ -54,6 +54,32 @@ def test_zero_error_has_zero_contribution_shares() -> None:
     assert explanations.loc[0, "ExplanationCoverage"] == 0.0
 
 
+def test_maps_input_features_without_renormalizing_padded_model_error() -> None:
+    """Mapped inputs should keep their shares of total model-space MAE."""
+    explanations = explain_reconstruction_anomalies(
+        target=np.zeros((1, 4)),
+        reconstruction=np.array([[4.0, 3.0, 2.0, 1.0]]),
+        feature_names=["temperature", "pressure"],
+        feature_indices=[0, 1],
+        top_k=2,
+    )
+
+    assert json.loads(explanations.loc[0, "TopContributors"]) == ["temperature", "pressure"]
+    assert json.loads(explanations.loc[0, "ContributionShares"]) == pytest.approx([0.4, 0.3])
+    assert explanations.loc[0, "ExplanationCoverage"] == pytest.approx(0.7)
+
+
+@pytest.mark.parametrize("feature_indices", [[], [0, 0], [0, 2]])
+def test_rejects_invalid_feature_indices(feature_indices: list[int]) -> None:
+    with pytest.raises(ValueError, match="feature_indices"):
+        explain_reconstruction_anomalies(
+            target=np.zeros((1, 2)),
+            reconstruction=np.ones((1, 2)),
+            feature_names=["a"] * len(feature_indices),
+            feature_indices=feature_indices,
+        )
+
+
 def test_rejects_mismatched_feature_names() -> None:
     with pytest.raises(ValueError, match="feature_names has 1 entries"):
         explain_reconstruction_anomalies(

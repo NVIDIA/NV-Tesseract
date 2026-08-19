@@ -202,12 +202,13 @@ def test_explain_toggle_preserves_numeric_feature_names(monkeypatch, tmp_path):
     ]
     input_df = pd.DataFrame(np.ones((5, len(feature_names))), columns=feature_names)
     input_df["anomaly"] = [0, 1, 0, 0, 1]
-    target = np.zeros((5, len(feature_names)))
+    target = np.zeros((5, 40))
     reconstruction = np.zeros_like(target)
-    reconstruction[1] = [0, 0, 0, 7, 6, 5, 4]
-    reconstruction[4] = [1, 2, 3, 4, 5, 6, 7]
+    reconstruction[1, :7] = [0, 0, 0, 7, 6, 5, 4]
+    reconstruction[1, 27] = 100
+    reconstruction[4, :7] = [1, 2, 3, 4, 5, 6, 7]
     inference_results = {
-        "residual": np.array([0.0, 22 / 7, 0.0, 0.0, 4.0]),
+        "residual": np.array([0.0, 122 / 40, 0.0, 0.0, 28 / 40]),
         "target": target,
         "recon": reconstruction,
     }
@@ -235,10 +236,44 @@ def test_explain_toggle_preserves_numeric_feature_names(monkeypatch, tmp_path):
     assert list(inference_df.columns) == feature_names
     assert result.loc[0, "TopContributors"] == "[]"
     assert result.loc[1, "TopContributors"] == ('["010-000-024-033","010-000-030-096","020-000-032-221"]')
-    assert json.loads(result.loc[1, "ContributionShares"]) == pytest.approx([7 / 22, 6 / 22, 5 / 22], abs=1e-6)
-    assert result.loc[1, "ExplanationCoverage"] == pytest.approx(18 / 22)
+    assert json.loads(result.loc[1, "ContributionShares"]) == pytest.approx([7 / 122, 6 / 122, 5 / 122], abs=1e-6)
+    assert result.loc[1, "ExplanationCoverage"] == pytest.approx(18 / 122)
     assert result.loc[1, "ExplanationMethod"] == "reconstruction_error"
     mock_inference.assert_called_once()
+
+
+@pytest.mark.parametrize("input_feature_count", [1, 7, 39, 40])
+def test_explain_toggle_maps_any_supported_input_width(monkeypatch, input_feature_count):
+    """Every directly mapped width up to target_dim should retain its input names."""
+    sample_count = 40
+    feature_names = [f"signal_{index}" for index in range(input_feature_count)]
+    input_df = pd.DataFrame(np.ones((sample_count, input_feature_count)), columns=feature_names)
+    target = np.zeros((sample_count, 40))
+    reconstruction = np.zeros_like(target)
+    reconstruction[0, :input_feature_count] = np.arange(1, input_feature_count + 1)
+    inference_results = {
+        "residual": np.abs(reconstruction).mean(axis=1),
+        "target": target,
+        "recon": reconstruction,
+    }
+    monkeypatch.setattr(anomaly_analysis, "get_model_target_dim", lambda model_path, config_path: 40)
+    monkeypatch.setattr(anomaly_analysis, "inference_ad_tesseract2_mp", Mock(return_value=inference_results))
+    mock_thresholder = Mock()
+    mock_thresholder.detect_anomalies.return_value = np.array([True] + [False] * (sample_count - 1))
+    mock_strategy = Mock()
+    mock_strategy.scs_thresholder = mock_thresholder
+    monkeypatch.setattr(anomaly_analysis, "SCSThresholdStrategy", Mock(return_value=mock_strategy))
+
+    result = anomaly_analysis.perform_anomaly_analysis_with_diffusion(
+        input_df,
+        threshold_strategy="scs",
+        model_path="model.pth",
+        config_path="config.yaml",
+        explain=True,
+    )
+
+    contributors = json.loads(result.loc[0, "TopContributors"])
+    assert contributors == feature_names[-min(3, input_feature_count) :][::-1]
 
 
 def test_report_metadata_arguments_are_ignored_without_report_path(monkeypatch, inference_results):

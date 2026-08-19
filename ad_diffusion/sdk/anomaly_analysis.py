@@ -190,12 +190,16 @@ def perform_anomaly_analysis_with_diffusion(
         target_for_explanation = target_data[:explanation_length]
         reconstruction_for_explanation = reconstruction[:explanation_length]
         target_feature_count = target_for_explanation.shape[1] if target_for_explanation.ndim > 1 else 1
-        feature_names = list(input_df.columns) if target_feature_count == len(input_df.columns) else None
+        input_feature_count = len(input_df.columns)
+        directly_mapped = preprocess_model_dir is None and input_feature_count <= target_feature_count
+        feature_names = list(input_df.columns) if directly_mapped else None
+        feature_indices = list(range(input_feature_count)) if directly_mapped else None
         explanations = explain_reconstruction_anomalies(
             target_for_explanation,
             reconstruction_for_explanation,
             anomaly_mask=anomalies[:explanation_length],
             feature_names=feature_names,
+            feature_indices=feature_indices,
             top_k=explanation_top_k,
         )
         explanations = explanations.reindex(range(original_length)).fillna(
