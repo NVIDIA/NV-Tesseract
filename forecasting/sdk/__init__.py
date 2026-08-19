@@ -4,8 +4,9 @@
 """Forecasting SDK — re-exports public API from `sdk.forecasting`."""
 
 from .forecasting import (
+    CHECKPOINT_BASE,
+    CHECKPOINT_CROSS_CHANNEL,
     DEFAULT_BACKBONE_NAME,
-    DEFAULT_CHECKPOINT_NAME,
     DEVICE,
     NVTesseractForecasting,
     download_model_weights,
@@ -13,8 +14,9 @@ from .forecasting import (
 )
 
 __all__ = [
+    "CHECKPOINT_BASE",
+    "CHECKPOINT_CROSS_CHANNEL",
     "DEFAULT_BACKBONE_NAME",
-    "DEFAULT_CHECKPOINT_NAME",
     "DEVICE",
     "NVTesseractForecasting",
     "download_model_weights",
