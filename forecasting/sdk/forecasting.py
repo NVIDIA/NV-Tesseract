@@ -73,6 +73,10 @@ DEFAULT_BACKBONE_NAME = "AutonLab/MOMENT-1-large"
 _MODEL_CACHE: dict[str, torch.nn.Module] = {}
 
 
+def _checkpoint_uses_cross_channel(state: dict) -> bool:
+    return any("cross_channel" in k for k in state)
+
+
 def _load_standardizer_artifact(path: str) -> Standardizer:
     artifact = joblib.load(path)
     if isinstance(artifact, Standardizer):
@@ -96,7 +100,6 @@ def _get_model_cache_key(
     seq_len: int,
     model_horizon: int,
     device: str,
-    use_cross_channel: bool,
     cross_channel_heads: int,
     cross_channel_dropout: float,
 ) -> str:
@@ -107,7 +110,7 @@ def _get_model_cache_key(
 
     cache_data = (
         f"{model_name}_{ckpt}_{seq_len}_{model_horizon}_{device}_{ckpt_mtime}_"
-        f"{use_cross_channel}_{cross_channel_heads}_{cross_channel_dropout}"
+        f"{cross_channel_heads}_{cross_channel_dropout}"
     )
     return hashlib.md5(cache_data.encode()).hexdigest()
 
@@ -129,7 +132,6 @@ def _load_cached_model(
         seq_len,
         model_horizon,
         str(device),
-        use_cross_channel,
         cross_channel_heads,
         cross_channel_dropout,
     )
@@ -145,7 +147,7 @@ def _load_cached_model(
     # (not "cross_channel_attn.") to remain correct if future checkpoints
     # introduce additional cross-channel components under different prefixes.
     state = torch.load(ckpt, map_location=device)
-    ckpt_has_cr = any("cross_channel" in k for k in state)
+    ckpt_has_cr = _checkpoint_uses_cross_channel(state)
     if use_cross_channel != ckpt_has_cr:
         logger.warning(
             "use_cross_channel=%s but checkpoint %s cross-channel weights; following checkpoint",

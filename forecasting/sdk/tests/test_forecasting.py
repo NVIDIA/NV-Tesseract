@@ -225,7 +225,13 @@ def test_perform_forecasting_uses_and_cleans_owned_temp_csvs(monkeypatch, tmp_pa
     assert all(not path.exists() for path in created_paths)
 
 
-def test_perform_forecasting_uses_cross_channel_model_by_default(patch_external_dependencies):
+def test_perform_forecasting_uses_cross_channel_model_when_checkpoint_contains_weights(
+    monkeypatch, patch_external_dependencies
+):
+    monkeypatch.setattr(
+        torch, "load", lambda *args, **kwargs: {"cross_channel_attn.attn.in_proj_weight": torch.empty(1)}
+    )
+
     df = make_timeseries(num_rows=10)
     forecasting.perform_forecasting(
         df,
@@ -241,6 +247,108 @@ def test_perform_forecasting_uses_cross_channel_model_by_default(patch_external_
     assert build_kwargs["use_cross_channel"] is True
     assert build_kwargs["cross_channel_heads"] == 8
     assert build_kwargs["cross_channel_dropout"] == 0.1
+
+
+def test_perform_forecasting_disables_cross_channel_when_checkpoint_has_no_weights(
+    caplog, patch_external_dependencies
+):
+    df = make_timeseries(num_rows=10)
+    with caplog.at_level(logging.WARNING):
+        forecasting.perform_forecasting(
+            df,
+            seq_len=5,
+            forecast_horizon=3,
+            model_horizon=2,
+            standardizer_pkl="fake_std.pkl",
+            ckpt="fake_ckpt.pt",
+        )
+
+    build_kwargs = patch_external_dependencies[0]
+    assert build_kwargs["use_cross_channel"] is False
+    assert any("lacks" in rec.getMessage() for rec in caplog.records)
+
+
+def test_perform_forecasting_enables_cross_channel_when_checkpoint_has_weights(
+    monkeypatch, caplog, patch_external_dependencies
+):
+    monkeypatch.setattr(
+        torch, "load", lambda *args, **kwargs: {"cross_channel_attn.attn.in_proj_weight": torch.empty(1)}
+    )
+
+    df = make_timeseries(num_rows=10)
+    with caplog.at_level(logging.WARNING):
+        forecasting.perform_forecasting(
+            df,
+            seq_len=5,
+            forecast_horizon=3,
+            model_horizon=2,
+            standardizer_pkl="fake_std.pkl",
+            ckpt="fake_ckpt.pt",
+            use_cross_channel=False,
+        )
+
+    build_kwargs = patch_external_dependencies[0]
+    assert build_kwargs["use_cross_channel"] is True
+    assert any("has" in rec.getMessage() for rec in caplog.records)
+
+
+def test_load_cached_model_reuses_checkpoint_across_requested_modes(monkeypatch, patch_external_dependencies):
+    load_calls = 0
+
+    def load_checkpoint(*args, **kwargs):
+        nonlocal load_calls
+        load_calls += 1
+        return {}
+
+    monkeypatch.setattr(torch, "load", load_checkpoint)
+
+    first = forecasting._load_cached_model(
+        model_name="fake-model",
+        ckpt="fake_ckpt.pt",
+        seq_len=5,
+        model_horizon=2,
+        device=torch.device("cpu"),
+        use_cross_channel=True,
+    )
+    second = forecasting._load_cached_model(
+        model_name="fake-model",
+        ckpt="fake_ckpt.pt",
+        seq_len=5,
+        model_horizon=2,
+        device=torch.device("cpu"),
+        use_cross_channel=False,
+    )
+
+    assert first is second
+    assert load_calls == 1
+    assert len(patch_external_dependencies) == 1
+
+
+def test_load_cached_model_rejects_missing_keys(monkeypatch):
+    class IncompleteModel(DummyModel):
+        def load_state_dict(self, state, strict=False):
+            return SimpleNamespace(
+                missing_keys=["cross_channel_attn.norm.bias"],
+                unexpected_keys=[],
+            )
+
+    monkeypatch.setattr(
+        forecasting,
+        "build_model",
+        lambda *, forecast_horizon, **kwargs: IncompleteModel(model_horizon=forecast_horizon),
+    )
+    monkeypatch.setattr(
+        torch, "load", lambda *args, **kwargs: {"cross_channel_attn.attn.in_proj_weight": torch.empty(1)}
+    )
+
+    with pytest.raises(RuntimeError, match="Missing checkpoint keys"):
+        forecasting._load_cached_model(
+            model_name="fake-model",
+            ckpt="fake_ckpt.pt",
+            seq_len=5,
+            model_horizon=2,
+            device=torch.device("cpu"),
+        )
 
 
 def test_perform_forecasting_allows_cross_channel_configuration_override(patch_external_dependencies):
