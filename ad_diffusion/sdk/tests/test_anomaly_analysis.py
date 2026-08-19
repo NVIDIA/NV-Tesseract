@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import Mock
@@ -188,8 +189,8 @@ def test_optional_pdf_report_excludes_metadata_from_inference(monkeypatch, infer
     assert destination.read_bytes().startswith(b"%PDF")
 
 
-def test_lowercase_anomaly_metadata_is_excluded_from_inference(monkeypatch, inference_results, tmp_path):
-    """A lowercase anomaly label should not replace valid signal names with model components."""
+def test_explain_toggle_preserves_numeric_feature_names(monkeypatch, tmp_path):
+    """The full analysis path should explain anomalies using the input signal names."""
     feature_names = [
         "x",
         "y",
@@ -201,6 +202,15 @@ def test_lowercase_anomaly_metadata_is_excluded_from_inference(monkeypatch, infe
     ]
     input_df = pd.DataFrame(np.ones((5, len(feature_names))), columns=feature_names)
     input_df["anomaly"] = [0, 1, 0, 0, 1]
+    target = np.zeros((5, len(feature_names)))
+    reconstruction = np.zeros_like(target)
+    reconstruction[1] = [0, 0, 0, 7, 6, 5, 4]
+    reconstruction[4] = [1, 2, 3, 4, 5, 6, 7]
+    inference_results = {
+        "residual": np.array([0.0, 22 / 7, 0.0, 0.0, 4.0]),
+        "target": target,
+        "recon": reconstruction,
+    }
     mock_inference = Mock(return_value=inference_results)
     monkeypatch.setattr(anomaly_analysis, "inference_ad_tesseract2_mp", mock_inference)
 
@@ -211,16 +221,24 @@ def test_lowercase_anomaly_metadata_is_excluded_from_inference(monkeypatch, infe
     monkeypatch.setattr(anomaly_analysis, "SCSThresholdStrategy", Mock(return_value=mock_strategy))
     monkeypatch.setattr(anomaly_analysis, "generate_anomaly_detection_report", Mock())
 
-    anomaly_analysis.perform_anomaly_analysis_with_diffusion(
+    result = anomaly_analysis.perform_anomaly_analysis_with_diffusion(
         input_df,
         threshold_strategy="scs",
         model_path="model.pth",
         config_path="config.yaml",
         report_path=tmp_path / "report.pdf",
+        explain=True,
+        explanation_top_k=3,
     )
 
     inference_df = mock_inference.call_args.kwargs["data"]
     assert list(inference_df.columns) == feature_names
+    assert result.loc[0, "TopContributors"] == "[]"
+    assert result.loc[1, "TopContributors"] == ('["010-000-024-033","010-000-030-096","020-000-032-221"]')
+    assert json.loads(result.loc[1, "ContributionShares"]) == pytest.approx([7 / 22, 6 / 22, 5 / 22], abs=1e-6)
+    assert result.loc[1, "ExplanationCoverage"] == pytest.approx(18 / 22)
+    assert result.loc[1, "ExplanationMethod"] == "reconstruction_error"
+    mock_inference.assert_called_once()
 
 
 def test_report_metadata_arguments_are_ignored_without_report_path(monkeypatch, inference_results):

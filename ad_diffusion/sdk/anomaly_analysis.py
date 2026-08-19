@@ -11,6 +11,7 @@ from pathlib import Path  # noqa: TC003
 import pandas as pd
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from sdk.explainability import explain_reconstruction_anomalies
 from sdk.inference_ad import (
     _resolve_model_paths,
     get_model_target_dim,
@@ -40,6 +41,8 @@ def perform_anomaly_analysis_with_diffusion(
     ground_truth_column: str | None = None,
     report_title: str = "Anomaly Detection Report",
     report_explanation_csv_path: str | Path | None = None,
+    explain: bool = False,
+    explanation_top_k: int = 3,
 ) -> pd.DataFrame:
     """
     Perform anomaly analysis using Tesseract AD Diffusion Model.
@@ -65,6 +68,8 @@ def perform_anomaly_analysis_with_diffusion(
         report_title: Title shown on the generated PDF report.
         report_explanation_csv_path: Optional destination for the full
             explainability CSV. When omitted, it is written beside the PDF.
+        explain: Whether to add reconstruction-error explanations for detected anomalies.
+        explanation_top_k: Maximum number of contributors returned per anomaly.
 
     Returns:
         DataFrame with original data and anomaly detection results
@@ -171,6 +176,34 @@ def perform_anomaly_analysis_with_diffusion(
 
     result_df["Anomaly"] = anomalies
     result_df["MAE"] = residual_scores  # Using residual (MAE) as anomaly score
+
+    if explain:
+        reconstruction = results.get("recon")
+        if reconstruction is None:
+            raise ValueError("Inference results must include 'recon' when explain=True.")
+
+        explanation_length = min(original_length, len(target_data), len(reconstruction), len(anomalies))
+        target_for_explanation = target_data[:explanation_length]
+        reconstruction_for_explanation = reconstruction[:explanation_length]
+        target_feature_count = target_for_explanation.shape[1] if target_for_explanation.ndim > 1 else 1
+        feature_names = list(input_df.columns) if target_feature_count == len(input_df.columns) else None
+        explanations = explain_reconstruction_anomalies(
+            target_for_explanation,
+            reconstruction_for_explanation,
+            anomaly_mask=anomalies[:explanation_length],
+            feature_names=feature_names,
+            top_k=explanation_top_k,
+        )
+        explanations = explanations.reindex(range(original_length)).fillna(
+            {
+                "TopContributors": "[]",
+                "ContributionShares": "[]",
+                "ExplanationCoverage": 0.0,
+                "ExplanationMethod": "",
+            }
+        )
+        for column in explanations.columns:
+            result_df[column] = explanations[column].to_numpy()
 
     if report_path is not None:
         generate_anomaly_detection_report(
