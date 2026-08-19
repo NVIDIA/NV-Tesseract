@@ -99,6 +99,21 @@ def _resolve_step_indices(
     return np.unique(arr)
 
 
+class _ChannelFlowEmbedDP(torch.nn.Module):
+    """Routes forward() to model.embed() so DataParallel shards the
+    probe-embedding batches across GPUs in channel-flow Jacobians.
+    DataParallel only intercepts forward(), not arbitrary named methods.
+    """
+
+    def __init__(self, model: ForecastModel) -> None:
+        super().__init__()
+        self._m = model
+
+    def forward(self, x_enc: torch.Tensor, input_mask: torch.Tensor) -> torch.Tensor:
+        out = self._m.embed(x_enc=x_enc, input_mask=input_mask)
+        return out.embeddings if hasattr(out, "embeddings") else out
+
+
 def _embed_windows_batched(
     model: ForecastModel,
     windows: Array,
@@ -120,10 +135,14 @@ def _embed_windows_batched(
     if n == 0:
         return np.zeros((0, 0), dtype=np.float32)
     out_chunks: list[Array] = []
+    _is_dp = isinstance(model, torch.nn.DataParallel)
     for i in range(0, n, batch_size):
         x = torch.from_numpy(np.ascontiguousarray(windows[i : i + batch_size])).to(device=device, dtype=torch.float32)
         m = torch.from_numpy(np.ascontiguousarray(masks[i : i + batch_size])).to(device=device, dtype=torch.long)
-        out_chunks.append(_embed_batch(model, x, m))
+        if _is_dp:
+            out_chunks.append(model(x, m).detach().cpu().numpy().astype(np.float32))
+        else:
+            out_chunks.append(_embed_batch(model, x, m))
     z = np.concatenate(out_chunks, axis=0)
     if np.any(~np.isfinite(z)):
         z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
@@ -170,6 +189,16 @@ def compute_per_channel_flow_jacobian(
     one batched forward of size ``2C + 1`` per transition.
     """
     cfg = cfg or ChannelFlowConfig()
+    # When multiple GPUs are available and no custom value_fn is set,
+    # wrap the model so DataParallel splits the (2+2*C)-probe embedding
+    # batch across devices, cutting wall-clock roughly in half per
+    # additional GPU without any change to the transition loop logic.
+    _n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if _n_gpus > 1 and value_fn is None:
+        import logging as _log
+
+        _log.getLogger(__name__).info("channel flow Jacobian: using %d GPUs via DataParallel", _n_gpus)
+        model = torch.nn.DataParallel(_ChannelFlowEmbedDP(model))
     vf = value_fn if value_fn is not None else _embed_windows_batched
 
     xw_view, m_view, T = _rolling_window_sources(series_ct, seq_len=seq_len, input_mask_t=input_mask_t)

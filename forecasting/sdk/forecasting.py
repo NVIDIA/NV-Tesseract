@@ -366,6 +366,23 @@ def _create_temp_csv_path(prefix: str) -> str:
     return path
 
 
+class _DARREmbedWrapper(torch.nn.Module):
+    """Routes forward() to model.embed() so DataParallel can shard DARR context batches.
+
+    DataParallel only intercepts forward(). The forecasting model's forward() runs
+    the forecast head, not the embed path. This wrapper re-maps forward() to embed()
+    so that build_context_memory can benefit from multi-GPU batch splitting.
+    """
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        super().__init__()
+        self._model = model
+
+    def forward(self, x_enc: torch.Tensor, input_mask: torch.Tensor) -> torch.Tensor:
+        out = self._model.embed(x_enc=x_enc, input_mask=input_mask)
+        return out.embeddings
+
+
 @torch.no_grad()
 def embed_batch(model, x_enc, input_mask):
     """Generate embeddings for a batch"""
@@ -409,11 +426,15 @@ def build_context_memory(model, context_loader, device, cosine=True):
     """
     model.eval()
     E, Y = [], []
+    _use_dp_forward = isinstance(model, (torch.nn.DataParallel, _DARREmbedWrapper))
     for batch in tqdm(context_loader, desc="Building context memory"):
         x_enc, y_future, input_mask = batch[:3]
         x_enc = x_enc.to(device, dtype=torch.float32)
         input_mask = input_mask.to(device)
-        emb = embed_batch(model, x_enc, input_mask)
+        if _use_dp_forward:
+            emb = model(x_enc, input_mask)
+        else:
+            emb = embed_batch(model, x_enc, input_mask)
         E.append(emb.detach().cpu().numpy().astype(np.float32))
         Y.append(y_future.detach().cpu().numpy().astype(np.float32))
 
@@ -2775,7 +2796,14 @@ def perform_forecasting(
 
             # Build context memory with observed continuations long enough for
             # the requested retrieval forecast.
-            DB_E, DB_Y = build_context_memory(model, context_loader, device, cosine=True)
+            # Wrap in DataParallel when multiple GPUs are available: the context
+            # loader has real batch depth so splitting across GPUs gives a meaningful
+            # speedup, especially with cross-channel attention enabled.
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            darr_embedder = torch.nn.DataParallel(_DARREmbedWrapper(model)) if n_gpus > 1 else model
+            if n_gpus > 1:
+                logger.info("DARR context build: using %d GPUs via DataParallel", n_gpus)
+            DB_E, DB_Y = build_context_memory(darr_embedder, context_loader, device, cosine=True)
 
             # Embed test data and get direct predictions (with autoregressive if needed)
             Q_E_list = []

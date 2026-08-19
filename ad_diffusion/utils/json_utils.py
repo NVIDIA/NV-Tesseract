@@ -277,7 +277,7 @@ def serialize_adaptive_normalizer(normalizer):
             serialized_params[k] = _serialize_numpy_for_json(v)
     data["params"] = serialized_params
 
-    # Handle scalers list (merge_tsb_ad_m.py AdaptiveNormalizer)
+    # Preserve optional extended normalizer state for backward compatibility.
     if hasattr(normalizer, "scalers"):
         data["scalers"] = [_serialize_sklearn_model(s) for s in normalizer.scalers]
     if hasattr(normalizer, "n_features"):
