@@ -151,7 +151,7 @@ perform_forecasting(
     
     # Model configuration
     standardizer_pkl: str = "standardizer.pkl",
-    ckpt: str = "moment_head_512_6hr.pt",
+    ckpt: str = "run8_best_model_cr.pt",
     seq_len: int = 512,
     forecast_horizon: int = 72,
     model_horizon: int = 72,
