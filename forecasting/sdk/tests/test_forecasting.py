@@ -249,9 +249,7 @@ def test_perform_forecasting_uses_cross_channel_model_when_checkpoint_contains_w
     assert build_kwargs["cross_channel_dropout"] == 0.1
 
 
-def test_perform_forecasting_disables_cross_channel_when_checkpoint_has_no_weights(
-    caplog, patch_external_dependencies
-):
+def test_perform_forecasting_disables_cross_channel_when_checkpoint_has_no_weights(caplog, patch_external_dependencies):
     df = make_timeseries(num_rows=10)
     with caplog.at_level(logging.WARNING):
         forecasting.perform_forecasting(
