@@ -295,7 +295,7 @@ def test_perform_forecasting_enables_cross_channel_when_checkpoint_has_weights(
 def test_load_cached_model_reuses_checkpoint_across_requested_modes(monkeypatch, patch_external_dependencies):
     load_calls = 0
 
-    def load_checkpoint(*args, **kwargs):
+    def load_checkpoint(*args: object, **kwargs: object) -> dict:
         nonlocal load_calls
         load_calls += 1
         return {}

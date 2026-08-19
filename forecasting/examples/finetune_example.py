@@ -49,8 +49,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dataset_longhorizon import CSVLongHorizonDataset, CSVLongHorizonSimpleDataset
 from model import build_model, count_trainable_params
 from sdk.forecasting import (
-    CHECKPOINT_CROSS_CHANNEL,
     CHECKPOINT_BASE,
+    CHECKPOINT_CROSS_CHANNEL,
     download_model_weights,
 )
 
