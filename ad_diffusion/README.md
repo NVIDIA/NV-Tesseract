@@ -74,6 +74,8 @@ results = perform_anomaly_analysis_with_diffusion(
     timestamp_column="timestamp",
     ground_truth_column="GT",
     explain=True,
+    report_max_pages=10,
+    report_consolidated_top_k=5,
 )
 ```
 
@@ -81,7 +83,10 @@ Timestamp and ground-truth columns used for the report are excluded from model
 features but preserved in the returned DataFrame. Existing callers are unchanged
 because PDF generation is disabled unless `report_path` is supplied.
 When explanations are enabled, the PDF adds contributor-share graphs and writes
-the complete row-level explanation data to a companion CSV.
+the complete row-level explanation data to a companion CSV. If per-anomaly
+charts would make the PDF exceed `report_max_pages` (10 by default), the PDF
+uses one consolidated, MAE-weighted top-contributors page instead; the companion
+CSV still contains every detected anomaly.
 
 An existing AD result or CSV can also be rendered after inference:
 

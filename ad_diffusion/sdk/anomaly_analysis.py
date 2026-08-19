@@ -41,6 +41,8 @@ def perform_anomaly_analysis_with_diffusion(
     ground_truth_column: str | None = None,
     report_title: str = "Anomaly Detection Report",
     report_explanation_csv_path: str | Path | None = None,
+    report_max_pages: int = 10,
+    report_consolidated_top_k: int = 5,
     explain: bool = False,
     explanation_top_k: int = 3,
 ) -> pd.DataFrame:
@@ -68,6 +70,8 @@ def perform_anomaly_analysis_with_diffusion(
         report_title: Title shown on the generated PDF report.
         report_explanation_csv_path: Optional destination for the full
             explainability CSV. When omitted, it is written beside the PDF.
+        report_max_pages: Maximum PDF page count. Excess anomaly details are consolidated.
+        report_consolidated_top_k: Number of overall contributors shown when details are consolidated.
         explain: Whether to add reconstruction-error explanations for detected anomalies.
         explanation_top_k: Maximum number of contributors returned per anomaly.
 
@@ -214,6 +218,8 @@ def perform_anomaly_analysis_with_diffusion(
             ground_truth_column=resolved_ground_truth_column,
             title=report_title,
             explanation_csv_path=report_explanation_csv_path,
+            max_report_pages=report_max_pages,
+            consolidated_top_k=report_consolidated_top_k,
         )
 
     return result_df

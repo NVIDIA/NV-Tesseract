@@ -5,6 +5,7 @@
 
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from sdk import reporting
 from sdk.reporting import (
+    _aggregate_explanation_contributions,
     _create_contribution_graph_page,
     _create_mae_note_page,
     _resolve_explanation_rows,
@@ -214,3 +217,53 @@ def test_contribution_graph_visualizes_shares_and_coverage() -> None:
     assert any(text.get_text() == "temperature\n75%" for text in axis.texts)
     assert any(text.get_text() == "pressure\n15%" for text in axis.texts)
     assert any(text.get_text() == "90.0% covered" for text in axis.texts)
+
+
+def test_aggregate_explanations_weights_features_by_anomaly_score() -> None:
+    """Overall contributors should reflect their contribution to total anomaly MAE."""
+    frame = pd.DataFrame(
+        {
+            "Anomaly": [True, True],
+            "MAE": [1.0, 3.0],
+            "TopContributors": ['["temperature","pressure"]', '["pressure","temperature"]'],
+            "ContributionShares": ["[0.5,0.5]", "[0.75,0.25]"],
+            "ExplanationCoverage": [1.0, 1.0],
+        }
+    )
+
+    contributions, coverage = _aggregate_explanation_contributions(
+        frame,
+        frame["Anomaly"].to_numpy(dtype=bool),
+        score_column="MAE",
+        top_k=2,
+    )
+
+    assert [feature for feature, _ in contributions] == ["pressure", "temperature"]
+    assert [share for _, share in contributions] == pytest.approx([0.6875, 0.3125])
+    assert coverage == pytest.approx(1.0)
+
+
+def test_large_explanation_report_uses_one_consolidated_page(monkeypatch, tmp_path: Path) -> None:
+    """Large anomaly sets should switch from per-anomaly pages to one summary page."""
+    sample_count = 80
+    frame = pd.DataFrame(
+        {
+            "signal": np.linspace(0.0, 1.0, sample_count),
+            "Anomaly": [True] * sample_count,
+            "MAE": np.linspace(0.1, 1.0, sample_count),
+            "TopContributors": ['["signal"]'] * sample_count,
+            "ContributionShares": ["[1.0]"] * sample_count,
+            "ExplanationCoverage": [1.0] * sample_count,
+        }
+    )
+    consolidated = Mock(wraps=reporting._create_consolidated_contribution_page)
+    detailed = Mock(wraps=reporting._create_contribution_graph_page)
+    monkeypatch.setattr(reporting, "_create_consolidated_contribution_page", consolidated)
+    monkeypatch.setattr(reporting, "_create_contribution_graph_page", detailed)
+
+    generate_anomaly_detection_report(frame, tmp_path / "consolidated.pdf", max_report_pages=10)
+
+    consolidated.assert_called_once()
+    detailed.assert_not_called()
+    assert consolidated.call_args.kwargs["max_report_pages"] == 10
+    assert consolidated.call_args.kwargs["anomaly_count"] == sample_count

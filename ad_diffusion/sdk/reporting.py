@@ -28,6 +28,8 @@ EXPLANATION_COLUMNS = {
 }
 REQUIRED_EXPLANATION_COLUMNS = ("TopContributors", "ContributionShares", "ExplanationCoverage")
 MAX_EXPLANATIONS_PER_PAGE = 7
+DEFAULT_MAX_REPORT_PAGES = 10
+DEFAULT_CONSOLIDATED_TOP_K = 5
 FEATURE_COLORS = ("#175CD3", "#039855", "#F79009", "#7F56D9", "#0E9384", "#D92D20", "#444CE7", "#C11574")
 
 
@@ -278,7 +280,7 @@ def _create_feature_page(
 ) -> Figure:
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
     axes = figure.subplots(len(feature_columns), 1, sharex=True, squeeze=False)
-    figure.subplots_adjust(left=0.09, right=0.96, top=0.90, bottom=0.10, hspace=0.42)
+    figure.subplots_adjust(left=0.09, right=0.96, top=0.84, bottom=0.10, hspace=0.42)
     figure.suptitle(
         f"Original signals with anomaly overlays ({feature_page_number}/{feature_page_count})",
         x=0.09,
@@ -443,6 +445,107 @@ def _create_contribution_graph_page(
     return figure
 
 
+def _aggregate_explanation_contributions(
+    result_df: pd.DataFrame,
+    detected: np.ndarray,
+    *,
+    score_column: str,
+    top_k: int,
+) -> tuple[list[tuple[str, float]], float]:
+    """Aggregate contributor shares across anomalies, weighted by anomaly MAE."""
+    scores = pd.to_numeric(result_df[score_column], errors="coerce").to_numpy(dtype=float)
+    total_anomaly_score = float(scores[detected].sum())
+    weighted_contributions: dict[str, float] = {}
+    for row_index in np.flatnonzero(detected):
+        contributors = _parse_explanation_list(result_df.iloc[row_index]["TopContributors"], name="TopContributors")
+        shares = _parse_explanation_list(result_df.iloc[row_index]["ContributionShares"], name="ContributionShares")
+        for contributor, share in zip(contributors, shares, strict=True):
+            feature = str(contributor)
+            weighted_contributions[feature] = weighted_contributions.get(feature, 0.0) + scores[row_index] * float(
+                share
+            )
+
+    ranked = sorted(weighted_contributions.items(), key=lambda item: (-item[1], item[0]))[:top_k]
+    if total_anomaly_score <= 0:
+        contributions = [(feature, 0.0) for feature, _ in ranked]
+    else:
+        contributions = [(feature, value / total_anomaly_score) for feature, value in ranked]
+    return contributions, sum(share for _, share in contributions)
+
+
+def _create_consolidated_contribution_page(
+    contributions: Sequence[tuple[str, float]],
+    *,
+    coverage: float,
+    anomaly_count: int,
+    page_number: int,
+    max_report_pages: int,
+) -> Figure:
+    """Create one page summarizing the strongest contributors across all anomalies."""
+    figure = Figure(figsize=(11.0, 8.5), facecolor="white")
+    axis = figure.add_axes((0.25, 0.20, 0.66, 0.55))
+    figure.suptitle(
+        "Overall anomaly feature contributions",
+        x=0.07,
+        y=0.955,
+        ha="left",
+        fontsize=18,
+        fontweight="bold",
+        color="#17365D",
+    )
+    figure.text(
+        0.07,
+        0.895,
+        f"Top {len(contributions)} contributors across {anomaly_count:,} detected anomalies, weighted by anomaly MAE.",
+        fontsize=10,
+        color="#667085",
+    )
+    figure.text(
+        0.07,
+        0.855,
+        f"Per-anomaly charts were consolidated to keep this report within {max_report_pages} pages; full details are in the companion CSV.",
+        fontsize=9,
+        color="#667085",
+    )
+    if not contributions:
+        axis.axis("off")
+        axis.text(0.0, 0.8, "No contributor data was available to summarize.", fontsize=11, color="#475467")
+        _add_footer(figure, page_number)
+        return figure
+
+    features = [feature for feature, _ in contributions][::-1]
+    shares = np.asarray([share for _, share in contributions][::-1], dtype=float)
+    colors = [FEATURE_COLORS[index % len(FEATURE_COLORS)] for index in range(len(features))]
+    bars = axis.barh(np.arange(len(features)), shares, color=colors, height=0.62)
+    axis.set_yticks(np.arange(len(features)), labels=features)
+    axis.set_xlim(0.0, max(0.05, min(1.0, float(shares.max()) * 1.22)))
+    axis.xaxis.set_major_formatter(lambda value, _position: f"{value:.0%}")
+    axis.set_xlabel("Share of total detected-anomaly MAE", fontsize=9, color="#344054")
+    axis.grid(axis="x", color="#D8DEE9", linewidth=0.6, alpha=0.8)
+    axis.set_axisbelow(True)
+    axis.spines[["top", "right", "left"]].set_visible(False)
+    axis.tick_params(axis="y", length=0, labelsize=8, colors="#344054", pad=8)
+    axis.tick_params(axis="x", labelsize=8, colors="#667085")
+    for bar, share in zip(bars, shares, strict=True):
+        axis.text(
+            bar.get_width() + axis.get_xlim()[1] * 0.015,
+            bar.get_y() + bar.get_height() / 2,
+            f"{share:.1%}",
+            va="center",
+            fontsize=8,
+            color="#344054",
+        )
+    figure.text(
+        0.25,
+        0.125,
+        f"Displayed features explain {coverage:.1%} of total detected-anomaly MAE; the remainder is outside the displayed contributors.",
+        fontsize=9,
+        color="#475467",
+    )
+    _add_footer(figure, page_number)
+    return figure
+
+
 def _write_explanation_csv(
     result_df: pd.DataFrame,
     detected: np.ndarray,
@@ -535,6 +638,8 @@ def generate_anomaly_detection_report(
     title: str = "Anomaly Detection Report",
     max_features_per_page: int = 4,
     explanation_csv_path: str | Path | None = None,
+    max_report_pages: int = DEFAULT_MAX_REPORT_PAGES,
+    consolidated_top_k: int = DEFAULT_CONSOLIDATED_TOP_K,
 ) -> Path:
     """Create a PDF report from an anomaly-analysis result DataFrame.
 
@@ -553,6 +658,14 @@ def generate_anomaly_detection_report(
         raise TypeError("max_features_per_page must be an integer.")
     if max_features_per_page < 1:
         raise ValueError("max_features_per_page must be at least 1.")
+    if not isinstance(max_report_pages, int) or isinstance(max_report_pages, bool):
+        raise TypeError("max_report_pages must be an integer.")
+    if max_report_pages < 4:
+        raise ValueError("max_report_pages must be at least 4.")
+    if not isinstance(consolidated_top_k, int) or isinstance(consolidated_top_k, bool):
+        raise TypeError("consolidated_top_k must be an integer.")
+    if consolidated_top_k < 1:
+        raise ValueError("consolidated_top_k must be at least 1.")
 
     resolved_timestamp = _resolve_column(
         result_df,
@@ -605,9 +718,15 @@ def generate_anomaly_detection_report(
             csv_destination,
             is_datetime=is_datetime,
         )
+    reserved_pages = 2 + (1 if explanation_rows is not None else 0)
+    available_feature_pages = max(1, max_report_pages - reserved_pages)
+    effective_features_per_page = max(
+        max_features_per_page,
+        int(np.ceil(len(resolved_features) / available_feature_pages)),
+    )
     feature_groups = [
-        resolved_features[index : index + max_features_per_page]
-        for index in range(0, len(resolved_features), max_features_per_page)
+        resolved_features[index : index + effective_features_per_page]
+        for index in range(0, len(resolved_features), effective_features_per_page)
     ]
     explanation_groups = (
         [
@@ -628,7 +747,20 @@ def generate_anomaly_detection_report(
     explanation_feature_colors = {
         feature: FEATURE_COLORS[index % len(FEATURE_COLORS)] for index, feature in enumerate(explanation_features)
     }
-    page_count = 2 + len(feature_groups) + len(explanation_groups)
+    detailed_page_count = 2 + len(feature_groups) + len(explanation_groups)
+    use_consolidated_explanations = explanation_rows is not None and detailed_page_count > max_report_pages
+    consolidated_contributions: list[tuple[str, float]] = []
+    consolidated_coverage = 0.0
+    if use_consolidated_explanations:
+        consolidated_contributions, consolidated_coverage = _aggregate_explanation_contributions(
+            result_df,
+            detected,
+            score_column=score_column,
+            top_k=consolidated_top_k,
+        )
+        page_count = 3 + len(feature_groups)
+    else:
+        page_count = detailed_page_count
 
     with PdfPages(destination, metadata={"Title": title, "Subject": "Time-series anomaly detection report"}) as pdf:
         pdf.savefig(
@@ -658,7 +790,20 @@ def generate_anomaly_detection_report(
                     feature_page_count=len(feature_groups),
                 )
             )
-        for graph_page_number, group in enumerate(explanation_groups, start=1):
+        if use_consolidated_explanations:
+            pdf.savefig(
+                _create_consolidated_contribution_page(
+                    consolidated_contributions,
+                    coverage=consolidated_coverage,
+                    anomaly_count=int(detected.sum()),
+                    page_number=2 + len(feature_groups),
+                    max_report_pages=max_report_pages,
+                )
+            )
+        for graph_page_number, group in enumerate(
+            [] if use_consolidated_explanations else explanation_groups,
+            start=1,
+        ):
             page_number = 1 + len(feature_groups) + graph_page_number
             pdf.savefig(
                 _create_contribution_graph_page(
