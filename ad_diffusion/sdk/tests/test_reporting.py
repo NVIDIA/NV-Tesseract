@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sdk.reporting import (
     _create_contribution_graph_page,
+    _create_mae_note_page,
     _resolve_explanation_rows,
     _resolve_x_axis,
     generate_anomaly_detection_report,
@@ -117,6 +118,24 @@ def test_resolve_x_axis_preserves_timestamp_values() -> None:
     assert values.equals(frame["timestamp"])
     assert label == "timestamp"
     assert is_datetime is True
+
+
+def test_mae_note_page_explains_row_number_time_steps() -> None:
+    """The PDF should explain row-number time steps when timestamps are unavailable."""
+    figure = _create_mae_note_page(page_number=3, uses_row_numbers=True)
+
+    assert any(
+        text.get_text()
+        == "No usable timestamp column was provided, so time steps in this report are zero-based DataFrame row numbers."
+        for text in figure.axes[0].texts
+    )
+
+
+def test_mae_note_page_omits_row_number_note_for_timestamped_data() -> None:
+    """Timestamped reports should not show the row-number fallback note."""
+    figure = _create_mae_note_page(page_number=3, uses_row_numbers=False)
+
+    assert not any("zero-based DataFrame row numbers" in text.get_text() for text in figure.axes[0].texts)
 
 
 def test_generate_report_includes_explainability_metrics(tmp_path: Path) -> None:

@@ -479,7 +479,7 @@ def _write_explanation_csv(
     return output_path
 
 
-def _create_mae_note_page(*, page_number: int) -> Figure:
+def _create_mae_note_page(*, page_number: int, uses_row_numbers: bool = False) -> Figure:
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
     axis = figure.add_axes((0.09, 0.12, 0.82, 0.76))
     axis.axis("off")
@@ -509,9 +509,13 @@ def _create_mae_note_page(*, page_number: int) -> Figure:
         "MAE scale depends on preprocessing and feature scaling, so values should be interpreted in the context of the same model and data pipeline.",
         "A high MAE identifies unusual reconstruction behavior; by itself, it does not establish physical causality or root cause.",
     ]
+    if uses_row_numbers:
+        notes.append(
+            "No usable timestamp column was provided, so time steps in this report are zero-based DataFrame row numbers."
+        )
     axis.text(0.0, 0.48, "Interpretation notes", fontsize=12, fontweight="bold", color="#175CD3", va="top")
     for note_index, note in enumerate(notes):
-        y_position = 0.39 - note_index * 0.10
+        y_position = 0.39 - note_index * 0.08
         axis.text(0.0, y_position, "-", fontsize=12, color="#175CD3", va="top")
         axis.text(0.035, y_position, note, fontsize=10, color="#344054", va="top", wrap=True)
 
@@ -665,5 +669,10 @@ def generate_anomaly_detection_report(
                     feature_colors=explanation_feature_colors,
                 )
             )
-        pdf.savefig(_create_mae_note_page(page_number=page_count))
+        pdf.savefig(
+            _create_mae_note_page(
+                page_number=page_count,
+                uses_row_numbers=x_label.startswith("Row number"),
+            )
+        )
     return destination
