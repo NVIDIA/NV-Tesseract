@@ -18,7 +18,7 @@ from matplotlib.figure import Figure
 if TYPE_CHECKING:
     from collections.abc import Hashable, Sequence
 
-GROUND_TRUTH_CANDIDATES = ("GT", "ground_truth", "is_anomaly", "label", "Label")
+GROUND_TRUTH_CANDIDATES = ("GT", "ground_truth", "is_anomaly", "anomaly", "label", "Label")
 TIMESTAMP_CANDIDATES = ("timestamp", "Timestamp", "time", "Time", "ts", "datetime", "date")
 EXPLANATION_COLUMNS = {
     "TopContributors",
@@ -60,7 +60,7 @@ def _resolve_x_axis(df: pd.DataFrame, timestamp_column: str | None) -> tuple[np.
     if timestamp_column is None:
         if isinstance(df.index, pd.DatetimeIndex):
             return pd.Series(df.index, index=df.index), "Time", True
-        return np.arange(len(df)), "Sample", False
+        return np.arange(len(df)), "Row number (no timestamp column)", False
 
     values = df[timestamp_column]
     if pd.api.types.is_numeric_dtype(values):
@@ -69,7 +69,7 @@ def _resolve_x_axis(df: pd.DataFrame, timestamp_column: str | None) -> tuple[np.
     parsed = pd.to_datetime(values, errors="coerce")
     if parsed.notna().all():
         return parsed, timestamp_column, True
-    return np.arange(len(df)), f"Sample ({timestamp_column} unavailable as time)", False
+    return np.arange(len(df)), f"Row number ({timestamp_column} unavailable as time)", False
 
 
 def _resolve_feature_columns(

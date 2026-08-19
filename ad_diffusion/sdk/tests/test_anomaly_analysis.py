@@ -188,6 +188,41 @@ def test_optional_pdf_report_excludes_metadata_from_inference(monkeypatch, infer
     assert destination.read_bytes().startswith(b"%PDF")
 
 
+def test_lowercase_anomaly_metadata_is_excluded_from_inference(monkeypatch, inference_results, tmp_path):
+    """A lowercase anomaly label should not replace valid signal names with model components."""
+    feature_names = [
+        "x",
+        "y",
+        "z",
+        "010-000-024-033",
+        "010-000-030-096",
+        "020-000-032-221",
+        "020-000-033-111",
+    ]
+    input_df = pd.DataFrame(np.ones((5, len(feature_names))), columns=feature_names)
+    input_df["anomaly"] = [0, 1, 0, 0, 1]
+    mock_inference = Mock(return_value=inference_results)
+    monkeypatch.setattr(anomaly_analysis, "inference_ad_tesseract2_mp", mock_inference)
+
+    mock_thresholder = Mock()
+    mock_thresholder.detect_anomalies.return_value = np.array([False, True, False, False, True])
+    mock_strategy = Mock()
+    mock_strategy.scs_thresholder = mock_thresholder
+    monkeypatch.setattr(anomaly_analysis, "SCSThresholdStrategy", Mock(return_value=mock_strategy))
+    monkeypatch.setattr(anomaly_analysis, "generate_anomaly_detection_report", Mock())
+
+    anomaly_analysis.perform_anomaly_analysis_with_diffusion(
+        input_df,
+        threshold_strategy="scs",
+        model_path="model.pth",
+        config_path="config.yaml",
+        report_path=tmp_path / "report.pdf",
+    )
+
+    inference_df = mock_inference.call_args.kwargs["data"]
+    assert list(inference_df.columns) == feature_names
+
+
 def test_report_metadata_arguments_are_ignored_without_report_path(monkeypatch, inference_results):
     """Report-only arguments must not alter the default inference feature set."""
     input_df = pd.DataFrame(

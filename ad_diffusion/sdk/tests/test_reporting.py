@@ -15,7 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sdk.reporting import (
     _create_contribution_graph_page,
     _resolve_explanation_rows,
+    _resolve_x_axis,
     generate_anomaly_detection_report,
+    infer_ground_truth_column,
 )
 
 
@@ -88,6 +90,33 @@ def test_generate_report_preserves_non_string_feature_labels(tmp_path: Path) -> 
     generate_anomaly_detection_report(frame, destination, feature_columns=[10, 20])
 
     assert destination.read_bytes().startswith(b"%PDF")
+
+
+def test_infers_lowercase_anomaly_as_ground_truth() -> None:
+    """A conventional lowercase anomaly label should be treated as report metadata."""
+    frame = pd.DataFrame({"signal": [1.0, 2.0], "anomaly": [0, 1]})
+
+    assert infer_ground_truth_column(frame) == "anomaly"
+
+
+def test_resolve_x_axis_identifies_row_numbers_without_timestamp() -> None:
+    """Reports without timestamps should identify their zero-based row-number axis."""
+    values, label, is_datetime = _resolve_x_axis(pd.DataFrame({"signal": [1.0, 2.0]}), None)
+
+    assert values.tolist() == [0, 1]
+    assert label == "Row number (no timestamp column)"
+    assert is_datetime is False
+
+
+def test_resolve_x_axis_preserves_timestamp_values() -> None:
+    """A valid timestamp column should remain the report's datetime axis."""
+    frame = _report_frame()
+
+    values, label, is_datetime = _resolve_x_axis(frame, "timestamp")
+
+    assert values.equals(frame["timestamp"])
+    assert label == "timestamp"
+    assert is_datetime is True
 
 
 def test_generate_report_includes_explainability_metrics(tmp_path: Path) -> None:
