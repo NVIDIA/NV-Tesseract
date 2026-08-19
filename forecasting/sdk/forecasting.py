@@ -66,8 +66,9 @@ def _has_mps():
 DEVICE = (
     torch.device("cuda") if torch.cuda.is_available() else torch.device("mps") if _has_mps() else torch.device("cpu")
 )
-DEFAULT_CHECKPOINT_NAME = "moment_head_512_6hr.pt"
-DEFAULT_CROSS_CHANNEL_CHECKPOINT_NAME = "run8_best_model_cr.pt"
+CHECKPOINT_CROSS_CHANNEL = "run8_best_model_cr.pt"
+CHECKPOINT_BASE = "moment_head_512_6hr.pt"  # non-cross-channel
+_KNOWN_CHECKPOINTS = {CHECKPOINT_CROSS_CHANNEL, CHECKPOINT_BASE}
 DEFAULT_BACKBONE_NAME = "AutonLab/MOMENT-1-large"
 _MODEL_CACHE: dict[str, torch.nn.Module] = {}
 
@@ -139,6 +140,20 @@ def _load_cached_model(
 
     logger.info("Loading model from checkpoint: %s", ckpt)
 
+    # Inspect state dict before building the model so use_cross_channel always
+    # matches what's actually in the checkpoint. We check for "cross_channel"
+    # (not "cross_channel_attn.") to remain correct if future checkpoints
+    # introduce additional cross-channel components under different prefixes.
+    state = torch.load(ckpt, map_location=device)
+    ckpt_has_cr = any("cross_channel" in k for k in state)
+    if use_cross_channel != ckpt_has_cr:
+        logger.warning(
+            "use_cross_channel=%s but checkpoint %s cross-channel weights; following checkpoint",
+            use_cross_channel,
+            "has" if ckpt_has_cr else "lacks",
+        )
+        use_cross_channel = ckpt_has_cr
+
     model = build_model(
         model_name=model_name,
         seq_len=seq_len,
@@ -152,16 +167,13 @@ def _load_cached_model(
         local_files_only=local_files_only,
         device=str(device),
     )
-    state = torch.load(ckpt, map_location=device)
     load_result = model.load_state_dict(state, strict=False)
     missing = list(getattr(load_result, "missing_keys", [])) if load_result is not None else []
     unexpected = list(getattr(load_result, "unexpected_keys", [])) if load_result is not None else []
     if unexpected:
         raise RuntimeError(f"Unexpected checkpoint keys for forecasting model: {unexpected}")
     if missing:
-        non_cr_missing = [key for key in missing if "cross_channel" not in key]
-        if non_cr_missing:
-            raise RuntimeError(f"Missing non-cross-channel checkpoint keys: {non_cr_missing}")
+        raise RuntimeError(f"Missing checkpoint keys: {missing}")
     model.eval()
     _MODEL_CACHE[cache_key] = model
     logger.info("Model cached with key: %s...", cache_key[:8])
@@ -175,7 +187,7 @@ def clear_model_cache():
 
 def download_model_weights(
     standardizer_pkl: str = "standardizer.pkl",
-    ckpt: str = DEFAULT_CHECKPOINT_NAME,
+    ckpt: str = CHECKPOINT_CROSS_CHANNEL,
     repo_id: str = "nvidia/nv-tesseract-forecasting",
     force_download: bool = False,
     revision: str | None = None,
@@ -2410,7 +2422,7 @@ def perform_forecasting(
     context_df: pd.DataFrame | None = None,  # Optional context DataFrame for DARR mode
     # Model configuration - Replace with your own paths for the weights and standardizer
     standardizer_pkl: str = "standardizer.pkl",
-    ckpt: str = DEFAULT_CHECKPOINT_NAME,
+    ckpt: str = CHECKPOINT_CROSS_CHANNEL,
     seq_len: int = 512,
     forecast_horizon: int = 72,
     model_horizon: int = 72,  # Override with other weights' values if needed
@@ -2562,9 +2574,10 @@ def perform_forecasting(
     # Set random seed
     control_randomness(seed=seed)
 
-    # Select checkpoint based on cross-channel mode when using defaults
-    if ckpt == DEFAULT_CHECKPOINT_NAME and use_cross_channel:
-        ckpt = DEFAULT_CROSS_CHANNEL_CHECKPOINT_NAME
+    # For the two published checkpoints, resolve the right one from use_cross_channel.
+    # Custom paths are left untouched — state dict inspection in _load_cached_model handles them.
+    if ckpt in _KNOWN_CHECKPOINTS:
+        ckpt = CHECKPOINT_CROSS_CHANNEL if use_cross_channel else CHECKPOINT_BASE
 
     # Auto-download model weights if they don't exist
     try:
@@ -2949,7 +2962,7 @@ class NVTesseractForecasting(
         **model_kwargs,
     ) -> "NVTesseractForecasting":
         standardizer_name = model_kwargs.get("standardizer_pkl", "standardizer.pkl")
-        ckpt_name = model_kwargs.get("ckpt", DEFAULT_CHECKPOINT_NAME)
+        ckpt_name = model_kwargs.get("ckpt", CHECKPOINT_CROSS_CHANNEL)
         local_path = Path(model_id)
         if local_path.is_dir():
             return cls(

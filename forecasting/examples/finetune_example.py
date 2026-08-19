@@ -49,8 +49,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dataset_longhorizon import CSVLongHorizonDataset, CSVLongHorizonSimpleDataset
 from model import build_model, count_trainable_params
 from sdk.forecasting import (
-    DEFAULT_CHECKPOINT_NAME,
-    DEFAULT_CROSS_CHANNEL_CHECKPOINT_NAME,
+    CHECKPOINT_CROSS_CHANNEL,
+    CHECKPOINT_BASE,
     download_model_weights,
 )
 
@@ -162,7 +162,7 @@ def resolve_checkpoint_init(args: argparse.Namespace) -> str | None:
     if args.ckpt_init.lower() != "auto":
         return args.ckpt_init
 
-    ckpt_name = DEFAULT_CROSS_CHANNEL_CHECKPOINT_NAME if args.use_cross_channel else DEFAULT_CHECKPOINT_NAME
+    ckpt_name = CHECKPOINT_CROSS_CHANNEL if args.use_cross_channel else CHECKPOINT_BASE
     _, ckpt_path = download_model_weights(
         standardizer_pkl=args.standardizer_init,
         ckpt=ckpt_name,
