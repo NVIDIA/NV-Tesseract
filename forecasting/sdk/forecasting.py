@@ -139,7 +139,9 @@ def load_forecasting_config(config_path: str | Path) -> ForecastingConfig:
     if config is None:
         return ForecastingConfig()
     if not isinstance(config, dict):
-        raise ValueError(f"Forecasting inference config 'inference' section must be a mapping, got {type(config).__name__}.")
+        raise ValueError(
+            f"Forecasting inference config 'inference' section must be a mapping, got {type(config).__name__}."
+        )
 
     unknown_keys = sorted(set(config) - _FORECASTING_CONFIG_FIELDS)
     if unknown_keys:
