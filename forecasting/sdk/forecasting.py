@@ -8,6 +8,7 @@ import os
 import tempfile
 import types
 from contextlib import contextmanager
+from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -71,6 +73,117 @@ CHECKPOINT_BASE = "moment_head_512_6hr.pt"  # non-cross-channel
 _KNOWN_CHECKPOINTS = {CHECKPOINT_CROSS_CHANNEL, CHECKPOINT_BASE}
 DEFAULT_BACKBONE_NAME = "AutonLab/MOMENT-1-large"
 _MODEL_CACHE: dict[str, torch.nn.Module] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class ForecastingConfig:
+    """Typed configuration for :func:`perform_forecasting`."""
+
+    timestamp_column: str = "timestamp"
+    target_column: str = "target"
+    standardizer_pkl: str = "standardizer.pkl"
+    ckpt: str = CHECKPOINT_CROSS_CHANNEL
+    seq_len: int = 512
+    forecast_horizon: int = 72
+    model_horizon: int | None = 72
+    save_preds: str | None = None
+    alpha: float = 0.01
+    model_name: str = DEFAULT_BACKBONE_NAME
+    batch_size: int = 8
+    num_workers: int = 2
+    stride: int | None = None
+    context_stride: int | None = None
+    seed: int = 13
+    k: int = 64
+    temperature: float = 0.05
+    device: str | None = None
+    local_files_only: bool = False
+    use_cross_channel: bool = True
+    cross_channel_heads: int = 8
+    cross_channel_dropout: float = 0.1
+    return_all_channels: bool = False
+    interpretability: bool = False
+    interpretability_output: str | None = None
+    interpretability_out_dir: str | Path = "interpretability_output"
+    interpretability_run_name: str | None = None
+    interpretability_top_k: int = 5
+    interpretability_dataset_name: str | None = None
+    n_lags: int = 128
+    softmax_tau: float = 1.0
+    channel_output_aware: bool = False
+    integrated_gradients: bool = False
+    integrated_gradients_baseline: Any = "noise"
+    integrated_gradients_steps: int = 64
+    integrated_gradients_n_baselines: int = 1
+    integrated_gradients_internal_batch_size: int | None = None
+    integrated_gradients_reduce: str = "l2"
+    integrated_gradients_grad_through_norm: bool = True
+
+
+_FORECASTING_CONFIG_FIELDS = frozenset(field.name for field in fields(ForecastingConfig))
+
+
+def load_forecasting_config(config_path: str | Path) -> ForecastingConfig:
+    """Load and validate a :class:`ForecastingConfig` from YAML.
+
+    The YAML may be a flat mapping or contain a top-level ``inference`` mapping,
+    which allows the TAO specification to carry dataset and training sections.
+    """
+    with open(config_path) as f:
+        raw_config = yaml.safe_load(f) or {}
+
+    if not isinstance(raw_config, dict):
+        raise ValueError(f"Forecasting inference config must be a mapping, got {type(raw_config).__name__}.")
+
+    config = raw_config.get("inference", raw_config)
+    if config is None:
+        return ForecastingConfig()
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"Forecasting inference config 'inference' section must be a mapping, got {type(config).__name__}."
+        )
+
+    unknown_keys = sorted(set(config) - _FORECASTING_CONFIG_FIELDS)
+    if unknown_keys:
+        allowed = ", ".join(sorted(_FORECASTING_CONFIG_FIELDS))
+        raise ValueError(f"Unknown forecasting inference config keys: {unknown_keys}. Allowed keys: {allowed}")
+
+    values = dict(config)
+    for artifact_field in ("standardizer_pkl", "ckpt"):
+        if artifact_field in values and not values[artifact_field]:
+            logger.warning(
+                "Forecasting config has an empty '%s'; falling back to default %r.",
+                artifact_field,
+                getattr(ForecastingConfig(), artifact_field),
+            )
+            values.pop(artifact_field, None)
+    return ForecastingConfig(**values)
+
+
+def _resolve_forecasting_config(
+    config: ForecastingConfig | str | Path | None,
+) -> ForecastingConfig:
+    if config is None:
+        resolved = ForecastingConfig()
+    elif isinstance(config, ForecastingConfig):
+        resolved = config
+    elif isinstance(config, (str, Path)):
+        resolved = load_forecasting_config(config)
+    else:
+        raise TypeError("config must be a ForecastingConfig, YAML path, or None")
+
+    artifact_defaults = ForecastingConfig()
+    artifact_updates = {}
+    for name in ("standardizer_pkl", "ckpt"):
+        if not getattr(resolved, name):
+            default_value = getattr(artifact_defaults, name)
+            logger.warning(
+                "Forecasting config has an empty '%s'; falling back to default %r.",
+                name,
+                default_value,
+            )
+            artifact_updates[name] = default_value
+    return replace(resolved, **artifact_updates) if artifact_updates else resolved
 
 
 def _checkpoint_uses_cross_channel(state: dict) -> bool:
@@ -2417,54 +2530,10 @@ def _run_interpretability(
 
 
 def perform_forecasting(
-    # Input data
     df: pd.DataFrame,
-    timestamp_column: str = "timestamp",
-    target_column: str = "target",
+    *,
+    config: ForecastingConfig | str | Path | None = None,
     context_df: pd.DataFrame | None = None,  # Optional context DataFrame for DARR mode
-    # Model configuration - Replace with your own paths for the weights and standardizer
-    standardizer_pkl: str = "standardizer.pkl",
-    ckpt: str = CHECKPOINT_CROSS_CHANNEL,
-    seq_len: int = 512,
-    forecast_horizon: int = 72,
-    model_horizon: int = 72,  # Override with other weights' values if needed
-    # Output configuration
-    save_preds: str | None = None,
-    # DARR mode configuration
-    alpha: float = 0.01,
-    # Additional parameters (with sensible defaults)
-    model_name: str = DEFAULT_BACKBONE_NAME,
-    batch_size: int = 8,
-    num_workers: int = 2,
-    stride: int | None = None,
-    context_stride: int | None = None,
-    seed: int = 13,
-    k: int = 64,
-    temperature: float = 0.05,
-    device: str | None = None,
-    local_files_only: bool = False,
-    use_cross_channel: bool = True,
-    cross_channel_heads: int = 8,
-    cross_channel_dropout: float = 0.1,
-    # Interpretability configuration
-    interpretability: bool = False,
-    interpretability_output: str | None = None,  # "json", "pdf", or None (both)
-    interpretability_out_dir: str | Path = "interpretability_output",
-    interpretability_run_name: str | None = None,
-    interpretability_top_k: int = 5,
-    interpretability_dataset_name: str | None = None,
-    n_lags: int = 128,
-    softmax_tau: float = 1.0,
-    channel_output_aware: bool = False,
-    integrated_gradients: bool = False,
-    integrated_gradients_baseline: Any = "noise",
-    integrated_gradients_steps: int = 64,
-    integrated_gradients_n_baselines: int = 1,
-    integrated_gradients_internal_batch_size: int | None = None,
-    integrated_gradients_reduce: str = "l2",
-    integrated_gradients_grad_through_norm: bool = True,
-    # Output configuration
-    return_all_channels: bool = False,  # When True, emit one {col}_forecast per feature column
 ) -> pd.DataFrame:
     """
     Perform time series forecasting using NV-Tesseract with optional context-enhanced mode (DARR).
@@ -2477,80 +2546,86 @@ def perform_forecasting(
     then the remaining numeric feature columns) instead of only
     ``{target_column}_forecast``. This also applies to interpretability mode.
     """
-    # Set model_horizon to forecast_horizon if not specified
-    if model_horizon is None:
-        model_horizon = forecast_horizon
+    cfg = _resolve_forecasting_config(config)
+
+    # Keep locals only for values resolved or transformed during this run.
+    standardizer_pkl = cfg.standardizer_pkl
+    ckpt = cfg.ckpt
+    model_horizon = cfg.model_horizon if cfg.model_horizon is not None else cfg.forecast_horizon
+    stride = cfg.stride if cfg.stride is not None else model_horizon
+    context_stride = cfg.context_stride if cfg.context_stride is not None else model_horizon
+    device = DEVICE if cfg.device is None else torch.device(cfg.device)
 
     # Validate that model_horizon is reasonable
     if model_horizon <= 0:
         raise ValueError(f"model_horizon must be positive, got {model_horizon}")
 
-    if forecast_horizon <= 0:
-        raise ValueError(f"forecast_horizon must be positive, got {forecast_horizon}")
+    if cfg.forecast_horizon <= 0:
+        raise ValueError(f"forecast_horizon must be positive, got {cfg.forecast_horizon}")
 
     # Maximum forecast horizon limit
     MAX_FORECAST_HORIZON = 512
-    if forecast_horizon > MAX_FORECAST_HORIZON:
-        raise ValueError(f"forecast_horizon must be <= {MAX_FORECAST_HORIZON}, got {forecast_horizon}")
+    if cfg.forecast_horizon > MAX_FORECAST_HORIZON:
+        raise ValueError(f"forecast_horizon must be <= {MAX_FORECAST_HORIZON}, got {cfg.forecast_horizon}")
 
     # The model's native horizon limits direct predictions, but DARR retrieves
     # observed continuations from context data. Keep the existing native-sized
     # context windows for shorter requests while retaining the full retrieval
     # trajectory whenever callers ask for a longer forecast.
-    darr_context_horizon = max(model_horizon, forecast_horizon)
+    darr_context_horizon = max(model_horizon, cfg.forecast_horizon)
 
     # Input validation
     if df is None or df.empty:
         raise ValueError("Input DataFrame is required and cannot be empty")
 
     # Validate minimum rows
-    if len(df) < seq_len:
-        raise ValueError(f"DataFrame has {len(df)} rows but seq_len requires at least {seq_len} rows")
+    if len(df) < cfg.seq_len:
+        raise ValueError(f"DataFrame has {len(df)} rows but seq_len requires at least {cfg.seq_len} rows")
 
     # Validate timestamp column
-    if timestamp_column not in df.columns:
-        raise ValueError(f"Timestamp column '{timestamp_column}' not found in DataFrame")
+    if cfg.timestamp_column not in df.columns:
+        raise ValueError(f"Timestamp column '{cfg.timestamp_column}' not found in DataFrame")
 
-    if df[timestamp_column].isnull().any():
-        raise ValueError(f"Timestamp column '{timestamp_column}' contains NULL values")
+    if df[cfg.timestamp_column].isnull().any():
+        raise ValueError(f"Timestamp column '{cfg.timestamp_column}' contains NULL values")
 
     # Try to convert timestamp column to datetime if it's not already
     working_df = df.copy()
     try:
-        if not pd.api.types.is_datetime64_any_dtype(working_df[timestamp_column]):
-            working_df[timestamp_column] = pd.to_datetime(working_df[timestamp_column])
+        if not pd.api.types.is_datetime64_any_dtype(working_df[cfg.timestamp_column]):
+            working_df[cfg.timestamp_column] = pd.to_datetime(working_df[cfg.timestamp_column])
     except Exception as e:
-        raise ValueError(f"Cannot parse timestamp column '{timestamp_column}' as datetime: {e}")
+        raise ValueError(f"Cannot parse timestamp column '{cfg.timestamp_column}' as datetime: {e}")
 
     # Validate target column
-    if target_column not in df.columns:
-        raise ValueError(f"Target column '{target_column}' not found in DataFrame")
+    if cfg.target_column not in df.columns:
+        raise ValueError(f"Target column '{cfg.target_column}' not found in DataFrame")
 
     # Check if target column is numeric
-    if not pd.api.types.is_numeric_dtype(working_df[target_column]):
-        raise ValueError(f"Target column '{target_column}' must contain numeric values")
+    if not pd.api.types.is_numeric_dtype(working_df[cfg.target_column]):
+        raise ValueError(f"Target column '{cfg.target_column}' must contain numeric values")
 
     # Handle NULL values in target column - fill with zeros
-    if working_df[target_column].isnull().any():
-        logger.warning("Found NULL values in '%s', filling with zeros", target_column)
-        working_df[target_column] = working_df[target_column].fillna(0)
+    if working_df[cfg.target_column].isnull().any():
+        logger.warning("Found NULL values in '%s', filling with zeros", cfg.target_column)
+        working_df[cfg.target_column] = working_df[cfg.target_column].fillna(0)
 
     # Automatically detect all numeric columns to use as features
     numeric_columns = working_df.select_dtypes(include=[np.number]).columns.tolist()
 
     # Make sure target column is first in the list
-    if target_column in numeric_columns:
-        numeric_columns.remove(target_column)
-    columns_to_process = [target_column] + numeric_columns
+    if cfg.target_column in numeric_columns:
+        numeric_columns.remove(cfg.target_column)
+    columns_to_process = [cfg.target_column] + numeric_columns
 
     # return_all_channels emits one {column}_forecast per channel; reject a
     # timestamp column name that would collide with one of them, since the
     # collision would silently overwrite the timestamp column in the output.
-    if return_all_channels:
-        colliding = [c for c in columns_to_process if f"{c}_forecast" == timestamp_column]
+    if cfg.return_all_channels:
+        colliding = [c for c in columns_to_process if f"{c}_forecast" == cfg.timestamp_column]
         if colliding:
             raise ValueError(
-                f"timestamp_column {timestamp_column!r} collides with the forecast column "
+                f"timestamp_column {cfg.timestamp_column!r} collides with the forecast column "
                 f"emitted for input column {colliding[0]!r}; rename one of them"
             )
 
@@ -2560,26 +2635,13 @@ def perform_forecasting(
             logger.warning("Found NULL values in '%s', filling with zeros", col)
             working_df[col] = working_df[col].fillna(0)
 
-    # Set default values
-    # Use model_horizon for strides to ensure consistent context memory regardless of forecast_horizon
-    if stride is None:
-        stride = model_horizon
-    if context_stride is None:
-        context_stride = model_horizon
-
-    # Set device
-    if device is None:
-        device = DEVICE
-    else:
-        device = torch.device(device)
-
     # Set random seed
-    control_randomness(seed=seed)
+    control_randomness(seed=cfg.seed)
 
     # For the two published checkpoints, resolve the right one from use_cross_channel.
     # Custom paths are left untouched — state dict inspection in _load_cached_model handles them.
     if ckpt in _KNOWN_CHECKPOINTS:
-        ckpt = CHECKPOINT_CROSS_CHANNEL if use_cross_channel else CHECKPOINT_BASE
+        ckpt = CHECKPOINT_CROSS_CHANNEL if cfg.use_cross_channel else CHECKPOINT_BASE
 
     # Auto-download model weights if they don't exist
     try:
@@ -2591,7 +2653,7 @@ def perform_forecasting(
     # Determine mode
     if context_df is not None:
         mode = "darr"
-        logger.info("Using DARR mode (Context-Enhanced Forecasting) with alpha=%s", alpha)
+        logger.info("Using DARR mode (Context-Enhanced Forecasting) with alpha=%s", cfg.alpha)
     else:
         mode = "standard"
         logger.info("Using standard forecasting mode (inference only)")
@@ -2606,8 +2668,8 @@ def perform_forecasting(
         temp_test_csv = _create_temp_csv_path("nv_tesseract_test_")
 
         # Save only the necessary columns (timestamp + value columns)
-        csv_df = working_df[[timestamp_column] + columns_to_process].copy()
-        csv_df.rename(columns={timestamp_column: "timestamp"}, inplace=True)
+        csv_df = working_df[[cfg.timestamp_column] + columns_to_process].copy()
+        csv_df.rename(columns={cfg.timestamp_column: "timestamp"}, inplace=True)
         csv_df.to_csv(temp_test_csv, index=False)
         test_csv_path = temp_test_csv
 
@@ -2616,19 +2678,19 @@ def perform_forecasting(
             temp_context_csv = _create_temp_csv_path("nv_tesseract_context_")
 
             # Validate context DataFrame columns
-            if timestamp_column not in context_df.columns:
-                raise ValueError(f"Context DataFrame missing timestamp column '{timestamp_column}'")
+            if cfg.timestamp_column not in context_df.columns:
+                raise ValueError(f"Context DataFrame missing timestamp column '{cfg.timestamp_column}'")
 
-            if target_column not in context_df.columns:
-                raise ValueError(f"Context DataFrame missing target column '{target_column}'")
+            if cfg.target_column not in context_df.columns:
+                raise ValueError(f"Context DataFrame missing target column '{cfg.target_column}'")
 
             # Validate context DataFrame has enough rows for at least one window
-            min_context_rows = seq_len + darr_context_horizon
+            min_context_rows = cfg.seq_len + darr_context_horizon
             if len(context_df) < min_context_rows:
                 raise ValueError(
                     f"Context DataFrame has {len(context_df)} rows but requires at least "
                     f"{min_context_rows} rows "
-                    f"(seq_len={seq_len} + context_horizon={darr_context_horizon})"
+                    f"(seq_len={cfg.seq_len} + context_horizon={darr_context_horizon})"
                 )
 
             # Process context DataFrame similarly to main DataFrame
@@ -2636,17 +2698,17 @@ def perform_forecasting(
 
             # Convert timestamp if needed
             try:
-                if not pd.api.types.is_datetime64_any_dtype(context_working[timestamp_column]):
-                    context_working[timestamp_column] = pd.to_datetime(context_working[timestamp_column])
+                if not pd.api.types.is_datetime64_any_dtype(context_working[cfg.timestamp_column]):
+                    context_working[cfg.timestamp_column] = pd.to_datetime(context_working[cfg.timestamp_column])
             except Exception as e:
-                raise ValueError(f"Cannot parse context timestamp column '{timestamp_column}' as datetime: {e}")
+                raise ValueError(f"Cannot parse context timestamp column '{cfg.timestamp_column}' as datetime: {e}")
 
             # Get numeric columns from context DataFrame
             context_numeric = context_working.select_dtypes(include=[np.number]).columns.tolist()
 
             # Ensure target column is included
-            if target_column in context_numeric:
-                context_numeric.remove(target_column)
+            if cfg.target_column in context_numeric:
+                context_numeric.remove(cfg.target_column)
 
             # COLUMN COMPATIBILITY CHECK AND ALIGNMENT
             # Common feature columns in input-DataFrame order (target excluded;
@@ -2657,7 +2719,7 @@ def perform_forecasting(
             # match, common_columns == context_numeric).
             context_numeric_set = set(context_numeric)
             common_columns = [col for col in numeric_columns if col in context_numeric_set]
-            context_columns_to_use = [timestamp_column, target_column] + common_columns
+            context_columns_to_use = [cfg.timestamp_column, cfg.target_column] + common_columns
 
             # Realign whenever the context column list differs from the input
             # list. A set comparison is not enough: the same columns in a
@@ -2691,14 +2753,14 @@ def perform_forecasting(
 
                     # The channel set narrowed: rewrite the main CSV in the same
                     # canonical order as the context CSV.
-                    columns_to_process = [target_column] + common_columns
-                    csv_df = working_df[[timestamp_column] + columns_to_process].copy()
-                    csv_df.rename(columns={timestamp_column: "timestamp"}, inplace=True)
+                    columns_to_process = [cfg.target_column] + common_columns
+                    csv_df = working_df[[cfg.timestamp_column] + columns_to_process].copy()
+                    csv_df.rename(columns={cfg.timestamp_column: "timestamp"}, inplace=True)
                     csv_df.to_csv(temp_test_csv, index=False)
 
             # Create CSV with selected columns
             context_csv_df = context_working[context_columns_to_use].copy()
-            context_csv_df.rename(columns={timestamp_column: "timestamp"}, inplace=True)
+            context_csv_df.rename(columns={cfg.timestamp_column: "timestamp"}, inplace=True)
 
             # Fill NULLs in context data
             for col in context_csv_df.columns:
@@ -2713,7 +2775,7 @@ def perform_forecasting(
         standardizer = _load_standardizer_artifact(standardizer_pkl)
 
         # ALWAYS use InferenceOnlyDataset for the main test data
-        test_dataset = InferenceOnlyDataset(csv_path=test_csv_path, seq_len=seq_len, standardizer=standardizer)
+        test_dataset = InferenceOnlyDataset(csv_path=test_csv_path, seq_len=cfg.seq_len, standardizer=standardizer)
 
         test_loader = DataLoader(
             test_dataset,
@@ -2724,15 +2786,15 @@ def perform_forecasting(
         )
 
         model = _load_cached_model(
-            model_name=model_name,
+            model_name=cfg.model_name,
             ckpt=ckpt,
-            seq_len=seq_len,
+            seq_len=cfg.seq_len,
             model_horizon=model_horizon,
             device=device,
-            local_files_only=local_files_only,
-            use_cross_channel=use_cross_channel,
-            cross_channel_heads=cross_channel_heads,
-            cross_channel_dropout=cross_channel_dropout,
+            local_files_only=cfg.local_files_only,
+            use_cross_channel=cfg.use_cross_channel,
+            cross_channel_heads=cfg.cross_channel_heads,
+            cross_channel_dropout=cfg.cross_channel_dropout,
         )
 
         # Interpretability path: produce explanation artifacts (heatmap, top-k
@@ -2740,40 +2802,40 @@ def perform_forecasting(
         # comes from the explanation's baseline (single forward pass, no AR
         # rollout) so that the persisted forecast.csv aligns 1:1 with the
         # attribution matrix.
-        if interpretability:
+        if cfg.interpretability:
             result_df, run_dir = _run_interpretability(
                 model=model,
                 standardizer=standardizer,
                 working_df=working_df,
                 columns_to_process=columns_to_process,
-                timestamp_column=timestamp_column,
-                target_column=target_column,
-                seq_len=seq_len,
-                forecast_horizon=forecast_horizon,
+                timestamp_column=cfg.timestamp_column,
+                target_column=cfg.target_column,
+                seq_len=cfg.seq_len,
+                forecast_horizon=cfg.forecast_horizon,
                 model_horizon=model_horizon,
                 device=device,
-                n_lags=n_lags,
-                softmax_tau=softmax_tau,
-                interpretability_output=interpretability_output,
-                interpretability_out_dir=interpretability_out_dir,
-                interpretability_run_name=interpretability_run_name,
-                interpretability_top_k=interpretability_top_k,
-                dataset_name=interpretability_dataset_name,
-                channel_output_aware=channel_output_aware,
-                return_all_channels=return_all_channels,
-                integrated_gradients=integrated_gradients,
-                integrated_gradients_baseline=integrated_gradients_baseline,
-                integrated_gradients_steps=integrated_gradients_steps,
-                integrated_gradients_n_baselines=integrated_gradients_n_baselines,
-                integrated_gradients_internal_batch_size=integrated_gradients_internal_batch_size,
-                integrated_gradients_reduce=integrated_gradients_reduce,
-                integrated_gradients_seed=seed,
-                integrated_gradients_grad_through_norm=integrated_gradients_grad_through_norm,
+                n_lags=cfg.n_lags,
+                softmax_tau=cfg.softmax_tau,
+                interpretability_output=cfg.interpretability_output,
+                interpretability_out_dir=cfg.interpretability_out_dir,
+                interpretability_run_name=cfg.interpretability_run_name,
+                interpretability_top_k=cfg.interpretability_top_k,
+                dataset_name=cfg.interpretability_dataset_name,
+                channel_output_aware=cfg.channel_output_aware,
+                return_all_channels=cfg.return_all_channels,
+                integrated_gradients=cfg.integrated_gradients,
+                integrated_gradients_baseline=cfg.integrated_gradients_baseline,
+                integrated_gradients_steps=cfg.integrated_gradients_steps,
+                integrated_gradients_n_baselines=cfg.integrated_gradients_n_baselines,
+                integrated_gradients_internal_batch_size=cfg.integrated_gradients_internal_batch_size,
+                integrated_gradients_reduce=cfg.integrated_gradients_reduce,
+                integrated_gradients_seed=cfg.seed,
+                integrated_gradients_grad_through_norm=cfg.integrated_gradients_grad_through_norm,
             )
             logger.info("Interpretability bundle written to: %s", run_dir)
-            if save_preds:
-                result_df.to_csv(save_preds, index=False)
-                logger.info("Saved predictions to %s", save_preds)
+            if cfg.save_preds:
+                result_df.to_csv(cfg.save_preds, index=False)
+                logger.info("Saved predictions to %s", cfg.save_preds)
             return result_df
 
         # Perform inference based on mode
@@ -2786,7 +2848,7 @@ def perform_forecasting(
             context_dataset = CSVLongHorizonSimpleDataset(
                 csv_path=context_csv_path,
                 data_split="train",
-                seq_len=seq_len,
+                seq_len=cfg.seq_len,
                 forecast_horizon=darr_context_horizon,
                 standardizer=None,
                 standardize=False,
@@ -2796,7 +2858,7 @@ def perform_forecasting(
             context_dataset.series = context_dataset.standardizer.transform(context_dataset.values)
 
             context_loader = DataLoader(
-                context_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
+                context_dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True
             )
 
             # Build context memory with observed continuations long enough for
@@ -2824,7 +2886,7 @@ def perform_forecasting(
 
                 # Direct prediction with autoregressive extension if needed
                 batch_preds = autoregressive_forecast(
-                    model, timeseries, input_mask, model_horizon, forecast_horizon, standardizer, device
+                    model, timeseries, input_mask, model_horizon, cfg.forecast_horizon, standardizer, device
                 )
                 preds_direct.append(batch_preds)
 
@@ -2835,8 +2897,8 @@ def perform_forecasting(
             preds_direct = np.concatenate(preds_direct, axis=0)
 
             # kNN retrieval forecast
-            preds_knn = knn_forecast(DB_E, DB_Y, Q_E, k=k, temperature=temperature)
-            preds_knn = preds_knn[:, :, :forecast_horizon]
+            preds_knn = knn_forecast(DB_E, DB_Y, Q_E, k=cfg.k, temperature=cfg.temperature)
+            preds_knn = preds_knn[:, :, : cfg.forecast_horizon]
 
             # Validate shapes before combining predictions
             if preds_direct.shape != preds_knn.shape:
@@ -2849,7 +2911,7 @@ def perform_forecasting(
                 )
 
             # Hybrid predictions
-            preds_hybrid = alpha * preds_direct + (1 - alpha) * preds_knn
+            preds_hybrid = cfg.alpha * preds_direct + (1 - cfg.alpha) * preds_knn
 
             # Use hybrid as main predictions
             preds = preds_hybrid
@@ -2864,7 +2926,7 @@ def perform_forecasting(
 
                 # Autoregressive forecast
                 batch_preds = autoregressive_forecast(
-                    model, timeseries, input_mask, model_horizon, forecast_horizon, standardizer, device
+                    model, timeseries, input_mask, model_horizon, cfg.forecast_horizon, standardizer, device
                 )
                 preds.append(batch_preds)
 
@@ -2880,15 +2942,15 @@ def perform_forecasting(
         P_orig_reshaped = P_orig.reshape(B * H, C).reshape(B, H, C).transpose(0, 2, 1)
 
         # Infer frequency from timestamp column
-        time_diffs = working_df[timestamp_column].diff().dropna()
+        time_diffs = working_df[cfg.timestamp_column].diff().dropna()
         if len(time_diffs) > 0:
             inferred_freq = time_diffs.mode()[0] if len(time_diffs.mode()) > 0 else time_diffs.median()
         else:
             inferred_freq = pd.Timedelta(hours=1)
 
-        last_input_time = working_df[timestamp_column].iloc[-1]
+        last_input_time = working_df[cfg.timestamp_column].iloc[-1]
         forecast_timestamps = pd.date_range(
-            start=last_input_time + inferred_freq, periods=forecast_horizon, freq=inferred_freq
+            start=last_input_time + inferred_freq, periods=cfg.forecast_horizon, freq=inferred_freq
         )
 
         # Emit the target channel only (default), or one {column}_forecast per
@@ -2898,16 +2960,16 @@ def perform_forecasting(
         # numeric features in input-column order). The backbone predicts every
         # channel anyway, so emitting them all avoids re-running the SDK once
         # per column (V calls -> 1) for multivariate use cases.
-        output_channels = columns_to_process if return_all_channels else [target_column]
-        cols = {timestamp_column: forecast_timestamps}
+        output_channels = columns_to_process if cfg.return_all_channels else [cfg.target_column]
+        cols = {cfg.timestamp_column: forecast_timestamps}
         for ch_idx, channel_name in enumerate(output_channels):
-            cols[f"{channel_name}_forecast"] = P_orig_reshaped[0, ch_idx, :forecast_horizon].tolist()
+            cols[f"{channel_name}_forecast"] = P_orig_reshaped[0, ch_idx, : cfg.forecast_horizon].tolist()
         result_df = pd.DataFrame(cols)
 
         # Save predictions if requested
-        if save_preds:
-            result_df.to_csv(save_preds, index=False)
-            logger.info("Saved predictions to %s", save_preds)
+        if cfg.save_preds:
+            result_df.to_csv(cfg.save_preds, index=False)
+            logger.info("Saved predictions to %s", cfg.save_preds)
 
         if mode == "darr":
             logger.info("%s", "\n" + "=" * 60)
@@ -2991,6 +3053,17 @@ class NVTesseractForecasting(
         shutil.copy2(self.standardizer_pkl, save_directory / Path(self.standardizer_pkl).name)
         shutil.copy2(self.ckpt, save_directory / Path(self.ckpt).name)
 
-    def forecast(self, df: "pd.DataFrame", **kwargs) -> "pd.DataFrame":
-        """Run forecasting. All keyword args are forwarded to ``perform_forecasting``."""
-        return perform_forecasting(df, standardizer_pkl=self.standardizer_pkl, ckpt=self.ckpt, **kwargs)
+    def forecast(
+        self,
+        df: "pd.DataFrame",
+        *,
+        config: "ForecastingConfig | str | Path | None" = None,
+        context_df: "pd.DataFrame | None" = None,
+    ) -> "pd.DataFrame":
+        """Forecast a DataFrame using this instance's artifacts."""
+        resolved = replace(
+            _resolve_forecasting_config(config),
+            standardizer_pkl=self.standardizer_pkl,
+            ckpt=self.ckpt,
+        )
+        return perform_forecasting(df, config=resolved, context_df=context_df)

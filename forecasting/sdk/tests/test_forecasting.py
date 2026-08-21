@@ -7,13 +7,29 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
+import sdk
 import torch
 from sdk import forecasting
+
+
+def perform_forecasting(
+    df: pd.DataFrame,
+    *,
+    config=None,
+    context_df: pd.DataFrame | None = None,
+    **options,
+) -> pd.DataFrame:
+    """Exercise the config-first API while keeping individual tests concise."""
+    assert config is None or not options
+    resolved = forecasting.ForecastingConfig(**options) if config is None else config
+    return forecasting.perform_forecasting(df, config=resolved, context_df=context_df)
 
 
 class DummyModel:
@@ -139,7 +155,7 @@ def make_timeseries_with_columns(num_rows: int = 10, columns: list[str] | None =
 
 def test_perform_forecasting_generates_forecast_when_horizon_exceeds_model_horizon():
     df = make_timeseries(num_rows=10)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -173,7 +189,7 @@ def test_perform_forecasting_uses_distinct_temp_csvs_for_concurrent_calls(monkey
 
     def invoke(_):
         with pytest.raises(StopAfterTempCsvError):
-            forecasting.perform_forecasting(
+            perform_forecasting(
                 make_timeseries(num_rows=10),
                 seq_len=5,
                 forecast_horizon=2,
@@ -209,7 +225,7 @@ def test_perform_forecasting_uses_and_cleans_owned_temp_csvs(monkeypatch, tmp_pa
 
     monkeypatch.setattr(forecasting, "_create_temp_csv_path", create_temp_csv_path)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         make_timeseries(num_rows=10),
         context_df=make_timeseries(num_rows=10) if with_context else None,
         seq_len=5,
@@ -233,7 +249,7 @@ def test_perform_forecasting_uses_cross_channel_model_when_checkpoint_contains_w
     )
 
     df = make_timeseries(num_rows=10)
-    forecasting.perform_forecasting(
+    perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -252,7 +268,7 @@ def test_perform_forecasting_uses_cross_channel_model_when_checkpoint_contains_w
 def test_perform_forecasting_disables_cross_channel_when_checkpoint_has_no_weights(caplog, patch_external_dependencies):
     df = make_timeseries(num_rows=10)
     with caplog.at_level(logging.WARNING):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=3,
@@ -275,7 +291,7 @@ def test_perform_forecasting_enables_cross_channel_when_checkpoint_has_weights(
 
     df = make_timeseries(num_rows=10)
     with caplog.at_level(logging.WARNING):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=3,
@@ -351,7 +367,7 @@ def test_load_cached_model_rejects_missing_keys(monkeypatch):
 
 def test_perform_forecasting_allows_cross_channel_configuration_override(patch_external_dependencies):
     df = make_timeseries(num_rows=10)
-    forecasting.perform_forecasting(
+    perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -378,7 +394,7 @@ def test_perform_forecasting_return_all_channels_emits_per_channel_forecasts(mon
     forecasting.clear_model_cache()
 
     df = make_timeseries(num_rows=10)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -401,7 +417,7 @@ def test_perform_forecasting_return_all_channels_emits_per_channel_forecasts(mon
 
 def test_perform_forecasting_return_all_channels_with_autoregressive_horizon():
     df = make_timeseries(num_rows=10)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=6,
@@ -421,7 +437,7 @@ def test_perform_forecasting_return_all_channels_with_autoregressive_horizon():
 def test_perform_forecasting_return_all_channels_darr_mode():
     df = make_timeseries(num_rows=12)
     context_df = make_timeseries(num_rows=12)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -452,7 +468,7 @@ def test_perform_forecasting_return_all_channels_supports_interpretability(monke
 
     monkeypatch.setattr(forecasting, "_run_interpretability", run_interpretability)
     df = make_timeseries(num_rows=10)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -469,18 +485,18 @@ def test_perform_forecasting_return_all_channels_supports_interpretability(monke
 def test_interpretability_sdk_defaults_match_algorithms():
     from integrated_gradients import integrated_gradients_embedding
 
-    sdk_params = inspect.signature(forecasting.perform_forecasting).parameters
+    config = forecasting.ForecastingConfig()
     explain_params = inspect.signature(forecasting.explain_forecast).parameters
     ig_params = inspect.signature(integrated_gradients_embedding).parameters
 
-    assert sdk_params["n_lags"].default == explain_params["n_lags"].default
-    assert sdk_params["softmax_tau"].default == explain_params["softmax_tau"].default
-    assert sdk_params["channel_output_aware"].default == explain_params["channel_output_aware"].default
-    assert sdk_params["integrated_gradients_baseline"].default == ig_params["baseline"].default
-    assert sdk_params["integrated_gradients_steps"].default == ig_params["n_steps"].default
-    assert sdk_params["integrated_gradients_n_baselines"].default == ig_params["n_baselines"].default
-    assert sdk_params["integrated_gradients_internal_batch_size"].default == ig_params["internal_batch_size"].default
-    assert sdk_params["integrated_gradients_reduce"].default == ig_params["reduce"].default
+    assert config.n_lags == explain_params["n_lags"].default
+    assert config.softmax_tau == explain_params["softmax_tau"].default
+    assert config.channel_output_aware == explain_params["channel_output_aware"].default
+    assert config.integrated_gradients_baseline == ig_params["baseline"].default
+    assert config.integrated_gradients_steps == ig_params["n_steps"].default
+    assert config.integrated_gradients_n_baselines == ig_params["n_baselines"].default
+    assert config.integrated_gradients_internal_batch_size == ig_params["internal_batch_size"].default
+    assert config.integrated_gradients_reduce == ig_params["reduce"].default
 
 
 def test_feature_axis_embedding_stability_csv_contains_complete_report(tmp_path):
@@ -572,7 +588,7 @@ def test_perform_forecasting_forwards_output_aware_mode(monkeypatch, tmp_path):
             "feature": np.linspace(0.0, 1.0, 10, dtype=np.float32),
         }
     )
-    forecasting.perform_forecasting(
+    perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -770,7 +786,7 @@ def test_normalization_statistics_gradient_is_scoped():
 def test_perform_forecasting_return_all_channels_rejects_timestamp_collision():
     df = make_timeseries(num_rows=10).rename(columns={"timestamp": "feature_forecast"})
     with pytest.raises(ValueError, match="collides"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             timestamp_column="feature_forecast",
             seq_len=5,
@@ -785,7 +801,7 @@ def test_perform_forecasting_return_all_channels_rejects_timestamp_collision():
 def test_perform_forecasting_requires_timestamp_column():
     df = make_timeseries(num_rows=6).drop(columns=["timestamp"])
     with pytest.raises(ValueError, match="Timestamp column 'timestamp' not found"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -799,7 +815,7 @@ def test_perform_forecasting_requires_numeric_target():
     df = make_timeseries(num_rows=6)
     df["target"] = df["target"].astype(str)
     with pytest.raises(ValueError, match="Target column 'target' must contain numeric values"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -812,7 +828,7 @@ def test_perform_forecasting_requires_numeric_target():
 def test_perform_forecasting_validates_forecast_horizon():
     df = make_timeseries(num_rows=6)
     with pytest.raises(ValueError, match="forecast_horizon must be positive"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=0,
@@ -826,7 +842,7 @@ def test_perform_forecasting_rejects_forecast_horizon_above_max():
     """forecast_horizon above 512 should raise ValueError."""
     df = make_timeseries(num_rows=520)
     with pytest.raises(ValueError, match="forecast_horizon must be <= 512"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=513,
@@ -839,7 +855,7 @@ def test_perform_forecasting_rejects_forecast_horizon_above_max():
 def test_perform_forecasting_accepts_max_forecast_horizon():
     """forecast_horizon of exactly 512 should be accepted."""
     df = make_timeseries(num_rows=520)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=512,
@@ -857,7 +873,7 @@ def test_perform_forecasting_darr_mode_rejects_forecast_horizon_above_max():
     df = make_timeseries(num_rows=520)
     context_df = make_timeseries(num_rows=520)
     with pytest.raises(ValueError, match="forecast_horizon must be <= 512"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=600,
@@ -871,7 +887,7 @@ def test_perform_forecasting_darr_mode_rejects_forecast_horizon_above_max():
 def test_perform_forecasting_validates_model_horizon():
     df = make_timeseries(num_rows=6)
     with pytest.raises(ValueError, match="model_horizon must be positive"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=0,
@@ -884,7 +900,7 @@ def test_perform_forecasting_validates_model_horizon():
 def test_perform_forecasting_requires_minimum_rows():
     df = make_timeseries(num_rows=4)
     with pytest.raises(ValueError, match="DataFrame has 4 rows but seq_len requires at least 5 rows"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -898,7 +914,7 @@ def test_perform_forecasting_context_df_missing_timestamp():
     df = make_timeseries(num_rows=7)
     context_df = make_timeseries(num_rows=7).drop(columns=["timestamp"])
     with pytest.raises(ValueError, match="Context DataFrame missing timestamp column 'timestamp'"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -913,7 +929,7 @@ def test_perform_forecasting_darr_mode_returns_hybrid_forecast():
     """DARR mode returns hybrid forecast combining direct and kNN predictions."""
     df = make_timeseries(num_rows=10)
     context_df = make_timeseries(num_rows=10)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -936,7 +952,7 @@ def test_perform_forecasting_darr_mode_with_custom_alpha():
     context_df = make_timeseries(num_rows=10)
 
     # Test with alpha=0.5 (50% direct, 50% kNN)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -957,7 +973,7 @@ def test_perform_forecasting_darr_mode_with_alpha_zero():
     df = make_timeseries(num_rows=10)
     context_df = make_timeseries(num_rows=10)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -978,7 +994,7 @@ def test_perform_forecasting_darr_mode_with_alpha_one():
     df = make_timeseries(num_rows=10)
     context_df = make_timeseries(num_rows=10)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -999,7 +1015,7 @@ def test_perform_forecasting_darr_mode_forecast_horizon_smaller_than_model_horiz
     df = make_timeseries(num_rows=10)
     context_df = make_timeseries(num_rows=10)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,  # Smaller than model_horizon
@@ -1019,7 +1035,7 @@ def test_perform_forecasting_darr_mode_forecast_horizon_equals_model_horizon():
     df = make_timeseries(num_rows=10)
     context_df = make_timeseries(num_rows=10)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -1039,7 +1055,7 @@ def test_perform_forecasting_darr_mode_forecast_horizon_larger_than_model_horizo
     df = make_timeseries(num_rows=12)
     context_df = make_timeseries(num_rows=12)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=6,  # Larger than model_horizon
@@ -1059,7 +1075,7 @@ def test_perform_forecasting_darr_mode_retrieves_full_requested_horizon():
     df = make_timeseries(num_rows=12)
     context_df = make_timeseries(num_rows=12)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=6,
@@ -1081,7 +1097,7 @@ def test_perform_forecasting_darr_mode_blends_full_retrieval_horizon():
     df = make_timeseries(num_rows=12)
     context_df = make_timeseries(num_rows=12)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=6,
@@ -1103,7 +1119,7 @@ def test_perform_forecasting_darr_mode_forecast_horizon_much_larger_than_model_h
     df = make_timeseries(num_rows=15)
     context_df = make_timeseries(num_rows=15)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=10,  # 5x model_horizon, requires 5 iterations
@@ -1123,7 +1139,7 @@ def test_perform_forecasting_darr_mode_forecast_horizon_not_multiple_of_model_ho
     df = make_timeseries(num_rows=12)
     context_df = make_timeseries(num_rows=12)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=7,  # Not a multiple of model_horizon (3)
@@ -1141,7 +1157,7 @@ def test_perform_forecasting_darr_mode_forecast_horizon_not_multiple_of_model_ho
 def test_perform_forecasting_requires_target_column():
     df = make_timeseries(num_rows=6).drop(columns=["target"])
     with pytest.raises(ValueError, match="Target column 'target' not found"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -1155,7 +1171,7 @@ def test_perform_forecasting_null_timestamps_rejected():
     df = make_timeseries(num_rows=6)
     df.loc[0, "timestamp"] = pd.NaT
     with pytest.raises(ValueError, match="Timestamp column 'timestamp' contains NULL values"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -1167,7 +1183,7 @@ def test_perform_forecasting_null_timestamps_rejected():
 
 def test_perform_forecasting_allows_custom_timestamp_column():
     df = make_timeseries(num_rows=10).rename(columns={"timestamp": "ts"})
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         timestamp_column="ts",
         seq_len=5,
@@ -1184,7 +1200,7 @@ def test_perform_forecasting_allows_custom_timestamp_column():
 def test_perform_forecasting_fills_null_targets():
     df = make_timeseries(num_rows=7)
     df.loc[0, "target"] = np.nan
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -1201,7 +1217,7 @@ def test_perform_forecasting_context_df_missing_target():
     df = make_timeseries(num_rows=7)
     context_df = make_timeseries(num_rows=7).drop(columns=["target"])
     with pytest.raises(ValueError, match="Context DataFrame missing target column 'target'"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -1217,7 +1233,7 @@ def test_perform_forecasting_darr_mode_with_custom_k():
     df = make_timeseries(num_rows=10)
     context_df = make_timeseries(num_rows=10)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -1238,7 +1254,7 @@ def test_perform_forecasting_darr_mode_with_custom_temperature():
     df = make_timeseries(num_rows=10)
     context_df = make_timeseries(num_rows=10)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -1259,7 +1275,7 @@ def test_perform_forecasting_darr_mode_with_larger_context():
     df = make_timeseries(num_rows=10)
     context_df = make_timeseries(num_rows=50)
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -1279,7 +1295,7 @@ def test_perform_forecasting_darr_mode_custom_timestamp_column():
     df = make_timeseries(num_rows=10).rename(columns={"timestamp": "ts"})
     context_df = make_timeseries(num_rows=10).rename(columns={"timestamp": "ts"})
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         timestamp_column="ts",
         seq_len=5,
@@ -1301,7 +1317,7 @@ def test_perform_forecasting_darr_mode_custom_target_column():
     df = make_timeseries(num_rows=10).rename(columns={"target": "value"})
     context_df = make_timeseries(num_rows=10).rename(columns={"target": "value"})
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         target_column="value",
         seq_len=5,
@@ -1324,7 +1340,7 @@ def test_perform_forecasting_darr_mode_context_df_insufficient_rows():
     context_df = make_timeseries(num_rows=6)
 
     with pytest.raises(ValueError, match="Context DataFrame has .* rows but requires at least .* rows"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -1342,7 +1358,7 @@ def test_perform_forecasting_darr_mode_requires_full_retrieval_horizon():
     context_df = make_timeseries(num_rows=10)
 
     with pytest.raises(ValueError, match=r"seq_len=5 \+ context_horizon=6"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=6,
@@ -1362,7 +1378,7 @@ def test_perform_forecasting_darr_mode_column_mismatch_input_more_columns():
     context_df = make_timeseries_with_columns(num_rows=10, columns=["feat1", "feat2"])
 
     # Should succeed by using only common columns
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -1385,7 +1401,7 @@ def test_perform_forecasting_darr_mode_column_mismatch_context_more_columns():
     context_df = make_timeseries_with_columns(num_rows=10, columns=["feat1", "feat2", "feat3", "feat4"])
 
     # Should succeed by using only common columns
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -1408,7 +1424,7 @@ def test_perform_forecasting_darr_mode_column_mismatch_partial_overlap():
     context_df = make_timeseries_with_columns(num_rows=10, columns=["feat2", "feat3", "feat4"])
 
     # Should succeed by using only common columns (feat2, feat3)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -1432,7 +1448,7 @@ def test_perform_forecasting_darr_mode_column_mismatch_no_common_columns():
 
     # Should raise error due to no common columns
     with pytest.raises(ValueError, match="No common numeric columns found between input and context datasets"):
-        forecasting.perform_forecasting(
+        perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=2,
@@ -1452,7 +1468,7 @@ def test_perform_forecasting_darr_mode_column_mismatch_many_vs_few():
     context_df = make_timeseries_with_columns(num_rows=10, columns=["HUFL", "HULL", "MUFL"])
 
     # Should succeed by using only common columns
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=2,
@@ -1475,7 +1491,7 @@ def test_perform_forecasting_darr_mode_column_alignment_with_autoregression():
     context_df = make_timeseries_with_columns(num_rows=12, columns=["feat1", "feat2"])
 
     # Test with autoregressive forecasting (forecast_horizon > model_horizon)
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=6,  # Larger than model_horizon
@@ -1501,7 +1517,7 @@ def test_perform_forecasting_darr_mode_same_columns_different_order(caplog):
     context_df = make_constant_feature_df(12, {"f2": 20.0, "f1": 10.0})
 
     with caplog.at_level(logging.WARNING):
-        result = forecasting.perform_forecasting(
+        result = perform_forecasting(
             df,
             seq_len=5,
             forecast_horizon=3,
@@ -1526,7 +1542,7 @@ def test_perform_forecasting_darr_mode_different_order_return_all_channels_align
     df = make_constant_feature_df(12, {"f1": 10.0, "f2": 20.0})
     context_df = make_constant_feature_df(12, {"f2": 20.0, "f1": 10.0})
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -1553,7 +1569,7 @@ def test_perform_forecasting_darr_mode_column_mismatch_uses_input_order_common_s
     df = make_constant_feature_df(12, {"zz": 30.0, "beta": 20.0, "alpha": 10.0})
     context_df = make_constant_feature_df(12, {"alpha": 10.0, "beta": 20.0})
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -1586,7 +1602,7 @@ def test_perform_forecasting_darr_mode_column_mismatch_direct_predictions_aligne
     df = make_constant_feature_df(12, {"zz": 30.0, "beta": 20.0, "alpha": 10.0})
     context_df = make_constant_feature_df(12, {"alpha": 10.0, "beta": 20.0})
 
-    result = forecasting.perform_forecasting(
+    result = perform_forecasting(
         df,
         seq_len=5,
         forecast_horizon=3,
@@ -1604,3 +1620,147 @@ def test_perform_forecasting_darr_mode_column_mismatch_direct_predictions_aligne
     # each column would carry the other channel's constant.
     assert result["beta_forecast"].tolist() == pytest.approx([20.0, 20.0, 20.0])
     assert result["alpha_forecast"].tolist() == pytest.approx([10.0, 10.0, 10.0])
+
+
+def test_sdk_package_exports_public_api():
+    assert sdk.DEFAULT_BACKBONE_NAME == forecasting.DEFAULT_BACKBONE_NAME
+    assert sdk.CHECKPOINT_CROSS_CHANNEL == forecasting.CHECKPOINT_CROSS_CHANNEL
+    assert sdk.CHECKPOINT_BASE == forecasting.CHECKPOINT_BASE
+    assert sdk.DEVICE == forecasting.DEVICE
+    assert sdk.ForecastingConfig is forecasting.ForecastingConfig
+    assert sdk.download_model_weights is forecasting.download_model_weights
+    assert sdk.load_forecasting_config is forecasting.load_forecasting_config
+    assert sdk.perform_forecasting is forecasting.perform_forecasting
+
+
+def test_perform_forecasting_has_compact_public_signature():
+    assert list(inspect.signature(forecasting.perform_forecasting).parameters) == [
+        "df",
+        "config",
+        "context_df",
+    ]
+
+
+def test_load_forecasting_config_accepts_nested_inference_section(tmp_path):
+    config_path = tmp_path / "forecasting.yaml"
+    config_path.write_text(
+        """
+dataset:
+  csv: ignored_by_sdk_loader.csv
+inference:
+  seq_len: 5
+  forecast_horizon: 3
+  model_horizon: 2
+  use_cross_channel: false
+train:
+  output_dir: ignored_by_sdk_loader
+""",
+        encoding="utf-8",
+    )
+
+    config = forecasting.load_forecasting_config(config_path)
+
+    assert isinstance(config, forecasting.ForecastingConfig)
+    assert config.seq_len == 5
+    assert config.forecast_horizon == 3
+    assert config.model_horizon == 2
+    assert config.use_cross_channel is False
+    assert config.batch_size == 8
+
+
+def test_load_forecasting_config_rejects_unknown_keys(tmp_path):
+    config_path = tmp_path / "forecasting.yaml"
+    config_path.write_text(
+        """
+inference:
+  seq_len: 5
+  typo_horizon: 3
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="typo_horizon"):
+        forecasting.load_forecasting_config(config_path)
+
+
+def test_commented_yaml_template_matches_config_defaults():
+    template_path = Path(forecasting.__file__).with_name("forecasting_inference_config.yaml")
+
+    assert asdict(forecasting.load_forecasting_config(template_path)) == asdict(forecasting.ForecastingConfig())
+
+    previous_content = ""
+    for line in template_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if line.startswith("  ") and not line.startswith("    ") and stripped and not stripped.startswith("#"):
+            assert previous_content.startswith("#"), f"Missing comment for config value: {stripped}"
+        if stripped:
+            previous_content = stripped
+
+
+def test_perform_forecasting_uses_yaml_config_values(monkeypatch, tmp_path, patch_external_dependencies):
+    config_path = tmp_path / "forecasting.yaml"
+    config_path.write_text(
+        """
+inference:
+  standardizer_pkl: fake_std_from_yaml.pkl
+  ckpt: fake_ckpt_from_yaml.pt
+  seq_len: 5
+  forecast_horizon: 3
+  model_horizon: 2
+  seed: 99
+  use_cross_channel: false
+  cross_channel_heads: 4
+  cross_channel_dropout: 0.2
+""",
+        encoding="utf-8",
+    )
+    download_calls = []
+
+    def download_model_weights(*, standardizer_pkl, ckpt, **kwargs):
+        download_calls.append((standardizer_pkl, ckpt))
+        return standardizer_pkl, ckpt
+
+    monkeypatch.setattr(forecasting, "download_model_weights", download_model_weights)
+
+    result = perform_forecasting(
+        make_timeseries(num_rows=10),
+        config=config_path,
+    )
+
+    assert len(result) == 3
+    assert download_calls == [("fake_std_from_yaml.pkl", "fake_ckpt_from_yaml.pt")]
+    assert patch_external_dependencies[0]["forecast_horizon"] == 2
+    assert patch_external_dependencies[0]["use_cross_channel"] is False
+    assert patch_external_dependencies[0]["cross_channel_heads"] == 4
+    assert patch_external_dependencies[0]["cross_channel_dropout"] == 0.2
+
+
+def test_perform_forecasting_treats_empty_yaml_artifact_paths_as_defaults(monkeypatch, tmp_path):
+    config_path = tmp_path / "forecasting.yaml"
+    config_path.write_text(
+        """
+inference:
+  standardizer_pkl: ""
+  ckpt: ""
+  seq_len: 5
+  forecast_horizon: 2
+  model_horizon: 2
+  use_cross_channel: true
+""",
+        encoding="utf-8",
+    )
+    download_calls = []
+
+    def download_model_weights(*, standardizer_pkl, ckpt, **kwargs):
+        download_calls.append((standardizer_pkl, ckpt))
+        return standardizer_pkl, ckpt
+
+    monkeypatch.setattr(forecasting, "download_model_weights", download_model_weights)
+
+    result = perform_forecasting(
+        make_timeseries(num_rows=10),
+        config=config_path,
+    )
+
+    assert len(result) == 2
+    assert download_calls == [("standardizer.pkl", forecasting.CHECKPOINT_CROSS_CHANNEL)]

@@ -33,7 +33,7 @@ Use the same interpreter/venv when you run the examples below.
 
 #### Forecasting
 ```python
-from sdk.forecasting import perform_forecasting
+from sdk.forecasting import ForecastingConfig, perform_forecasting
 import pandas as pd
 import numpy as np
 
@@ -43,25 +43,41 @@ df = pd.DataFrame({
     "feature_a": np.random.randn(600),
 })
 
-forecasts = perform_forecasting(
-    df=df,
+config = ForecastingConfig(
     seq_len=512,
     forecast_horizon=72,
 )
+forecasts = perform_forecasting(df=df, config=config)
 # Returns a DataFrame with `target_forecast` column containing 72 predictions
+```
+
+Forecasting options can also be moved into a YAML file and passed as the typed
+configuration source — a fully commented template is packaged at
+`forecasting/sdk/forecasting_inference_config.yaml`:
+
+```python
+from sdk.forecasting import perform_forecasting
+
+results = perform_forecasting(
+    df=df,
+    config="forecasting/sdk/forecasting_inference_config.yaml",
+)
 ```
 
 #### DARR (Context-Enhanced) Forecasting
 
 ```python
-darr_result = perform_forecasting(
-    df=df,
-    context_df=historical_df,  # Historical data for kNN retrieval
+darr_config = ForecastingConfig(
     seq_len=512,
     forecast_horizon=72,
     alpha=0.2,   # 20% direct, 80% kNN
     k=64,
     temperature=0.05,
+)
+darr_result = perform_forecasting(
+    df=df,
+    config=darr_config,
+    context_df=historical_df,  # Historical data for kNN retrieval
 )
 ```
 
@@ -70,14 +86,14 @@ darr_result = perform_forecasting(
 Forecasting includes a model-agnostic **interpretability** framework that explains *why* a forecast looks the way it does — without modifying the underlying model. Pass `interpretability=True` to write an explanation bundle alongside the forecast: lag and feature attributions per horizon, semantic-flow diagnostics, trajectory stability, and optional embedding Integrated Gradients (JSON, CSVs, and PDF report):
 
 ```python
-results = perform_forecasting(
-    df=df,
+interp_config = ForecastingConfig(
     seq_len=512,
     forecast_horizon=72,
     interpretability=True,
     interpretability_output=None,  # "json", "pdf", or None for both
     interpretability_out_dir="interpretability_output",
 )
+results = perform_forecasting(df=df, config=interp_config)
 # Bundle written under interpretability_output/run_<UTC-timestamp>/
 ```
 
