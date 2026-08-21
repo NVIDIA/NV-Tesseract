@@ -16,11 +16,12 @@ Model weights download automatically from the public Hugging Face repo on first 
 
 import logging
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
 
-from sdk.forecasting import perform_forecasting
+from sdk.forecasting import ForecastingConfig, perform_forecasting
 
 logger = logging.getLogger(__name__)
 
@@ -49,15 +50,18 @@ if __name__ == "__main__":
     seq_len = 512
     forecast_horizon = 100
 
-    # Standard forecasting (no external memory)
-    # Model weights will be auto-downloaded if not present
-    forecast_df = perform_forecasting(
-        df=df,
+    base_config = ForecastingConfig(
         seq_len=seq_len,
         forecast_horizon=forecast_horizon,
         timestamp_column=timestamp_col,
         target_column=target_col,
-        save_preds="forecast_ETTh_seq_len_100.csv",
+    )
+
+    # Standard forecasting (no external memory)
+    # Model weights will be auto-downloaded if not present
+    forecast_df = perform_forecasting(
+        df=df,
+        config=replace(base_config, save_preds="forecast_ETTh_seq_len_100.csv"),
     )
     logger.info(
         "\nStandard forecast (only predicted rows with '%s_forecast' column):\n%s", target_col, forecast_df.to_csv()
@@ -73,12 +77,8 @@ if __name__ == "__main__":
     context_df = pd.read_csv(context_csv_path)
     darr_df = perform_forecasting(
         df=df,
-        seq_len=seq_len,
-        forecast_horizon=forecast_horizon,
+        config=replace(base_config, save_preds="forecast_ETTh_darr_100.csv"),
         context_df=context_df,  # This enables DARR mode
-        timestamp_column=timestamp_col,
-        target_column=target_col,
-        save_preds="forecast_ETTh_darr_100.csv",
         # Model weights auto-downloaded if needed
     )
     logger.info("\nDARR forecast (hybrid prediction in '%s_forecast' column):\n%s", target_col, darr_df.to_csv())
@@ -98,12 +98,8 @@ if __name__ == "__main__":
     df_interp[f"{target_col}_diff"] = df_interp[target_col].diff().fillna(0.0)
     df_interp[f"{target_col}_roll12"] = df_interp[target_col].rolling(window=12, min_periods=1).mean()
 
-    interp_df = perform_forecasting(
-        df=df_interp,
-        seq_len=seq_len,
-        forecast_horizon=forecast_horizon,
-        timestamp_column=timestamp_col,
-        target_column=target_col,
+    interp_config = replace(
+        base_config,
         # Interpretability controls
         interpretability=True,
         interpretability_output=None,  # write both JSON and PDF
@@ -113,6 +109,10 @@ if __name__ == "__main__":
         softmax_tau=1.0,
         integrated_gradients=True,
         save_preds="forecast_ETTh_with_explanations.csv",
+    )
+    interp_df = perform_forecasting(
+        df=df_interp,
+        config=interp_config,
     )
     logger.info(
         "\nInterpretability forecast (single-window baseline in '%s_forecast' column):\n%s",
