@@ -34,26 +34,37 @@ Then use the main function:
 import pandas as pd
 import sys, os
 sys.path.append('/path/to/ad_diffusion')  # Adjust to your installation path
-from sdk.anomaly_analysis import perform_anomaly_analysis_with_diffusion
+from sdk.anomaly_analysis import ADDiffusionConfig, perform_anomaly_analysis_with_diffusion
 
 # Load your data
 df = pd.read_csv("your_data.csv")
 
-# Perform anomaly detection — omit model_path/config_path to auto-download
+# Perform anomaly detection — omit model_path/model_config_path to auto-download
 # the pretrained weights from Hugging Face (nvidia/nv-tesseract-ad-diffusion).
 results = perform_anomaly_analysis_with_diffusion(
     df=df,
     threshold_strategy="scs",  # or "macs"
-    # model_path="path/to/your/model.pth",    # optional; defaults to final_model.pth
-    # config_path="path/to/config.yaml",      # optional; defaults to curriculum_medium.yaml
+    # model_path="path/to/your/model.pth",         # optional; defaults to final_model.pth
+    # model_config_path="path/to/config.yaml",     # optional; defaults to curriculum_medium.yaml
     nsample=15,
     preprocess_model_dir="path/to/preprocessing/models",  # optional
-    explain=True,
-    explanation_top_k=3,
+    sdk_config=ADDiffusionConfig(explain=True, explanation_top_k=3),
 )
 
 # Results contain original data plus anomaly detection results
 print(f"Detected {results['Anomaly'].sum()} anomalies")
+```
+
+Explainability and reporting settings (`explain`, `report_path`, etc.) live on
+`ADDiffusionConfig`, which can also be loaded from a YAML file — a fully
+commented template is available at `sdk/sdk_config.yaml`:
+
+```python
+results = perform_anomaly_analysis_with_diffusion(
+    df=df,
+    threshold_strategy="scs",
+    sdk_config="sdk_config.yaml",
+)
 ```
 
 With `explain=True`, the result also includes `TopContributors`,
@@ -72,12 +83,14 @@ ground truth when a conventional label column such as `GT` is present:
 results = perform_anomaly_analysis_with_diffusion(
     df=df,
     threshold_strategy="scs",
-    report_path="output/pdf/anomaly_detection_report.pdf",
-    timestamp_column="timestamp",
-    ground_truth_column="GT",
-    explain=True,
-    report_max_pages=10,
-    report_consolidated_top_k=5,
+    sdk_config=ADDiffusionConfig(
+        report_path="output/pdf/anomaly_detection_report.pdf",
+        timestamp_column="timestamp",
+        ground_truth_column="GT",
+        explain=True,
+        report_max_pages=10,
+        report_consolidated_top_k=5,
+    ),
 )
 ```
 
@@ -298,7 +311,7 @@ results = perform_anomaly_analysis_with_diffusion(
     df=analysis_df,
     threshold_strategy="scs",
     model_path="artifacts/finetune_my_data/best_finetuned_model.pth",
-    config_path="artifacts/finetune_my_data/finetune_config.yaml",
+    model_config_path="artifacts/finetune_my_data/finetune_config.yaml",
     nsample=15,
 )
 ```

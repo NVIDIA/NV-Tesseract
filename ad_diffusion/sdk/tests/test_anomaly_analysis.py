@@ -3,6 +3,7 @@
 
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -75,7 +76,7 @@ def test_perform_anomaly_analysis_with_scs_strategy(monkeypatch, numeric_df, inf
         numeric_df,
         threshold_strategy="scs",
         model_path="model.pth",
-        config_path="config.yaml",
+        model_config_path="config.yaml",
         nsample=7,
     )
 
@@ -100,7 +101,7 @@ def test_perform_anomaly_analysis_rejects_non_numeric_columns(numeric_df):
             mixed_df,
             threshold_strategy="scs",
             model_path="model.pth",
-            config_path="config.yaml",
+            model_config_path="config.yaml",
         )
 
 
@@ -113,7 +114,7 @@ def test_perform_anomaly_analysis_rejects_insufficient_rows(monkeypatch):
             short_df,
             threshold_strategy="scs",
             model_path="model.pth",
-            config_path="config.yaml",
+            model_config_path="config.yaml",
         )
 
 
@@ -125,7 +126,7 @@ def test_perform_anomaly_analysis_rejects_unknown_threshold(monkeypatch, numeric
             numeric_df,
             threshold_strategy="not-a-strategy",
             model_path="model.pth",
-            config_path="config.yaml",
+            model_config_path="config.yaml",
         )
 
 
@@ -145,7 +146,7 @@ def test_perform_anomaly_analysis_truncates_long_model_outputs(monkeypatch, nume
         numeric_df,
         threshold_strategy="macs",
         model_path="model.pth",
-        config_path="config.yaml",
+        model_config_path="config.yaml",
     )
 
     assert len(result) == len(numeric_df)
@@ -179,8 +180,8 @@ def test_optional_pdf_report_excludes_metadata_from_inference(monkeypatch, infer
         input_df,
         threshold_strategy="scs",
         model_path="model.pth",
-        config_path="config.yaml",
-        report_path=destination,
+        model_config_path="config.yaml",
+        sdk_config=anomaly_analysis.ADDiffusionConfig(report_path=destination),
     )
 
     inference_df = mock_inference.call_args.kwargs["data"]
@@ -226,10 +227,12 @@ def test_explain_toggle_preserves_numeric_feature_names(monkeypatch, tmp_path):
         input_df,
         threshold_strategy="scs",
         model_path="model.pth",
-        config_path="config.yaml",
-        report_path=tmp_path / "report.pdf",
-        explain=True,
-        explanation_top_k=3,
+        model_config_path="config.yaml",
+        sdk_config=anomaly_analysis.ADDiffusionConfig(
+            report_path=tmp_path / "report.pdf",
+            explain=True,
+            explanation_top_k=3,
+        ),
     )
 
     inference_df = mock_inference.call_args.kwargs["data"]
@@ -268,8 +271,8 @@ def test_explain_toggle_maps_any_supported_input_width(monkeypatch, input_featur
         input_df,
         threshold_strategy="scs",
         model_path="model.pth",
-        config_path="config.yaml",
-        explain=True,
+        model_config_path="config.yaml",
+        sdk_config=anomaly_analysis.ADDiffusionConfig(explain=True),
     )
 
     contributors = json.loads(result.loc[0, "TopContributors"])
@@ -299,10 +302,104 @@ def test_report_metadata_arguments_are_ignored_without_report_path(monkeypatch, 
         input_df,
         threshold_strategy="scs",
         model_path="model.pth",
-        config_path="config.yaml",
-        timestamp_column="sample_time",
-        ground_truth_column="expected_anomaly",
+        model_config_path="config.yaml",
+        sdk_config=anomaly_analysis.ADDiffusionConfig(
+            timestamp_column="sample_time",
+            ground_truth_column="expected_anomaly",
+        ),
     )
 
     inference_df = mock_inference.call_args.kwargs["data"]
     assert list(inference_df.columns) == list(input_df.columns)
+
+
+def test_load_sdk_config_accepts_nested_sdk_section(tmp_path):
+    config_path = tmp_path / "sdk_config.yaml"
+    config_path.write_text(
+        """
+model:
+  target_dim: 40
+sdk:
+  explain: true
+  explanation_top_k: 5
+  report_title: Custom Report
+""",
+        encoding="utf-8",
+    )
+
+    config = anomaly_analysis.load_sdk_config(config_path)
+
+    assert isinstance(config, anomaly_analysis.ADDiffusionConfig)
+    assert config.explain is True
+    assert config.explanation_top_k == 5
+    assert config.report_title == "Custom Report"
+    assert config.report_max_pages == 10
+
+
+def test_load_sdk_config_accepts_flat_mapping(tmp_path):
+    config_path = tmp_path / "sdk_config.yaml"
+    config_path.write_text("explain: true\nexplanation_top_k: 2\n", encoding="utf-8")
+
+    config = anomaly_analysis.load_sdk_config(config_path)
+
+    assert config.explain is True
+    assert config.explanation_top_k == 2
+
+
+def test_load_sdk_config_rejects_unknown_keys(tmp_path):
+    config_path = tmp_path / "sdk_config.yaml"
+    config_path.write_text(
+        """
+sdk:
+  explain: true
+  typo_top_k: 5
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="typo_top_k"):
+        anomaly_analysis.load_sdk_config(config_path)
+
+
+def test_commented_yaml_template_matches_config_defaults():
+    template_path = Path(anomaly_analysis.__file__).with_name("sdk_config.yaml")
+
+    assert asdict(anomaly_analysis.load_sdk_config(template_path)) == asdict(anomaly_analysis.ADDiffusionConfig())
+
+    previous_content = ""
+    for line in template_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if line.startswith("  ") and not line.startswith("    ") and stripped and not stripped.startswith("#"):
+            assert previous_content.startswith("#"), f"Missing comment for config value: {stripped}"
+        if stripped:
+            previous_content = stripped
+
+
+def test_perform_anomaly_analysis_uses_yaml_sdk_config(monkeypatch, numeric_df, inference_results, tmp_path):
+    config_path = tmp_path / "sdk_config.yaml"
+    config_path.write_text(
+        """
+sdk:
+  explain: true
+  explanation_top_k: 2
+""",
+        encoding="utf-8",
+    )
+    mock_inference = Mock(return_value=inference_results)
+    monkeypatch.setattr(anomaly_analysis, "inference_ad_tesseract2_mp", mock_inference)
+
+    mock_thresholder = Mock()
+    mock_thresholder.detect_anomalies.return_value = np.array([False, True, False, True, False])
+    mock_strategy = Mock()
+    mock_strategy.scs_thresholder = mock_thresholder
+    monkeypatch.setattr(anomaly_analysis, "SCSThresholdStrategy", Mock(return_value=mock_strategy))
+
+    result = anomaly_analysis.perform_anomaly_analysis_with_diffusion(
+        numeric_df,
+        threshold_strategy="scs",
+        model_path="model.pth",
+        model_config_path="config.yaml",
+        sdk_config=config_path,
+    )
+
+    assert "TopContributors" in result.columns
