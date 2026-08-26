@@ -1,17 +1,13 @@
-# SDK (explainability/reporting) settings for
+# SDK (reporting) settings for
 # sdk.anomaly_analysis.perform_anomaly_analysis_with_diffusion.
 # Copy this file and pass it with sdk_config="path/to/your_config.yaml".
 #
-# This covers only the explain toggle and explainability/report-related
-# parameters. Inference-behavior settings (threshold_strategy, nsample,
-# preprocess_model_dir) and model paths (model_path, model_config_path) stay
-# as direct keyword arguments on perform_anomaly_analysis_with_diffusion.
+# This covers only report-related parameters. Inference-behavior settings
+# (threshold_strategy, nsample, preprocess_model_dir), model paths
+# (model_path, model_config_path), and the explain/explanation_top_k
+# explainability toggle stay as direct keyword arguments on
+# perform_anomaly_analysis_with_diffusion.
 sdk:
-  # If true, add exact reconstruction-error explanations for anomalous rows.
-  # This does not trigger additional model inference.
-  explain: false
-  # Maximum number of target-space contributors to return per anomalous row.
-  explanation_top_k: 3
   # Optional PDF destination. No report is generated when null.
   report_path: null
   # Optional timestamp column used only for report plotting; conventional

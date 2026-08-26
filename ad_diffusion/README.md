@@ -48,16 +48,18 @@ results = perform_anomaly_analysis_with_diffusion(
     # model_config_path="path/to/config.yaml",     # optional; defaults to curriculum_medium.yaml
     nsample=15,
     preprocess_model_dir="path/to/preprocessing/models",  # optional
-    sdk_config=ADDiffusionConfig(explain=True, explanation_top_k=3),
+    explain=True,
+    explanation_top_k=3,
 )
 
 # Results contain original data plus anomaly detection results
 print(f"Detected {results['Anomaly'].sum()} anomalies")
 ```
 
-Explainability and reporting settings (`explain`, `report_path`, etc.) live on
-`ADDiffusionConfig`, which can also be loaded from a YAML file — a fully
-commented template is available at `sdk/sdk_config.yaml`:
+Reporting settings (`report_path`, etc.) live on `ADDiffusionConfig`, which can
+also be loaded from a YAML file — a fully commented template is available at
+`sdk/sdk_config.yaml`. `explain`/`explanation_top_k` stay direct keyword
+arguments since they're not part of the reporting config:
 
 ```python
 results = perform_anomaly_analysis_with_diffusion(
@@ -83,11 +85,11 @@ ground truth when a conventional label column such as `GT` is present:
 results = perform_anomaly_analysis_with_diffusion(
     df=df,
     threshold_strategy="scs",
+    explain=True,
     sdk_config=ADDiffusionConfig(
         report_path="output/pdf/anomaly_detection_report.pdf",
         timestamp_column="timestamp",
         ground_truth_column="GT",
-        explain=True,
         report_max_pages=10,
         report_consolidated_top_k=5,
     ),

@@ -228,11 +228,9 @@ def test_explain_toggle_preserves_numeric_feature_names(monkeypatch, tmp_path):
         threshold_strategy="scs",
         model_path="model.pth",
         model_config_path="config.yaml",
-        sdk_config=anomaly_analysis.ADDiffusionConfig(
-            report_path=tmp_path / "report.pdf",
-            explain=True,
-            explanation_top_k=3,
-        ),
+        explain=True,
+        explanation_top_k=3,
+        sdk_config=anomaly_analysis.ADDiffusionConfig(report_path=tmp_path / "report.pdf"),
     )
 
     inference_df = mock_inference.call_args.kwargs["data"]
@@ -272,7 +270,7 @@ def test_explain_toggle_maps_any_supported_input_width(monkeypatch, input_featur
         threshold_strategy="scs",
         model_path="model.pth",
         model_config_path="config.yaml",
-        sdk_config=anomaly_analysis.ADDiffusionConfig(explain=True),
+        explain=True,
     )
 
     contributors = json.loads(result.loc[0, "TopContributors"])
@@ -320,9 +318,8 @@ def test_load_sdk_config_accepts_nested_sdk_section(tmp_path):
 model:
   target_dim: 40
 sdk:
-  explain: true
-  explanation_top_k: 5
   report_title: Custom Report
+  report_consolidated_top_k: 8
 """,
         encoding="utf-8",
     )
@@ -330,20 +327,19 @@ sdk:
     config = anomaly_analysis.load_sdk_config(config_path)
 
     assert isinstance(config, anomaly_analysis.ADDiffusionConfig)
-    assert config.explain is True
-    assert config.explanation_top_k == 5
     assert config.report_title == "Custom Report"
+    assert config.report_consolidated_top_k == 8
     assert config.report_max_pages == 10
 
 
 def test_load_sdk_config_accepts_flat_mapping(tmp_path):
     config_path = tmp_path / "sdk_config.yaml"
-    config_path.write_text("explain: true\nexplanation_top_k: 2\n", encoding="utf-8")
+    config_path.write_text("report_title: Custom Report\nreport_max_pages: 2\n", encoding="utf-8")
 
     config = anomaly_analysis.load_sdk_config(config_path)
 
-    assert config.explain is True
-    assert config.explanation_top_k == 2
+    assert config.report_title == "Custom Report"
+    assert config.report_max_pages == 2
 
 
 def test_load_sdk_config_rejects_unknown_keys(tmp_path):
@@ -351,7 +347,7 @@ def test_load_sdk_config_rejects_unknown_keys(tmp_path):
     config_path.write_text(
         """
 sdk:
-  explain: true
+  report_title: Custom Report
   typo_top_k: 5
 """,
         encoding="utf-8",
@@ -375,15 +371,25 @@ def test_commented_yaml_template_matches_config_defaults():
             previous_content = stripped
 
 
-def test_perform_anomaly_analysis_uses_yaml_sdk_config(monkeypatch, numeric_df, inference_results, tmp_path):
+def test_perform_anomaly_analysis_uses_yaml_sdk_config(monkeypatch, inference_results, tmp_path):
+    destination = tmp_path / "anomaly_report.pdf"
     config_path = tmp_path / "sdk_config.yaml"
     config_path.write_text(
-        """
+        f"""
 sdk:
-  explain: true
-  explanation_top_k: 2
+  timestamp_column: timestamp
+  ground_truth_column: GT
+  report_path: {destination}
 """,
         encoding="utf-8",
+    )
+    input_df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=5, freq="min"),
+            "feature_1": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "feature_2": [2.0, 2.5, 3.0, 3.5, 4.0],
+            "GT": [0, 1, 0, 0, 1],
+        }
     )
     mock_inference = Mock(return_value=inference_results)
     monkeypatch.setattr(anomaly_analysis, "inference_ad_tesseract2_mp", mock_inference)
@@ -395,11 +401,14 @@ sdk:
     monkeypatch.setattr(anomaly_analysis, "SCSThresholdStrategy", Mock(return_value=mock_strategy))
 
     result = anomaly_analysis.perform_anomaly_analysis_with_diffusion(
-        numeric_df,
+        input_df,
         threshold_strategy="scs",
         model_path="model.pth",
         model_config_path="config.yaml",
         sdk_config=config_path,
     )
 
-    assert "TopContributors" in result.columns
+    inference_df = mock_inference.call_args.kwargs["data"]
+    assert list(inference_df.columns) == ["feature_1", "feature_2"]
+    assert {"timestamp", "GT", "Anomaly", "MAE"}.issubset(result.columns)
+    assert destination.read_bytes().startswith(b"%PDF")

@@ -32,15 +32,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class ADDiffusionConfig:
-    """Explainability and reporting configuration for :func:`perform_anomaly_analysis_with_diffusion`.
+    """Reporting configuration for :func:`perform_anomaly_analysis_with_diffusion`.
 
-    Scoped to the explain toggle and explainability/report-related parameters —
-    inference-behavior knobs like ``threshold_strategy``, ``nsample``, and the
-    model/config paths stay as direct function arguments.
+    Scoped to report-related parameters — inference-behavior knobs like
+    ``threshold_strategy``, ``nsample``, the model/config paths, and the
+    ``explain``/``explanation_top_k`` explainability toggle stay as direct
+    function arguments.
     """
 
-    explain: bool = False
-    explanation_top_k: int = 3
     report_path: str | Path | None = None
     timestamp_column: str | None = None
     ground_truth_column: str | None = None
@@ -97,6 +96,8 @@ def perform_anomaly_analysis_with_diffusion(
     model_config_path: str | Path = "",
     nsample: int = 15,
     preprocess_model_dir: str | Path | None = None,
+    explain: bool = False,
+    explanation_top_k: int = 3,
     sdk_config: ADDiffusionConfig | str | Path | None = None,
 ) -> pd.DataFrame:
     """
@@ -115,7 +116,9 @@ def perform_anomaly_analysis_with_diffusion(
         model_config_path: Path to the model architecture config file (optional if config is in checkpoint)
         nsample: Number of samples for diffusion model inference
         preprocess_model_dir: Directory containing preprocessing model (optional)
-        sdk_config: Explainability/reporting `ADDiffusionConfig`, YAML path, or `None` for defaults.
+        explain: Whether to add reconstruction-error explanations for detected anomalies.
+        explanation_top_k: Maximum number of contributors returned per anomaly.
+        sdk_config: Reporting `ADDiffusionConfig`, YAML path, or `None` for defaults.
             See `ADDiffusionConfig` for the field reference.
 
     Returns:
@@ -226,7 +229,7 @@ def perform_anomaly_analysis_with_diffusion(
     result_df["Anomaly"] = anomalies
     result_df["MAE"] = residual_scores  # Using residual (MAE) as anomaly score
 
-    if cfg.explain:
+    if explain:
         reconstruction = results.get("recon")
         if reconstruction is None:
             raise ValueError("Inference results must include 'recon' when explain=True.")
@@ -245,7 +248,7 @@ def perform_anomaly_analysis_with_diffusion(
             anomaly_mask=anomalies[:explanation_length],
             feature_names=feature_names,
             feature_indices=feature_indices,
-            top_k=cfg.explanation_top_k,
+            top_k=explanation_top_k,
         )
         explanations = explanations.reindex(range(original_length)).fillna(
             {
