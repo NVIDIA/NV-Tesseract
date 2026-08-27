@@ -231,7 +231,7 @@ model:
   target_dim: 40
 sdk:
   report_title: Custom Report
-  report_consolidated_top_k: 8
+  report_max_pages: 8
 """,
         encoding="utf-8",
     )
@@ -240,8 +240,7 @@ sdk:
 
     assert isinstance(config, anomaly_analysis.ADDiffusionConfig)
     assert config.report_title == "Custom Report"
-    assert config.report_consolidated_top_k == 8
-    assert config.report_max_pages == 10
+    assert config.report_max_pages == 8
 
 
 def test_load_sdk_config_accepts_flat_mapping(tmp_path):

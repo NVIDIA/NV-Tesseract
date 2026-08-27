@@ -42,9 +42,7 @@ class ADDiffusionConfig:
     timestamp_column: str | None = None
     ground_truth_column: str | None = None
     report_title: str = "Anomaly Detection Report"
-    report_explanation_csv_path: str | Path | None = None
     report_max_pages: int = 10
-    report_consolidated_top_k: int = 5
 
 
 _SDK_CONFIG_FIELDS = frozenset(field.name for field in fields(ADDiffusionConfig))
@@ -231,9 +229,7 @@ def perform_anomaly_analysis_with_diffusion(
             timestamp_column=resolved_timestamp_column,
             ground_truth_column=resolved_ground_truth_column,
             title=cfg.report_title,
-            explanation_csv_path=cfg.report_explanation_csv_path,
             max_report_pages=cfg.report_max_pages,
-            consolidated_top_k=cfg.report_consolidated_top_k,
         )
 
     return result_df

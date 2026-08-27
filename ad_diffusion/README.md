@@ -69,7 +69,6 @@ results = perform_anomaly_analysis_with_diffusion(
         timestamp_column="timestamp",
         ground_truth_column="GT",
         report_max_pages=10,
-        report_consolidated_top_k=5,
     ),
 )
 

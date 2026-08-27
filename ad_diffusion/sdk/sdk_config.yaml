@@ -17,10 +17,5 @@ sdk:
   ground_truth_column: null
   # Title shown on the generated PDF report.
   report_title: Anomaly Detection Report
-  # Optional destination for the full explainability CSV; written beside the
-  # PDF when null.
-  report_explanation_csv_path: null
-  # Maximum PDF page count. Excess anomaly details are consolidated.
+  # Maximum PDF page count. Excess feature signals are grouped per page.
   report_max_pages: 10
-  # Number of overall contributors shown when details are consolidated.
-  report_consolidated_top_k: 5
