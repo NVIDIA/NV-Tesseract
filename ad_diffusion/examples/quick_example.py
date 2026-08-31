@@ -253,7 +253,7 @@ def run_anomaly_detection_example(
                     df=analysis_df,
                     threshold_strategy="scs",  # Try "macs" as alternative
                     model_path=resolved_model_path,
-                    config_path=resolved_config_path if Path(resolved_config_path).exists() else "",
+                    model_config_path=resolved_config_path if Path(resolved_config_path).exists() else "",
                     nsample=15,
                     # preprocess_model_dir="/path/to/preprocessing/models"  # Optional
                 )

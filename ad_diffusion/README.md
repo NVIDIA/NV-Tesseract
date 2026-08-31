@@ -43,8 +43,8 @@ df = pd.read_csv("your_data.csv")
 results = perform_anomaly_analysis_with_diffusion(
     df=df,
     threshold_strategy="scs",  # or "macs"
-    # model_path="path/to/your/model.pth",    # optional; defaults to final_model.pth
-    # config_path="path/to/config.yaml",      # optional; defaults to curriculum_medium.yaml
+    # model_path="path/to/your/model.pth",         # optional; defaults to final_model.pth
+    # model_config_path="path/to/config.yaml",     # optional; defaults to curriculum_medium.yaml
     nsample=15,
     preprocess_model_dir="path/to/preprocessing/models",  # optional
 )
@@ -52,6 +52,38 @@ results = perform_anomaly_analysis_with_diffusion(
 # Results contain original data plus anomaly detection results
 print(f"Detected {results['Anomaly'].sum()} anomalies")
 ```
+
+Generate a PDF report with the original signals, detected anomalies, MAE, and
+ground truth when a conventional label column such as `GT` is present. Report
+settings live on `ADDiffusionConfig`, which can also be loaded from a YAML
+file — a fully commented template is available at `sdk/sdk_config.yaml`:
+
+```python
+from sdk.anomaly_analysis import ADDiffusionConfig, perform_anomaly_analysis_with_diffusion
+
+results = perform_anomaly_analysis_with_diffusion(
+    df=df,
+    threshold_strategy="scs",
+    sdk_config=ADDiffusionConfig(
+        report_path="output/pdf/anomaly_detection_report.pdf",
+        timestamp_column="timestamp",
+        ground_truth_column="GT",
+        report_max_pages=10,
+    ),
+)
+
+# Or load the same settings from YAML:
+results = perform_anomaly_analysis_with_diffusion(
+    df=df,
+    threshold_strategy="scs",
+    sdk_config="sdk_config.yaml",
+)
+```
+
+Timestamp and ground-truth columns used for the report are excluded from
+model features but preserved in the returned DataFrame. Existing callers are
+unchanged because PDF generation is disabled unless `report_path` is
+supplied.
 
 ## Pretrained Weights
 
@@ -244,7 +276,7 @@ results = perform_anomaly_analysis_with_diffusion(
     df=analysis_df,
     threshold_strategy="scs",
     model_path="artifacts/finetune_my_data/best_finetuned_model.pth",
-    config_path="artifacts/finetune_my_data/finetune_config.yaml",
+    model_config_path="artifacts/finetune_my_data/finetune_config.yaml",
     nsample=15,
 )
 ```
@@ -294,10 +326,13 @@ from sdk.anomaly_analysis import perform_anomaly_analysis_with_diffusion
 - **model_path** (str|Path, optional): Path to the NV-Tesseract AD diffusion model checkpoint.
   If omitted or the file doesn't exist, `final_model.pth` is auto-downloaded from
   `nvidia/nv-tesseract-ad-diffusion` on Hugging Face.
-- **config_path** (str|Path, optional): Path to the model config YAML. If omitted
-  or missing, `curriculum_medium.yaml` is auto-downloaded from the same repo.
+- **model_config_path** (str|Path, optional): Path to the model architecture config YAML.
+  If omitted or missing, `curriculum_medium.yaml` is auto-downloaded from the same repo.
 - **nsample** (int): Number of diffusion samples (default: 15)
 - **preprocess_model_dir** (str|Path): Optional preprocessing model directory
+- **sdk_config** (ADDiffusionConfig|str|Path, optional): Reporting settings, either
+  a typed `ADDiffusionConfig`, a YAML path, or `None` for defaults. See
+  `sdk/sdk_config.yaml` for the field reference.
 
 ### Advanced Usage
 
