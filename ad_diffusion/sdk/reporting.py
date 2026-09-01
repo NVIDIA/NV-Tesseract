@@ -747,9 +747,11 @@ def _create_mae_note_page(
         va="top",
     )
     notes = [
-        "Lower MAE means a closer reconstruction and more typical\n"
-        "behavior. Higher MAE means a larger mismatch and more\n"
-        "anomalous behavior.",
+        (
+            "Lower MAE means a closer reconstruction and more typical\n"
+            "behavior. Higher MAE means a larger mismatch and more\n"
+            "anomalous behavior."
+        ),
         "The anomaly flag is produced by applying the selected\nthreshold strategy to the MAE sequence.",
         "MAE scale depends on preprocessing and feature scaling.\nCompare values within the same model and data pipeline.",
         "High MAE identifies unusual reconstruction behavior. It does\nnot establish physical causality or root cause.",
