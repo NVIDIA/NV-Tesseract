@@ -38,11 +38,11 @@ def test_resolve_checkpoint_init_downloads_standard_checkpoint(monkeypatch):
 
     ckpt_path = finetune_example.resolve_checkpoint_init(make_args())
 
-    assert ckpt_path == f"downloaded/{finetune_example.DEFAULT_CHECKPOINT_NAME}"
+    assert ckpt_path == f"downloaded/{finetune_example.CHECKPOINT_BASE}"
     assert calls == [
         {
             "standardizer_pkl": "standardizer.pkl",
-            "ckpt": finetune_example.DEFAULT_CHECKPOINT_NAME,
+            "ckpt": finetune_example.CHECKPOINT_BASE,
             "repo_id": "nvidia/nv-tesseract-forecasting",
         }
     ]
@@ -59,5 +59,5 @@ def test_resolve_checkpoint_init_downloads_cross_channel_checkpoint(monkeypatch)
 
     ckpt_path = finetune_example.resolve_checkpoint_init(make_args(use_cross_channel=True))
 
-    assert ckpt_path == f"downloaded/{finetune_example.DEFAULT_CROSS_CHANNEL_CHECKPOINT_NAME}"
-    assert calls[0]["ckpt"] == finetune_example.DEFAULT_CROSS_CHANNEL_CHECKPOINT_NAME
+    assert ckpt_path == f"downloaded/{finetune_example.CHECKPOINT_CROSS_CHANNEL}"
+    assert calls[0]["ckpt"] == finetune_example.CHECKPOINT_CROSS_CHANNEL

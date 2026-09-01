@@ -9,6 +9,7 @@ A package for anomaly detection using NV-Tesseract diffusion models.
 - **Multi-GPU Support**: Automatic multi-GPU inference with shared memory optimization
 - **Fast Inference**: Supports DPM-Solver for 50-100x speedup over standard diffusion
 - **Preprocessing Pipeline**: Complete TSB-AD compatible preprocessing with domain adaptation
+- **Model-agnostic Explainability**: Attributes each detected anomaly's MAE to its largest reconstruction errors
 - **Auto-download from Hugging Face**: Pretrained weights are fetched automatically from [`nvidia/nv-tesseract-ad-diffusion`](https://huggingface.co/nvidia/nv-tesseract-ad-diffusion) on first use
 - **Simple Structure**: Organized as modules without Python package complexity - easy to use and modify
 
@@ -33,25 +34,49 @@ Then use the main function:
 import pandas as pd
 import sys, os
 sys.path.append('/path/to/ad_diffusion')  # Adjust to your installation path
-from sdk.anomaly_analysis import perform_anomaly_analysis_with_diffusion
+from sdk.anomaly_analysis import ADDiffusionConfig, perform_anomaly_analysis_with_diffusion
 
 # Load your data
 df = pd.read_csv("your_data.csv")
 
-# Perform anomaly detection — omit model_path/config_path to auto-download
+# Perform anomaly detection — omit model_path/model_config_path to auto-download
 # the pretrained weights from Hugging Face (nvidia/nv-tesseract-ad-diffusion).
 results = perform_anomaly_analysis_with_diffusion(
     df=df,
     threshold_strategy="scs",  # or "macs"
-    # model_path="path/to/your/model.pth",    # optional; defaults to final_model.pth
-    # config_path="path/to/config.yaml",      # optional; defaults to curriculum_medium.yaml
+    # model_path="path/to/your/model.pth",         # optional; defaults to final_model.pth
+    # model_config_path="path/to/config.yaml",     # optional; defaults to curriculum_medium.yaml
     nsample=15,
     preprocess_model_dir="path/to/preprocessing/models",  # optional
+    explain=True,
+    explanation_top_k=3,
 )
 
 # Results contain original data plus anomaly detection results
 print(f"Detected {results['Anomaly'].sum()} anomalies")
 ```
+
+Reporting settings (`report_path`, etc.) live on `ADDiffusionConfig`, which can
+also be loaded from a YAML file — a fully commented template is available at
+`sdk/sdk_config.yaml`. `explain`/`explanation_top_k` stay direct keyword
+arguments since they're not part of the reporting config:
+
+```python
+results = perform_anomaly_analysis_with_diffusion(
+    df=df,
+    threshold_strategy="scs",
+    sdk_config="sdk_config.yaml",
+)
+```
+
+With `explain=True`, the result also includes `TopContributors`,
+`ContributionShares`, `ExplanationCoverage`, and `ExplanationMethod`. These
+columns are derived from the existing target and reconstruction, so explanation
+does not run the detector again. Inputs with any feature count up to the model's
+target dimension retain their original column names; right-padded model dimensions
+remain part of the MAE denominator but are not presented as input features. When
+PCA or feature engineering changes the feature space, contributors use conservative
+`component_N` labels instead of claiming an incorrect mapping to original signals.
 
 Generate a PDF report with the original signals, detected anomalies, MAE, and
 ground truth when a conventional label column such as `GT` is present:
@@ -60,15 +85,25 @@ ground truth when a conventional label column such as `GT` is present:
 results = perform_anomaly_analysis_with_diffusion(
     df=df,
     threshold_strategy="scs",
-    report_path="output/pdf/anomaly_detection_report.pdf",
-    timestamp_column="timestamp",
-    ground_truth_column="GT",
+    explain=True,
+    sdk_config=ADDiffusionConfig(
+        report_path="output/pdf/anomaly_detection_report.pdf",
+        timestamp_column="timestamp",
+        ground_truth_column="GT",
+        report_max_pages=10,
+        report_consolidated_top_k=5,
+    ),
 )
 ```
 
 Timestamp and ground-truth columns used for the report are excluded from model
 features but preserved in the returned DataFrame. Existing callers are unchanged
 because PDF generation is disabled unless `report_path` is supplied.
+When explanations are enabled, the PDF adds contributor-share graphs and writes
+the complete row-level explanation data to a companion CSV. If per-anomaly
+charts would make the PDF exceed `report_max_pages` (10 by default), the PDF
+uses one consolidated, MAE-weighted top-contributors page instead; the companion
+CSV still contains every detected anomaly.
 
 An existing AD result or CSV can also be rendered after inference:
 
@@ -171,8 +206,10 @@ uv run ruff check .
 ad_diffusion/
 ├── sdk/                        # Main inference functions
 │   ├── anomaly_analysis.py     # Main API function
+│   ├── explainability.py       # Reconstruction-error contribution explanations
 │   ├── inference_ad.py         # Core inference engine
 │   ├── inference_worker.py     # Multi-GPU worker
+│   ├── reporting.py            # PDF and companion CSV report generation
 │   └── thresholds.py          # Threshold strategies (SCS, MACS)
 ├── models/                     # Diffusion model implementations
 │   ├── main_model.py          # TSDiffuser_Generic model
@@ -180,6 +217,7 @@ ad_diffusion/
 │   └── utils.py               # Model evaluation utilities
 ├── utils/                      # Utility functions and tools
 │   ├── tsb_ad_preprocessor.py # Data preprocessing
+│   ├── adaptive_normalizer.py # Distribution-aware normalization
 │   ├── json_utils.py          # Model loading/saving
 │   ├── adaptive_threshold.py  # SCS and MACS implementations
 │   └── dpm_solver_pytorch.py  # DPM-Solver for fast inference
@@ -275,7 +313,7 @@ results = perform_anomaly_analysis_with_diffusion(
     df=analysis_df,
     threshold_strategy="scs",
     model_path="artifacts/finetune_my_data/best_finetuned_model.pth",
-    config_path="artifacts/finetune_my_data/finetune_config.yaml",
+    model_config_path="artifacts/finetune_my_data/finetune_config.yaml",
     nsample=15,
 )
 ```
