@@ -1,0 +1,27 @@
+# SDK (reporting) settings for
+# sdk.anomaly_analysis.perform_anomaly_analysis_with_diffusion.
+# Copy this file and pass it with sdk_config="path/to/your_config.yaml".
+#
+# This covers only report-related parameters. Inference-behavior settings
+# (threshold_strategy, nsample, preprocess_model_dir), model paths
+# (model_path, model_config_path), and the explain/explanation_top_k
+# explainability toggle stay as direct keyword arguments on
+# perform_anomaly_analysis_with_diffusion.
+sdk:
+  # Optional PDF destination. No report is generated when null.
+  report_path: null
+  # Optional timestamp column used only for report plotting; conventional
+  # names are auto-detected when report_path is set and this is null.
+  timestamp_column: null
+  # Optional binary-label column used only for report plotting; conventional
+  # names are auto-detected when report_path is set and this is null.
+  ground_truth_column: null
+  # Title shown on the generated PDF report.
+  report_title: Anomaly Detection Report
+  # Optional destination for the full explainability CSV; written beside the
+  # PDF when null.
+  report_explanation_csv_path: null
+  # Maximum PDF page count. Excess anomaly details are consolidated.
+  report_max_pages: 10
+  # Number of overall contributors shown when details are consolidated.
+  report_consolidated_top_k: 5

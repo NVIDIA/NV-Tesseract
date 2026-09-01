@@ -14,6 +14,7 @@ dependencies = [
     "tqdm>=4.65.0",
     "huggingface_hub>=0.22.0",
     "transformers>=4.36.0",
+    "pyyaml>=6.0,<7",
 ]
 
 [tool.uv]
