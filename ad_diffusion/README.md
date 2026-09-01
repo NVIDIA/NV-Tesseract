@@ -29,14 +29,34 @@ uv sync
 uv run python your_script.py
 ```
 
-Then use the main function:
-```python
-import pandas as pd
-import sys, os
-sys.path.append('/path/to/ad_diffusion')  # Adjust to your installation path
-from sdk.anomaly_analysis import ADDiffusionConfig, perform_anomaly_analysis_with_diffusion
+Explainability and reporting use a YAML configuration. Copy the fully commented
+template at `sdk/sdk_config.yaml` and enable the required settings:
 
-# Load your data
+```yaml
+sdk:
+  explain: true
+  explanation_top_k: 3
+  diagnose_reconstruction: true
+  report_path: output/pdf/anomaly_detection_report.pdf
+  timestamp_column: timestamp
+  ground_truth_column: GT
+  report_title: Anomaly Detection Report
+  report_explanation_csv_path: output/pdf/anomaly_detection_report_explanations.csv
+  report_max_pages: 10
+  report_consolidated_top_k: 5
+```
+
+Pass the YAML file to the SDK:
+
+```python
+import os
+import sys
+
+import pandas as pd
+
+sys.path.append("/path/to/ad_diffusion")
+from sdk.anomaly_analysis import perform_anomaly_analysis_with_diffusion
+
 df = pd.read_csv("your_data.csv")
 
 # Perform anomaly detection — omit model_path/model_config_path to auto-download
@@ -47,29 +67,25 @@ results = perform_anomaly_analysis_with_diffusion(
     # model_path="path/to/your/model.pth",         # optional; defaults to final_model.pth
     # model_config_path="path/to/config.yaml",     # optional; defaults to curriculum_medium.yaml
     nsample=15,
-    preprocess_model_dir="path/to/preprocessing/models",  # optional
-    explain=True,
-    explanation_top_k=3,
+    sdk_config="path/to/sdk_config.yaml",
 )
-
-# Results contain original data plus anomaly detection results
 print(f"Detected {results['Anomaly'].sum()} anomalies")
 ```
 
-Reporting settings (`report_path`, etc.) live on `ADDiffusionConfig`, which can
-also be loaded from a YAML file — a fully commented template is available at
-`sdk/sdk_config.yaml`. `explain`/`explanation_top_k` stay direct keyword
-arguments since they're not part of the reporting config:
+`ADDiffusionConfig` remains available when configuration must be constructed
+programmatically instead of loaded from YAML:
 
 ```python
-results = perform_anomaly_analysis_with_diffusion(
-    df=df,
-    threshold_strategy="scs",
-    sdk_config="sdk_config.yaml",
+from sdk.anomaly_analysis import ADDiffusionConfig
+
+sdk_config = ADDiffusionConfig(
+    explain=True,
+    explanation_top_k=3,
+    diagnose_reconstruction=True,
 )
 ```
 
-With `explain=True`, the result also includes `TopContributors`,
+When `sdk.explain: true`, the result also includes `TopContributors`,
 `ContributionShares`, `ExplanationCoverage`, and `ExplanationMethod`. These
 columns are derived from the existing target and reconstruction, so explanation
 does not run the detector again. Inputs with any feature count up to the model's
@@ -78,30 +94,25 @@ remain part of the MAE denominator but are not presented as input features. When
 PCA or feature engineering changes the feature space, contributors use conservative
 `component_N` labels instead of claiming an incorrect mapping to original signals.
 
-Generate a PDF report with the original signals, detected anomalies, MAE, and
-ground truth when a conventional label column such as `GT` is present:
+Set `sdk.diagnose_reconstruction: true` to test why selected features may have
+been reconstructed incorrectly. The SDK applies level-shift, trend-change,
+transient-spike, and variance-burst repairs and re-scores them with the unchanged
+detector. This opt-in path performs four additional inference passes and requires
+directly mapped input features without a preprocessing model. It returns
+`LikelyReconstructionIssue`, `RepairImpact`, `DiagnosticConfidence`, and
+`ExplanationConsistency`. These metrics describe detector behavior and do not
+establish physical causality.
 
-```python
-results = perform_anomaly_analysis_with_diffusion(
-    df=df,
-    threshold_strategy="scs",
-    explain=True,
-    sdk_config=ADDiffusionConfig(
-        report_path="output/pdf/anomaly_detection_report.pdf",
-        timestamp_column="timestamp",
-        ground_truth_column="GT",
-        report_max_pages=10,
-        report_consolidated_top_k=5,
-    ),
-)
-```
+Set `sdk.report_path` in the YAML file to generate a PDF report with the
+original signals, detected anomalies, MAE, and ground truth when a conventional
+label column such as `GT` is present.
 
 Timestamp and ground-truth columns used for the report are excluded from model
 features but preserved in the returned DataFrame. Existing callers are unchanged
-because PDF generation is disabled unless `report_path` is supplied.
-When explanations are enabled, the PDF adds contributor-share graphs and writes
+because PDF generation is disabled unless `sdk.report_path` is supplied.
+When `sdk.explain: true`, the PDF adds contributor-share graphs and writes
 the complete row-level explanation data to a companion CSV. If per-anomaly
-charts would make the PDF exceed `report_max_pages` (10 by default), the PDF
+charts would make the PDF exceed `sdk.report_max_pages` (10 by default), the PDF
 uses one consolidated, MAE-weighted top-contributors page instead; the companion
 CSV still contains every detected anomaly.
 
@@ -367,6 +378,9 @@ from sdk.anomaly_analysis import perform_anomaly_analysis_with_diffusion
   or missing, `curriculum_medium.yaml` is auto-downloaded from the same repo.
 - **nsample** (int): Number of diffusion samples (default: 15)
 - **preprocess_model_dir** (str|Path): Optional preprocessing model directory
+- **sdk_config** (ADDiffusionConfig|str|Path, optional): Explainability and
+  reporting configuration object or path to an SDK YAML file. The default
+  disables explanations, reconstruction diagnosis, and PDF generation.
 
 ### Advanced Usage
 

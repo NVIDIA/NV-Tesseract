@@ -25,12 +25,26 @@ EXPLANATION_COLUMNS = {
     "ContributionShares",
     "ExplanationCoverage",
     "ExplanationMethod",
+    "LikelyReconstructionIssue",
+    "RepairImpact",
+    "DiagnosticConfidence",
+    "ExplanationConsistency",
 }
 REQUIRED_EXPLANATION_COLUMNS = ("TopContributors", "ContributionShares", "ExplanationCoverage")
+REQUIRED_DIAGNOSIS_COLUMNS = (
+    "LikelyReconstructionIssue",
+    "RepairImpact",
+    "DiagnosticConfidence",
+    "ExplanationConsistency",
+)
 MAX_EXPLANATIONS_PER_PAGE = 7
 DEFAULT_MAX_REPORT_PAGES = 10
 DEFAULT_CONSOLIDATED_TOP_K = 5
 FEATURE_COLORS = ("#175CD3", "#039855", "#F79009", "#7F56D9", "#0E9384", "#D92D20", "#444CE7", "#C11574")
+SCORE_DIRECTION_NOTE = (
+    "Lower MAE means a closer reconstruction\nand more typical behavior.\n"
+    "Higher MAE means a larger mismatch\nand more anomalous behavior."
+)
 
 
 def infer_ground_truth_column(df: pd.DataFrame) -> str | None:
@@ -187,6 +201,30 @@ def _resolve_explanation_rows(
     return rows
 
 
+def _resolve_diagnosis_rows(
+    result_df: pd.DataFrame,
+    detected: np.ndarray,
+) -> list[tuple[str, str, str, str]] | None:
+    """Validate and format the four user-facing reconstruction-diagnosis fields."""
+    present = [column for column in REQUIRED_DIAGNOSIS_COLUMNS if column in result_df.columns]
+    if not present:
+        return None
+    missing = [column for column in REQUIRED_DIAGNOSIS_COLUMNS if column not in result_df.columns]
+    if missing:
+        raise ValueError(f"Reconstruction-diagnosis report data is missing columns: {missing}.")
+
+    rows = []
+    for row_index in np.flatnonzero(detected):
+        impact = pd.to_numeric(result_df.iloc[row_index]["RepairImpact"], errors="coerce")
+        if not np.isfinite(impact) or not 0 <= impact <= 1:
+            raise ValueError("RepairImpact must contain only finite values between 0 and 1.")
+        issue = str(result_df.iloc[row_index]["LikelyReconstructionIssue"]).strip() or "Not available"
+        confidence = str(result_df.iloc[row_index]["DiagnosticConfidence"]).strip() or "Not available"
+        consistency = str(result_df.iloc[row_index]["ExplanationConsistency"]).strip() or "Not available"
+        rows.append((issue, f"{impact:.1%}", confidence, consistency))
+    return rows
+
+
 def _style_axis(axis, *, is_datetime: bool) -> None:
     axis.grid(True, color="#D8DEE9", linewidth=0.6, alpha=0.8)
     axis.spines[["top", "right"]].set_visible(False)
@@ -225,6 +263,26 @@ def _create_overview_page(
         y_position = 0.78 - row_index * 0.13
         summary_axis.text(0.0, y_position, label, fontsize=9, color="#667085", va="center")
         summary_axis.text(0.32, y_position, value, fontsize=10, color="#101828", fontweight="bold", va="center")
+
+    summary_axis.text(
+        0.56,
+        0.82,
+        "How to read the anomaly score",
+        fontsize=10,
+        fontweight="bold",
+        color="#175CD3",
+        va="top",
+    )
+    summary_axis.text(
+        0.56,
+        0.66,
+        SCORE_DIRECTION_NOTE,
+        fontsize=8.5,
+        color="#344054",
+        va="top",
+        linespacing=1.5,
+        bbox={"boxstyle": "round,pad=0.65", "facecolor": "#F5F8FF", "edgecolor": "#B2CCFF"},
+    )
 
     score_axis.plot(x_values, scores, color="#475467", linewidth=1.2, label="MAE anomaly score")
     if ground_truth is not None and ground_truth.any():
@@ -342,11 +400,12 @@ def _create_contribution_graph_page(
     graph_page_number: int,
     graph_page_count: int,
     feature_colors: dict[str, str] | None = None,
+    diagnosis_rows: Sequence[tuple[str, str, str, str]] | None = None,
 ) -> Figure:
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
-    axis = figure.add_axes((0.28, 0.14, 0.64, 0.66))
+    axis = figure.add_axes((0.20, 0.14, 0.44 if diagnosis_rows is not None else 0.72, 0.66))
     figure.suptitle(
-        f"Feature contributions by anomaly ({graph_page_number}/{graph_page_count})",
+        f"Feature contributions and diagnosis by anomaly ({graph_page_number}/{graph_page_count})",
         x=0.07,
         y=0.955,
         ha="left",
@@ -361,6 +420,8 @@ def _create_contribution_graph_page(
         fontsize=10,
         color="#667085",
     )
+    if diagnosis_rows is not None:
+        figure.text(0.71, 0.825, "Reconstruction diagnosis", fontsize=8, fontweight="bold", color="#175CD3")
     if not rows:
         axis.axis("off")
         axis.text(
@@ -431,6 +492,25 @@ def _create_contribution_graph_page(
         axis.text(1.015, y_position, f"{coverage_text} covered", va="center", fontsize=7.5, color="#475467")
         y_labels.append(timestamp.replace("\n", " "))
 
+    if diagnosis_rows is not None:
+        for y_position, (issue, impact, confidence, consistency) in zip(y_positions, diagnosis_rows, strict=True):
+            normalized_y = 0.14 + 0.66 * ((y_position + 0.75) / MAX_EXPLANATIONS_PER_PAGE)
+            figure.text(0.71, normalized_y + 0.018, issue, fontsize=7, fontweight="bold", color="#101828")
+            figure.text(
+                0.71,
+                normalized_y - 0.002,
+                f"Impact {impact}  |  Confidence {confidence}",
+                fontsize=6.5,
+                color="#344054",
+            )
+            figure.text(
+                0.71,
+                normalized_y - 0.022,
+                f"Consistency {consistency}",
+                fontsize=6.5,
+                color="#667085",
+            )
+
     axis.set_yticks(y_positions, labels=y_labels)
     axis.set_ylim(-0.75, MAX_EXPLANATIONS_PER_PAGE - 0.25)
     axis.set_xlim(0.0, 1.15)
@@ -473,6 +553,37 @@ def _aggregate_explanation_contributions(
     return contributions, sum(share for _, share in contributions)
 
 
+def _summarize_diagnoses(
+    result_df: pd.DataFrame,
+    detected: np.ndarray,
+) -> list[tuple[str, str]] | None:
+    if not all(column in result_df.columns for column in REQUIRED_DIAGNOSIS_COLUMNS):
+        return None
+    anomalous = result_df.loc[detected]
+    if anomalous.empty:
+        return [
+            ("Most common issue", "Not available"),
+            ("Median impact", "0.0%"),
+            ("High confidence", "0.0%"),
+            ("Consistency", "Not evaluated"),
+        ]
+    issues = anomalous["LikelyReconstructionIssue"].astype(str)
+    most_common_issue = issues.value_counts().index[0]
+    median_impact = float(pd.to_numeric(anomalous["RepairImpact"], errors="coerce").median())
+    high_confidence = float(anomalous["DiagnosticConfidence"].astype(str).eq("High").mean())
+    consistency_values = anomalous["ExplanationConsistency"].astype(str)
+    numeric_consistency = pd.to_numeric(consistency_values.str.removesuffix("%"), errors="coerce")
+    consistency = (
+        f"{float(numeric_consistency.median()):.0f}%" if numeric_consistency.notna().any() else "Not evaluated"
+    )
+    return [
+        ("Most common issue", most_common_issue),
+        ("Median impact", f"{median_impact:.1%}"),
+        ("High confidence", f"{high_confidence:.1%}"),
+        ("Consistency", consistency),
+    ]
+
+
 def _create_consolidated_contribution_page(
     contributions: Sequence[tuple[str, float]],
     *,
@@ -480,6 +591,7 @@ def _create_consolidated_contribution_page(
     anomaly_count: int,
     page_number: int,
     max_report_pages: int,
+    diagnosis_summary: Sequence[tuple[str, str]] | None = None,
 ) -> Figure:
     """Create one page summarizing the strongest contributors across all anomalies."""
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
@@ -542,6 +654,12 @@ def _create_consolidated_contribution_page(
         fontsize=9,
         color="#475467",
     )
+    if diagnosis_summary:
+        figure.text(0.07, 0.075, "Reconstruction diagnosis", fontsize=9, fontweight="bold", color="#175CD3")
+        for index, (label, value) in enumerate(diagnosis_summary):
+            x_position = 0.27 + index * 0.17
+            figure.text(x_position, 0.077, label, fontsize=7, color="#667085")
+            figure.text(x_position, 0.052, value, fontsize=8, fontweight="bold", color="#101828")
     _add_footer(figure, page_number)
     return figure
 
@@ -554,73 +672,170 @@ def _write_explanation_csv(
     *,
     is_datetime: bool,
 ) -> Path:
-    columns = (
+    columns = [
         "Anomalous timestamp",
         "Top contributors",
         "Contribution shares",
         "Explanation coverage",
-    )
+    ]
+    include_diagnosis = all(column in result_df.columns for column in REQUIRED_DIAGNOSIS_COLUMNS)
+    if include_diagnosis:
+        columns.extend(
+            ["Likely reconstruction issue", "Repair impact", "Diagnostic confidence", "Explanation consistency"]
+        )
     records = []
     x_array = np.asarray(x_values)
     for row_index in np.flatnonzero(detected):
         contributors = _parse_explanation_list(result_df.iloc[row_index]["TopContributors"], name="TopContributors")
         shares = _parse_explanation_list(result_df.iloc[row_index]["ContributionShares"], name="ContributionShares")
         coverage = float(result_df.iloc[row_index]["ExplanationCoverage"])
-        records.append(
-            {
-                "Anomalous timestamp": _format_explanation_sample(x_array[row_index], is_datetime=is_datetime).replace(
-                    "\n", " "
-                ),
-                "Top contributors": json.dumps([str(value) for value in contributors], separators=(",", ":")),
-                "Contribution shares": json.dumps([float(value) for value in shares], separators=(",", ":")),
-                "Explanation coverage": coverage,
-            }
-        )
+        record = {
+            "Anomalous timestamp": _format_explanation_sample(x_array[row_index], is_datetime=is_datetime).replace(
+                "\n", " "
+            ),
+            "Top contributors": json.dumps([str(value) for value in contributors], separators=(",", ":")),
+            "Contribution shares": json.dumps([float(value) for value in shares], separators=(",", ":")),
+            "Explanation coverage": coverage,
+        }
+        if include_diagnosis:
+            record.update(
+                {
+                    "Likely reconstruction issue": result_df.iloc[row_index]["LikelyReconstructionIssue"],
+                    "Repair impact": float(result_df.iloc[row_index]["RepairImpact"]),
+                    "Diagnostic confidence": result_df.iloc[row_index]["DiagnosticConfidence"],
+                    "Explanation consistency": result_df.iloc[row_index]["ExplanationConsistency"],
+                }
+            )
+        records.append(record)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame.from_records(records, columns=columns).to_csv(output_path, index=False)
     return output_path
 
 
-def _create_mae_note_page(*, page_number: int, uses_row_numbers: bool = False) -> Figure:
+def _create_mae_note_page(
+    *,
+    page_number: int,
+    uses_row_numbers: bool = False,
+    include_diagnosis: bool = False,
+) -> Figure:
     figure = Figure(figsize=(11.0, 8.5), facecolor="white")
-    axis = figure.add_axes((0.09, 0.12, 0.82, 0.76))
+    axis = figure.add_axes((0.07, 0.10, 0.86, 0.80))
     axis.axis("off")
+    axis.set_xlim(0.0, 1.0)
+    axis.set_ylim(0.0, 1.0)
+    axis.set_autoscale_on(False)
 
-    axis.text(0.0, 0.96, "About the MAE anomaly score", fontsize=18, fontweight="bold", color="#17365D", va="top")
+    title = "How to interpret this report" if include_diagnosis else "About the MAE anomaly score"
+    axis.text(0.0, 0.98, title, fontsize=18, fontweight="bold", color="#17365D", va="top")
     axis.text(
         0.0,
-        0.83,
-        "MAE means mean absolute error. In this report, it measures the average absolute difference "
-        "between the observed values and NV-Tesseract's reconstructed values at each sample.",
-        fontsize=11,
+        0.86,
+        "MAE means mean absolute error. It is the average absolute\n"
+        "difference between observed and reconstructed values at each sample.",
+        fontsize=9.5,
         color="#344054",
         va="top",
         wrap=True,
     )
     axis.text(
         0.0,
-        0.65,
+        0.70,
         r"$\mathrm{MAE}(t)=\frac{1}{F}\sum_{f=1}^{F}|x_{t,f}-\hat{x}_{t,f}|$",
-        fontsize=16,
+        fontsize=14,
         color="#101828",
         va="top",
     )
     notes = [
-        "A larger MAE means the detector reconstructed that sample less accurately.",
-        "The anomaly flag is produced by applying the selected threshold strategy to the MAE sequence.",
-        "MAE scale depends on preprocessing and feature scaling, so values should be interpreted in the context of the same model and data pipeline.",
-        "A high MAE identifies unusual reconstruction behavior; by itself, it does not establish physical causality or root cause.",
+        "Lower MAE means a closer reconstruction and more typical\n"
+        "behavior. Higher MAE means a larger mismatch and more\n"
+        "anomalous behavior.",
+        "The anomaly flag is produced by applying the selected\nthreshold strategy to the MAE sequence.",
+        "MAE scale depends on preprocessing and feature scaling.\nCompare values within the same model and data pipeline.",
+        "High MAE identifies unusual reconstruction behavior. It does\nnot establish physical causality or root cause.",
     ]
     if uses_row_numbers:
         notes.append(
             "No usable timestamp column was provided, so time steps in this report are zero-based DataFrame row numbers."
         )
-    axis.text(0.0, 0.48, "Interpretation notes", fontsize=12, fontweight="bold", color="#175CD3", va="top")
-    for note_index, note in enumerate(notes):
-        y_position = 0.39 - note_index * 0.08
-        axis.text(0.0, y_position, "-", fontsize=12, color="#175CD3", va="top")
-        axis.text(0.035, y_position, note, fontsize=10, color="#344054", va="top", wrap=True)
+    axis.text(0.0, 0.57, "MAE interpretation", fontsize=11, fontweight="bold", color="#175CD3", va="top")
+    note_positions = [0.49, 0.34, 0.23, 0.12, 0.02]
+    for y_position, note in zip(note_positions[: len(notes)], notes, strict=True):
+        axis.text(0.0, y_position, "-", fontsize=10, color="#175CD3", va="top")
+        axis.text(0.025, y_position, note, fontsize=8.5, color="#344054", va="top", wrap=True)
+
+    if include_diagnosis:
+        x_position = 0.53
+        axis.plot([0.49, 0.49], [0.05, 0.89], color="#D8DEE9", linewidth=0.8, transform=axis.transAxes)
+        axis.text(
+            x_position,
+            0.86,
+            "Reconstruction diagnosis",
+            fontsize=11,
+            fontweight="bold",
+            color="#175CD3",
+            va="top",
+        )
+        axis.text(
+            x_position,
+            0.79,
+            "These metrics describe how the detector responded to four\n"
+            "tested repairs. They do not prove physical causality or root cause.",
+            fontsize=8.5,
+            color="#344054",
+            va="top",
+            wrap=True,
+        )
+        axis.text(x_position, 0.69, "Likely issue", fontsize=9, fontweight="bold", color="#101828", va="top")
+        axis.text(
+            x_position,
+            0.645,
+            "The pattern whose repair reduced the anomaly score the most.\nPossible values:",
+            fontsize=8,
+            color="#475467",
+            va="top",
+        )
+        issue_values = [
+            "Level shift - sustained upward or downward change.",
+            "Trend change - unexpected change in direction or slope.",
+            "Transient spike - brief, isolated jump or drop.",
+            "Variance burst - temporary increase in fluctuation or noise.",
+            "No supported repair - none of the tested repairs reduced the score.",
+        ]
+        for index, value in enumerate(issue_values):
+            y_position = 0.56 - index * 0.045
+            axis.text(x_position, y_position, "-", fontsize=8, color="#175CD3", va="top")
+            axis.text(x_position + 0.018, y_position, value, fontsize=7.6, color="#344054", va="top")
+
+        axis.text(x_position, 0.31, "Repair impact", fontsize=9, fontweight="bold", color="#101828", va="top")
+        axis.text(
+            x_position,
+            0.265,
+            "Percentage decrease in anomaly score after the best repair.\n"
+            "Larger values mean a stronger effect on the detector.",
+            fontsize=8,
+            color="#475467",
+            va="top",
+        )
+        axis.text(x_position, 0.18, "Diagnostic confidence", fontsize=9, fontweight="bold", color="#101828", va="top")
+        axis.text(
+            x_position,
+            0.135,
+            "Best-versus-next-best margin: High >=20 points; Moderate\n"
+            "10-20; Low <10; Inconclusive means no clear improvement.",
+            fontsize=8,
+            color="#475467",
+            va="top",
+        )
+        axis.text(x_position, 0.07, "Explanation consistency", fontsize=9, fontweight="bold", color="#101828", va="top")
+        axis.text(
+            x_position,
+            0.025,
+            "Agreement across repeated evaluations; Not evaluated means one evaluation was used.",
+            fontsize=7.4,
+            color="#475467",
+            va="top",
+        )
 
     _add_footer(figure, page_number)
     return figure
@@ -702,6 +917,9 @@ def generate_anomaly_detection_report(
         x_values,
         is_datetime=is_datetime,
     )
+    diagnosis_rows = _resolve_diagnosis_rows(result_df, detected)
+    if diagnosis_rows is not None and explanation_rows is None:
+        raise ValueError("Reconstruction-diagnosis report data requires feature-contribution explanation columns.")
 
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -735,6 +953,14 @@ def generate_anomaly_detection_report(
         ]
         if explanation_rows
         else ([[]] if explanation_rows is not None else [])
+    )
+    diagnosis_groups = (
+        [
+            diagnosis_rows[index : index + MAX_EXPLANATIONS_PER_PAGE]
+            for index in range(0, len(diagnosis_rows), MAX_EXPLANATIONS_PER_PAGE)
+        ]
+        if diagnosis_rows
+        else ([[]] if diagnosis_rows is not None else [])
     )
     explanation_features = list(
         dict.fromkeys(
@@ -798,6 +1024,7 @@ def generate_anomaly_detection_report(
                     anomaly_count=int(detected.sum()),
                     page_number=2 + len(feature_groups),
                     max_report_pages=max_report_pages,
+                    diagnosis_summary=_summarize_diagnoses(result_df, detected),
                 )
             )
         for graph_page_number, group in enumerate(
@@ -805,6 +1032,7 @@ def generate_anomaly_detection_report(
             start=1,
         ):
             page_number = 1 + len(feature_groups) + graph_page_number
+            diagnosis_group = diagnosis_groups[graph_page_number - 1] if diagnosis_groups else None
             pdf.savefig(
                 _create_contribution_graph_page(
                     group,
@@ -812,12 +1040,14 @@ def generate_anomaly_detection_report(
                     graph_page_number=graph_page_number,
                     graph_page_count=len(explanation_groups),
                     feature_colors=explanation_feature_colors,
+                    diagnosis_rows=diagnosis_group,
                 )
             )
         pdf.savefig(
             _create_mae_note_page(
                 page_number=page_count,
                 uses_row_numbers=x_label.startswith("Row number"),
+                include_diagnosis=diagnosis_rows is not None,
             )
         )
     return destination
