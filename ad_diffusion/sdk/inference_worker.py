@@ -16,7 +16,7 @@ import logging
 import os
 import sys
 import time
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 
 # Log start time before any heavy imports
 start_time = time.time()
@@ -93,13 +93,13 @@ def main():
         # With CUDA_VISIBLE_DEVICES set, cuda:0 refers to our assigned GPU
         device = torch.device("cuda:0")
 
-        # Set seed for reproducibility
-        device_seed = seed + gpu_id
-        random.seed(device_seed)
-        np.random.seed(device_seed)
-        torch.manual_seed(device_seed)
+        # Keep process-level randomness independent of physical GPU assignment.
+        # Diffusion noise itself is seeded per global window below.
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed(device_seed)
+            torch.cuda.manual_seed(seed)
 
         # Load model
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
@@ -120,12 +120,17 @@ def main():
             # Create dataloader for this chunk
             if isinstance(data_chunk, dict) and data_chunk.get("window_shm"):
                 shm = shared_memory.SharedMemory(name=data_chunk["shm_name"])
+                # This worker only borrows the parent-owned segment. Without
+                # unregistering, every worker's resource tracker tries to unlink it
+                # at process exit and reports a false leak/double-unlink warning.
+                resource_tracker.unregister(shm._name, "shared_memory")
                 # Convert JSON-serialized dtype (str) and shape (list) back to numpy types
                 shm_dtype = np.dtype(data_chunk["dtype"])
                 shm_shape = tuple(data_chunk["shape"])
                 windows = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
                 loader1, loader2 = get_dataloader_from_windows(
                     windows,
+                    batch_size=data_chunk.get("batch_size", 32),
                     split=data_chunk["split"],
                     window_indices=data_chunk["window_indices"],
                 )
@@ -145,6 +150,9 @@ def main():
                 nsample=nsample,
                 use_dpm_solver=use_dpm_solver,  # NEW: Pass DPM parameters
                 dpm_steps=dpm_steps,  # NEW: Pass DPM parameters
+                window_seeds=[seed + window_index for window_index in data_chunk["window_indices"]]
+                if isinstance(data_chunk, dict) and data_chunk.get("window_shm")
+                else None,
             )
         finally:
             if shm is not None:

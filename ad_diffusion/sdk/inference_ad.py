@@ -112,6 +112,7 @@ PROFILE_RESIDUALS = os.environ.get("TESSERACT_PROFILE_RESIDUALS", "0") == "1"
 
 # Default seed for reproducibility
 DEFAULT_SEED = 42
+INFERENCE_BATCH_SIZE = 32
 
 
 def set_seed(seed: int = DEFAULT_SEED) -> None:
@@ -612,15 +613,18 @@ def _build_window_indexes(total_rows: int, window_length: int, window_split: int
 
 
 def _split_indexes(indexes: list[int], num_parts: int) -> list[list[int]]:
+    """Split indexes without changing canonical inference batch boundaries."""
     if num_parts <= 1:
         return [indexes]
-    chunk_size = len(indexes) // num_parts
-    remainder = len(indexes) % num_parts
+
+    batches = [indexes[i : i + INFERENCE_BATCH_SIZE] for i in range(0, len(indexes), INFERENCE_BATCH_SIZE)]
+    chunk_size = len(batches) // num_parts
+    remainder = len(batches) % num_parts
     chunks: list[list[int]] = []
     start = 0
     for i in range(num_parts):
         end = start + chunk_size + (1 if i < remainder else 0)
-        chunks.append(indexes[start:end])
+        chunks.append([index for batch in batches[start:end] for index in batch])
         start = end
     return chunks
 
@@ -645,9 +649,14 @@ def _build_window_tensor(
 
 def _create_shared_memory(array: np.ndarray) -> dict:
     shm = shared_memory.SharedMemory(create=True, size=array.nbytes)
-    shm_array = np.ndarray(array.shape, dtype=array.dtype, buffer=shm.buf)
-    shm_array[:] = array
-    return {"name": shm.name, "shape": array.shape, "dtype": array.dtype}
+    try:
+        shm_array = np.ndarray(array.shape, dtype=array.dtype, buffer=shm.buf)
+        shm_array[:] = array
+        return {"name": shm.name, "shape": array.shape, "dtype": array.dtype}
+    finally:
+        # The segment remains alive until unlink(), but this creator handle is no
+        # longer needed. Keeping it open triggers resource_tracker leak warnings.
+        shm.close()
 
 
 def _cleanup_shared_memory(shm_info: dict) -> None:
@@ -777,7 +786,15 @@ def combine_samples_and_compute_residuals(samples_list: list, target) -> dict:
     }
 
 
-def evaluate_ad_tesseract2(model, test_loader1, test_loader2, nsample=30, use_dpm_solver=False, dpm_steps=20):
+def evaluate_ad_tesseract2(
+    model,
+    test_loader1,
+    test_loader2,
+    nsample=30,
+    use_dpm_solver=False,
+    dpm_steps=20,
+    window_seeds=None,
+):
     """
     Evaluate the model on the test data with optional DPM-Solver support.
 
@@ -804,6 +821,7 @@ def evaluate_ad_tesseract2(model, test_loader1, test_loader2, nsample=30, use_dp
         save_results=False,
         use_dpm_solver=use_dpm_solver,
         dpm_steps=dpm_steps,
+        window_seeds=window_seeds,
     )
     timings["diffusion_sampling"] = time.perf_counter() - t0
 
@@ -1153,15 +1171,16 @@ def inference_ad_tesseract2_mp(
         dict with residual, residual_l2, target, recon, target_dim keys.
 
     Note:
-        Combining multiprocessing with DPM-Solver provides massive speedup!
-        Example: 4 GPUs * 50x DPM speedup = 200x total speedup vs single-GPU standard diffusion.
+        Multi-GPU scaling is workload-dependent. Workers process canonical batches
+        independently; additional visible GPUs do not imply linear speedup.
     """
     # Ensure weights are available locally before spinning up workers (which
     # otherwise each race to download the same files).
     resolved_model, resolved_config = _resolve_model_paths(model_path, config_path)
 
     total_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    if total_gpus <= 1:
+    if total_gpus == 0:
+        set_seed(seed)
         return inference_ad_tesseract2(
             data,
             resolved_model,
@@ -1184,15 +1203,10 @@ def inference_ad_tesseract2_mp(
     # Log multiprocessing + DPM strategy
     method_str = f"DPM-Solver ({dpm_steps} steps)" if use_dpm_solver else "Standard Diffusion"
     logger.info("%s", "\n" + "=" * 60)
-    logger.info("MULTI-GPU INFERENCE with %s", method_str)
+    logger.info("GPU WORKER INFERENCE with %s", method_str)
     logger.info("%s", "=" * 60)
     logger.info("Processes: %s", num_processes)
     logger.info("GPU IDs: %s", gpu_ids)
-    if use_dpm_solver:
-        per_process_speedup = 1000 / dpm_steps
-        total_speedup = per_process_speedup * num_processes
-        logger.info("Per-GPU speedup: ~%.0fx", per_process_speedup)
-        logger.info("Total estimated speedup: ~%.0fx vs single-GPU standard", total_speedup)
     logger.info("%s\n", "=" * 60)
 
     model_path = Path(resolved_model)
@@ -1247,6 +1261,7 @@ def inference_ad_tesseract2_mp(
                         "dtype": str(shm_info["dtype"]),
                         "window_indices": chunk,
                         "split": split,
+                        "batch_size": INFERENCE_BATCH_SIZE,
                     },
                     "model_path": str(model_path),
                     "config": config,

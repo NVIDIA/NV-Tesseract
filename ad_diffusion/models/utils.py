@@ -235,6 +235,7 @@ def evaluate(
     save_results=True,
     use_dpm_solver=False,
     dpm_steps=20,
+    window_seeds=None,
 ):
     """
     Evaluate the model on test data with optional DPM-Solver for fast inference.
@@ -286,15 +287,33 @@ def evaluate(
         else:
             logger.info("Using standard diffusion sampling")
 
+        window_offset = 0
         with tqdm(zip(test_loader1, test_loader2, strict=False), mininterval=5.0, maxinterval=50.0) as it:
             for batch_no, (test_batch1, test_batch2) in enumerate(it, start=1):
+                generators = None
+                if window_seeds is not None:
+                    batch_size = len(test_batch1["observed_data"])
+                    batch_seeds = window_seeds[window_offset : window_offset + batch_size]
+                    if len(batch_seeds) != batch_size:
+                        raise ValueError(
+                            f"Missing per-window seeds: need {batch_size} at offset {window_offset}, "
+                            f"got {len(batch_seeds)}."
+                        )
+                    generators = []
+                    for window_seed in batch_seeds:
+                        generator = torch.Generator(device=model.device)
+                        generator.manual_seed(int(window_seed))
+                        generators.append(generator)
+                    window_offset += batch_size
+
                 # Process first batch with selected sampling method
+                generator_kwargs = {"generators": generators} if generators is not None else {}
                 if use_dpm_solver:
                     samples, c_target, eval_points, observed_points, observed_time = model.evaluate_with_dpm(
-                        test_batch1, nsample, dpm_steps
+                        test_batch1, nsample, dpm_steps, **generator_kwargs
                     )
                 else:
-                    output = model.evaluate(test_batch1, nsample)
+                    output = model.evaluate(test_batch1, nsample, **generator_kwargs)
                     samples, c_target, eval_points, observed_points, observed_time = output
 
                 samples = samples.permute(0, 1, 3, 2)
@@ -304,9 +323,11 @@ def evaluate(
 
                 # Process second batch with selected sampling method
                 if use_dpm_solver:
-                    samples2, _, eval_points2, _, _ = model.evaluate_with_dpm(test_batch2, nsample, dpm_steps)
+                    samples2, _, eval_points2, _, _ = model.evaluate_with_dpm(
+                        test_batch2, nsample, dpm_steps, **generator_kwargs
+                    )
                 else:
-                    output2 = model.evaluate(test_batch2, nsample)
+                    output2 = model.evaluate(test_batch2, nsample, **generator_kwargs)
                     samples2, _, eval_points2, _, _ = output2
 
                 samples2 = samples2.permute(0, 1, 3, 2)
@@ -343,6 +364,9 @@ def evaluate(
                     },
                     refresh=True,
                 )
+
+        if window_seeds is not None and window_offset != len(window_seeds):
+            raise ValueError(f"Unused per-window seeds: consumed {window_offset}, received {len(window_seeds)}.")
 
         # Save generated outputs
         all_target = torch.cat(all_target, dim=0).to("cpu")

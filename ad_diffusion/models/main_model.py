@@ -439,7 +439,33 @@ class TSDiffuser_base(nn.Module):
 
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, n_samples, strategy_type):
+    @staticmethod
+    def _randn_like_per_window(reference, generators=None):
+        """Generate noise from RNG streams bound to individual windows.
+
+        A regular ``torch.randn_like`` consumes one device-wide RNG stream for the
+        complete batch. That makes a window's noise depend on which other windows
+        share its batch. ``generators`` keeps one stream per batch row so changing
+        the worker or batch partition does not change that window's noise.
+        """
+        if generators is None:
+            return torch.randn_like(reference)
+        if len(generators) != reference.shape[0]:
+            raise ValueError(f"Expected one RNG generator per window ({reference.shape[0]}), got {len(generators)}.")
+        return torch.stack(
+            [
+                torch.randn(
+                    sample.shape,
+                    dtype=sample.dtype,
+                    device=sample.device,
+                    generator=generator,
+                )
+                for sample, generator in zip(reference, generators, strict=True)
+            ],
+            dim=0,
+        )
+
+    def impute(self, observed_data, cond_mask, side_info, n_samples, strategy_type, generators=None):
         B, K, L = observed_data.shape
 
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
@@ -450,11 +476,11 @@ class TSDiffuser_base(nn.Module):
                 noisy_obs = observed_data
                 noisy_cond_history = []
                 for t in range(self.num_steps):
-                    noise = torch.randn_like(noisy_obs)
+                    noise = self._randn_like_per_window(noisy_obs, generators)
                     noisy_obs = (self.alpha_hat[t] ** 0.5) * noisy_obs + self.beta[t] ** 0.5 * noise
                     noisy_cond_history.append(noisy_obs * cond_mask)
 
-            current_sample = torch.randn_like(observed_data)
+            current_sample = self._randn_like_per_window(observed_data, generators)
 
             for t in range(self.num_steps - 1, -1, -1):
                 if self.is_unconditional:
@@ -476,7 +502,7 @@ class TSDiffuser_base(nn.Module):
                 current_sample = coeff1 * (current_sample - coeff2 * predicted)
 
                 if t > 0:
-                    noise = torch.randn_like(current_sample)
+                    noise = self._randn_like_per_window(current_sample, generators)
                     sigma = ((1.0 - self.alpha[t - 1]) / (1.0 - self.alpha[t]) * self.beta[t]) ** 0.5
                     current_sample += sigma * noise
 
@@ -530,7 +556,16 @@ class TSDiffuser_base(nn.Module):
             imputed_samples[:, i] = current_sample.detach()
         return imputed_samples
 
-    def dpm_solver_impute(self, observed_data, cond_mask, side_info, n_samples, strategy_type, num_steps=20):
+    def dpm_solver_impute(
+        self,
+        observed_data,
+        cond_mask,
+        side_info,
+        n_samples,
+        strategy_type,
+        num_steps=20,
+        generators=None,
+    ):
         """
         Fast inference using DPM-Solver++ (10-20 steps instead of 1000).
         No retraining needed - works with existing trained model.
@@ -576,14 +611,14 @@ class TSDiffuser_base(nn.Module):
                 # Precompute noisy conditions for timesteps we'll actually use
                 for t in timesteps_to_use:
                     t_idx = t.item()
-                    noise = torch.randn_like(observed_data)
+                    noise = self._randn_like_per_window(observed_data, generators)
                     alpha_t = self.alpha_hat[t_idx]
                     beta_t = self.beta[t_idx]
                     noisy_obs_t = (alpha_t**0.5) * observed_data + (beta_t**0.5) * noise
                     noisy_cond_history[t_idx] = noisy_obs_t * cond_mask
 
             # Initialize from noise
-            current_sample = torch.randn_like(observed_data)
+            current_sample = self._randn_like_per_window(observed_data, generators)
 
             # Define model wrapper for DPM-Solver
             def model_fn(x, t_continuous):
@@ -615,7 +650,7 @@ class TSDiffuser_base(nn.Module):
                         noisy_cond = noisy_cond_history[t_idx]
                     else:
                         # Fallback: compute on the fly (shouldn't happen with precompute)
-                        noise = torch.randn_like(observed_data)
+                        noise = self._randn_like_per_window(observed_data, generators)
                         alpha_t = self.alpha_hat[t_idx]
                         beta_t = self.beta[t_idx]
                         noisy_cond = (alpha_t**0.5) * observed_data + (beta_t**0.5) * noise
@@ -743,7 +778,7 @@ class TSDiffuser_base(nn.Module):
             strategy_type=strategy_type,
         )
 
-    def evaluate(self, batch, n_samples):
+    def evaluate(self, batch, n_samples, generators=None):
         """
         Standard evaluation using full diffusion process.
 
@@ -771,14 +806,21 @@ class TSDiffuser_base(nn.Module):
             side_info = self.get_side_info(observed_tp, cond_mask)
 
             normalized_data, data_mean, data_std = self._normalize_observed_data(observed_data)
-            samples = self.impute(normalized_data, cond_mask, side_info, n_samples, strategy_type)
+            samples = self.impute(
+                normalized_data,
+                cond_mask,
+                side_info,
+                n_samples,
+                strategy_type,
+                generators=generators,
+            )
             samples = self._denormalize_samples(samples, data_mean, data_std)
 
             for i in range(len(cut_length)):  # to avoid double evaluation
                 target_mask[i, ..., 0 : cut_length[i].item()] = 0
         return samples, observed_data, target_mask, observed_mask, observed_tp
 
-    def evaluate_with_dpm(self, batch, n_samples, dpm_steps=20):
+    def evaluate_with_dpm(self, batch, n_samples, dpm_steps=20, generators=None):
         """
         Fast evaluation using DPM-Solver for 50-100x speedup.
 
@@ -813,7 +855,13 @@ class TSDiffuser_base(nn.Module):
             normalized_data, data_mean, data_std = self._normalize_observed_data(observed_data)
             # Use DPM-Solver for fast sampling
             samples = self.dpm_solver_impute(
-                normalized_data, cond_mask, side_info, n_samples, strategy_type, num_steps=dpm_steps
+                normalized_data,
+                cond_mask,
+                side_info,
+                n_samples,
+                strategy_type,
+                num_steps=dpm_steps,
+                generators=generators,
             )
             samples = self._denormalize_samples(samples, data_mean, data_std)
 
