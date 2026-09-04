@@ -502,6 +502,8 @@ def preprocess_simple(data, model_dir, domain=None, scale_factor=1.0):
     """
     Simplified preprocessing function for quick integration.
 
+    Produces the legacy 38 engineered feature columns without metadata.
+
     Args:
         data: Input data (numpy array or DataFrame)
         model_dir: Directory containing saved preprocessing models
@@ -516,7 +518,7 @@ def preprocess_simple(data, model_dir, domain=None, scale_factor=1.0):
         data=data,
         domain=domain,
         model_dir=model_dir,
-        target_features=38,
+        target_dim=38,
         add_metadata=False,  # Don't add metadata for simple version
     )
 
