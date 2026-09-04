@@ -26,9 +26,12 @@ import sys
 import types
 import warnings
 from argparse import Namespace
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+from weakref import WeakKeyDictionary
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +208,33 @@ def nanstd(tensor, dim=None, keepdim=False):
     return nanvar(tensor, dim=dim, keepdim=keepdim).sqrt()
 
 
+RevINStatistics = tuple[torch.Tensor, torch.Tensor]
+_RevINGradientContexts = tuple[tuple[object, bool], ...]
+_REVIN_GRADIENT_CONTEXTS: ContextVar[_RevINGradientContexts] = ContextVar(
+    "revin_gradient_contexts",
+    default=(),
+)
+_REVIN_LEGACY_STATISTICS: ContextVar[WeakKeyDictionary[nn.Module, RevINStatistics] | None] = ContextVar(
+    "revin_legacy_statistics",
+    default=None,
+)
+
+
+def _revin_statistics_gradients_enabled() -> bool:
+    contexts = _REVIN_GRADIENT_CONTEXTS.get()
+    return bool(contexts and contexts[-1][1])
+
+
 class RevIN(nn.Module):
+    """Reversible instance normalization with request-local statistics.
+
+    A caller that later denormalizes must request the statistics produced by
+    the matching normalization call and pass them back explicitly. Legacy
+    callers that omit return_statistics keep their latest statistics in the
+    current thread/task context instead of module state, so the original
+    sequential norm then denorm API remains safe across requests.
+    """
+
     def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = False):
         super().__init__()
         self.num_features = num_features
@@ -214,43 +243,105 @@ class RevIN(nn.Module):
         if self.affine:
             self._init_params()
 
-    def forward(self, x: torch.Tensor, mode: str = "norm", mask: torch.Tensor = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        mode: str = "norm",
+        mask: torch.Tensor | None = None,
+        statistics: RevINStatistics | None = None,
+        return_statistics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, RevINStatistics]:
         if mode == "norm":
-            self._get_statistics(x, mask=mask)
-            x = self._normalize(x)
-        elif mode == "denorm":
-            x = self._denormalize(x)
-        else:
-            raise NotImplementedError
-        return x
+            if statistics is not None:
+                raise ValueError("statistics must not be provided when mode='norm'")
+            statistics = self._get_statistics(x, mask=mask)
+            normalized = self._normalize(x, statistics)
+            if return_statistics:
+                return normalized, statistics
+            self._remember_legacy_statistics(statistics)
+            return normalized
+        if mode == "denorm":
+            if statistics is None:
+                statistics = self._legacy_statistics()
+            if return_statistics:
+                raise ValueError("return_statistics is only supported when mode='norm'")
+            return self._denormalize(x, statistics)
+        raise NotImplementedError
+
+    @staticmethod
+    @contextmanager
+    def statistics_gradient_context(*, enabled: bool):
+        """Select statistics autograd behavior for the current thread/task.
+
+        Entries are removed by identity instead of reset with a ContextVar
+        token. That keeps overlapping contexts correct even if callers exit
+        them out of LIFO order.
+        """
+
+        marker = object()
+        contexts = _REVIN_GRADIENT_CONTEXTS.get()
+        _REVIN_GRADIENT_CONTEXTS.set((*contexts, (marker, enabled)))
+        try:
+            yield
+        finally:
+            contexts = _REVIN_GRADIENT_CONTEXTS.get()
+            _REVIN_GRADIENT_CONTEXTS.set(tuple(context for context in contexts if context[0] is not marker))
 
     def _init_params(self):
         self.affine_weight = nn.Parameter(torch.ones(1, self.num_features, 1))
         self.affine_bias = nn.Parameter(torch.zeros(1, self.num_features, 1))
 
-    def _get_statistics(self, x, mask=None):
+    def _get_statistics(self, x, mask=None) -> RevINStatistics:
         if mask is None:
-            mask = torch.ones((x.shape[0], x.shape[-1]))
+            mask = torch.ones((x.shape[0], x.shape[-1]), device=x.device)
         n_channels = x.shape[1]
-        mask = mask.unsqueeze(1).repeat(1, n_channels, 1).bool()
+        mask = mask.to(device=x.device).unsqueeze(1).expand(-1, n_channels, -1).bool()
         masked_x = torch.where(mask, x, torch.nan)
-        self.mean = torch.nanmean(masked_x, dim=-1, keepdim=True).detach()
-        self.stdev = nanstd(masked_x, dim=-1, keepdim=True).detach() + self.eps
+        mean = torch.nanmean(masked_x, dim=-1, keepdim=True)
+        detached_stdev = nanstd(masked_x, dim=-1, keepdim=True).detach()
 
-    def _normalize(self, x):
-        x = x - self.mean
-        x = x / self.stdev
+        if not _revin_statistics_gradients_enabled():
+            return mean.detach(), detached_stdev + self.eps
+
+        variance = (masked_x - mean).square().nanmean(dim=-1, keepdim=True)
+        eps_sq = torch.as_tensor(float(self.eps) ** 2, dtype=variance.dtype, device=variance.device)
+        safe_stdev = variance.clamp_min(eps_sq).sqrt()
+        stdev = detached_stdev + safe_stdev - safe_stdev.detach() + self.eps
+        return mean, stdev
+
+    def _remember_legacy_statistics(self, statistics: RevINStatistics) -> None:
+        statistics_by_module = _REVIN_LEGACY_STATISTICS.get()
+        updated: WeakKeyDictionary[nn.Module, RevINStatistics] = WeakKeyDictionary()
+        if statistics_by_module is not None:
+            updated.update(statistics_by_module)
+        updated[self] = statistics
+        _REVIN_LEGACY_STATISTICS.set(updated)
+
+    def _legacy_statistics(self) -> RevINStatistics:
+        statistics_by_module = _REVIN_LEGACY_STATISTICS.get()
+        if statistics_by_module is None or self not in statistics_by_module:
+            raise ValueError(
+                "RevIN denormalization requires statistics from a matching normalization call "
+                "in the current thread/task context"
+            )
+        return statistics_by_module[self]
+
+    def _normalize(self, x, statistics: RevINStatistics):
+        mean, stdev = statistics
+        x = x - mean
+        x = x / stdev
         if self.affine:
             x = x * self.affine_weight
             x = x + self.affine_bias
         return x
 
-    def _denormalize(self, x):
+    def _denormalize(self, x, statistics: RevINStatistics):
+        mean, stdev = statistics
         if self.affine:
             x = x - self.affine_bias
             x = x / (self.affine_weight + self.eps * self.eps)
-        x = x * self.stdev
-        x = x + self.mean
+        x = x * stdev
+        x = x + mean
         return x
 
 
@@ -577,7 +668,7 @@ class BackboneModel(nn.Module):
         if input_mask is None:
             input_mask = torch.ones((batch_size, seq_len)).to(x_enc.device)
 
-        x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
+        x_enc, _ = self.normalizer(x=x_enc, mask=input_mask, mode="norm", return_statistics=True)
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
 
         input_mask_patch_view = Masking.convert_seq_to_patch_view(input_mask, self.patch_len)
@@ -615,7 +706,12 @@ class BackboneModel(nn.Module):
             mask = self.mask_generator.generate_mask(x=x_enc, input_mask=input_mask)
             mask = mask.to(x_enc.device)
 
-        x_enc = self.normalizer(x=x_enc, mask=mask * input_mask, mode="norm")
+        x_enc, revin_statistics = self.normalizer(
+            x=x_enc,
+            mask=mask * input_mask,
+            mode="norm",
+            return_statistics=True,
+        )
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
         x_enc = self.tokenizer(x=x_enc)
         enc_in = self.patch_embedding(x_enc, mask=mask)
@@ -636,13 +732,18 @@ class BackboneModel(nn.Module):
         enc_out = self._apply_cross_channel(enc_out)
 
         dec_out = self.head(enc_out)
-        dec_out = self.normalizer(x=dec_out, mode="denorm")
+        dec_out = self.normalizer(x=dec_out, mode="denorm", statistics=revin_statistics)
         return TimeseriesOutputs(input_mask=input_mask, reconstruction=dec_out, pretrain_mask=mask, illegal_output=None)
 
     def forecast(self, *, x_enc: torch.Tensor, input_mask: torch.Tensor = None, **kwargs) -> TimeseriesOutputs:
         batch_size, n_channels, seq_len = x_enc.shape
 
-        x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
+        x_enc, revin_statistics = self.normalizer(
+            x=x_enc,
+            mask=input_mask,
+            mode="norm",
+            return_statistics=True,
+        )
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
         x_enc = self.tokenizer(x=x_enc)
         enc_in = self.patch_embedding(x_enc, mask=torch.ones_like(input_mask))
@@ -660,7 +761,7 @@ class BackboneModel(nn.Module):
         enc_out = self._apply_cross_channel(enc_out)
 
         dec_out = self.head(enc_out)
-        dec_out = self.normalizer(x=dec_out, mode="denorm")
+        dec_out = self.normalizer(x=dec_out, mode="denorm", statistics=revin_statistics)
         return TimeseriesOutputs(input_mask=input_mask, forecast=dec_out)
 
     def classify(
@@ -670,7 +771,7 @@ class BackboneModel(nn.Module):
         if input_mask is None:
             input_mask = torch.ones((batch_size, seq_len)).to(x_enc.device)
 
-        x_enc = self.normalizer(x=x_enc, mask=input_mask, mode="norm")
+        x_enc, _ = self.normalizer(x=x_enc, mask=input_mask, mode="norm", return_statistics=True)
         x_enc = torch.nan_to_num(x_enc, nan=0, posinf=0, neginf=0)
         x_enc = self.tokenizer(x=x_enc)
         enc_in = self.patch_embedding(x_enc, mask=input_mask)
