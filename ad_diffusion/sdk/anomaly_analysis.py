@@ -3,21 +3,30 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yaml
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sdk.explainability import explain_reconstruction_anomalies
 from sdk.inference_ad import (
+    DEFAULT_SEED,
     _resolve_model_paths,
     get_model_target_dim,
     inference_ad_tesseract2_mp,
+    set_seed,
+)
+from sdk.reconstruction_failure import (
+    FAILURE_MODES,
+    build_repair_variants,
+    summarize_repair_diagnostics,
 )
 from sdk.reporting import (
     generate_anomaly_detection_report,
@@ -32,14 +41,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class ADDiffusionConfig:
-    """Reporting configuration for :func:`perform_anomaly_analysis_with_diffusion`.
+    """Explainability and reporting configuration for :func:`perform_anomaly_analysis_with_diffusion`.
 
-    Scoped to report-related parameters — inference-behavior knobs like
-    ``threshold_strategy``, ``nsample``, the model/config paths, and the
-    ``explain``/``explanation_top_k`` explainability toggle stay as direct
-    function arguments.
+    Scoped to the explain toggle and explainability/report-related parameters —
+    inference-behavior knobs like ``threshold_strategy``, ``nsample``, and the
+    model/config paths stay as direct function arguments.
     """
 
+    explain: bool = False
+    explanation_top_k: int = 3
+    diagnose_reconstruction: bool = False
     report_path: str | Path | None = None
     timestamp_column: str | None = None
     ground_truth_column: str | None = None
@@ -96,8 +107,6 @@ def perform_anomaly_analysis_with_diffusion(
     model_config_path: str | Path = "",
     nsample: int = 15,
     preprocess_model_dir: str | Path | None = None,
-    explain: bool = False,
-    explanation_top_k: int = 3,
     sdk_config: ADDiffusionConfig | str | Path | None = None,
 ) -> pd.DataFrame:
     """
@@ -116,15 +125,24 @@ def perform_anomaly_analysis_with_diffusion(
         model_config_path: Path to the model architecture config file (optional if config is in checkpoint)
         nsample: Number of samples for diffusion model inference
         preprocess_model_dir: Directory containing preprocessing model (optional)
-        explain: Whether to add reconstruction-error explanations for detected anomalies.
-        explanation_top_k: Maximum number of contributors returned per anomaly.
-        sdk_config: Reporting `ADDiffusionConfig`, YAML path, or `None` for defaults.
-            See `ADDiffusionConfig` for the field reference.
+        sdk_config: Explainability/reporting `ADDiffusionConfig`, YAML path, or `None` for defaults.
+            Set ``diagnose_reconstruction=True`` to test four reconstruction-failure
+            hypotheses with structure-preserving repairs and paired re-scoring.
+            This requires ``explain=True`` and performs four additional model
+            inference passes. Raw per-hypothesis scores are not returned.
+            See `ADDiffusionConfig` for the full field reference.
 
     Returns:
         DataFrame with original data and anomaly detection results
     """
     cfg = _resolve_sdk_config(sdk_config)
+    if cfg.diagnose_reconstruction and not cfg.explain:
+        raise ValueError("diagnose_reconstruction=True requires explain=True.")
+    if cfg.diagnose_reconstruction and preprocess_model_dir is not None:
+        raise ValueError(
+            "Reconstruction diagnosis currently requires directly mapped input features; "
+            "preprocess_model_dir is not supported."
+        )
 
     # Prepare data for diffusion model
     # The diffusion model expects all numeric columns
@@ -147,8 +165,6 @@ def perform_anomaly_analysis_with_diffusion(
 
     # Validate all columns are numeric by attempting to convert the entire DataFrame
     original_columns = input_df.columns.tolist()
-
-    # Try to convert all columns to numeric at once
     numeric_df = input_df.apply(pd.to_numeric, errors="coerce")
 
     # Check which columns introduced NaNs (indicating non-numeric values)
@@ -160,7 +176,6 @@ def perform_anomaly_analysis_with_diffusion(
         if converted_na_count > original_na_count:
             non_numeric_cols.append(col)
         else:
-            # Update the original dataframe with successfully converted column
             input_df[col] = numeric_df[col]
 
     if non_numeric_cols:
@@ -169,7 +184,6 @@ def perform_anomaly_analysis_with_diffusion(
             f"All input values must be numeric for anomaly detection."
         )
 
-    # Resolve / auto-download weights once up front so downstream calls share them.
     resolved_model, resolved_config = _resolve_model_paths(
         str(model_path) if model_path else None,
         str(model_config_path) if model_config_path else "",
@@ -187,6 +201,8 @@ def perform_anomaly_analysis_with_diffusion(
         )
 
     # Run inference with diffusion model (auto-uses multi-GPU when available)
+    if cfg.diagnose_reconstruction:
+        set_seed(DEFAULT_SEED)
     results = inference_ad_tesseract2_mp(
         data=input_df,
         model_path=resolved_model,
@@ -201,15 +217,16 @@ def perform_anomaly_analysis_with_diffusion(
     # Get target data for advanced thresholding methods
     target_data = results["target"]
 
-    # Model evaluation works on fixed-size windows and may append padded rows to
-    # the final window. Align outputs before threshold calibration so synthetic
-    # padding cannot change the thresholds used for real input rows.
+    # Align padded inference outputs before adaptive-threshold calibration.
     original_length = len(df)
-    if len(residual_scores) != original_length:
-        logger.info(f"Aligning lengths: residual_scores={len(residual_scores)}, original_data={original_length}")
-        residual_scores = residual_scores[:original_length]
-    if len(target_data) != original_length:
-        target_data = target_data[:original_length]
+    if len(residual_scores) != original_length or len(target_data) != original_length:
+        logger.info(
+            "Aligning detector inputs: "
+            f"residual_scores={len(residual_scores)}, target_data={len(target_data)}, "
+            f"original_data={original_length}"
+        )
+    residual_scores = residual_scores[:original_length]
+    target_data = target_data[:original_length]
 
     # Apply thresholding strategy
     if threshold_strategy == "scs":
@@ -221,15 +238,17 @@ def perform_anomaly_analysis_with_diffusion(
     else:
         raise ValueError(f"Unknown threshold strategy: {threshold_strategy}")
 
-    # Create result dataframe. A thresholder may return a longer mask than the
-    # score array, so keep assignment aligned with the input rows as well.
+    # A custom threshold strategy may return a mask aligned to padded model
+    # outputs. Preserve the OSS SDK's one-row-per-input contract.
+    anomalies = np.asarray(anomalies, dtype=bool)[:original_length]
+
+    # Create result dataframe
     result_df = df.copy()
-    anomalies = anomalies[:original_length]
 
     result_df["Anomaly"] = anomalies
     result_df["MAE"] = residual_scores  # Using residual (MAE) as anomaly score
 
-    if explain:
+    if cfg.explain:
         reconstruction = results.get("recon")
         if reconstruction is None:
             raise ValueError("Inference results must include 'recon' when explain=True.")
@@ -237,6 +256,7 @@ def perform_anomaly_analysis_with_diffusion(
         explanation_length = min(original_length, len(target_data), len(reconstruction), len(anomalies))
         target_for_explanation = target_data[:explanation_length]
         reconstruction_for_explanation = reconstruction[:explanation_length]
+
         target_feature_count = target_for_explanation.shape[1] if target_for_explanation.ndim > 1 else 1
         input_feature_count = len(input_df.columns)
         directly_mapped = preprocess_model_dir is None and input_feature_count <= target_feature_count
@@ -248,8 +268,11 @@ def perform_anomaly_analysis_with_diffusion(
             anomaly_mask=anomalies[:explanation_length],
             feature_names=feature_names,
             feature_indices=feature_indices,
-            top_k=explanation_top_k,
+            top_k=cfg.explanation_top_k,
         )
+
+        # Model outputs can be shorter than the source frame for some windowing
+        # configurations. Reindexing preserves the SDK's one-row-per-input contract.
         explanations = explanations.reindex(range(original_length)).fillna(
             {
                 "TopContributors": "[]",
@@ -261,6 +284,46 @@ def perform_anomaly_analysis_with_diffusion(
         for column in explanations.columns:
             result_df[column] = explanations[column].to_numpy()
 
+        if cfg.diagnose_reconstruction:
+            if not directly_mapped:
+                raise ValueError(
+                    "Reconstruction diagnosis requires input features that map directly to model dimensions."
+                )
+            feature_lookup = {str(column): index for index, column in enumerate(input_df.columns)}
+            candidate_feature_indices: list[list[int]] = [[] for _ in range(original_length)]
+            for row_index in np.flatnonzero(anomalies[:original_length]):
+                contributor_names = json.loads(result_df.iloc[row_index]["TopContributors"])
+                candidate_feature_indices[row_index] = [feature_lookup[name] for name in contributor_names]
+
+            reference_window = min(21, len(input_df) if len(input_df) % 2 else max(1, len(input_df) - 1))
+            reference = input_df.rolling(window=reference_window, center=True, min_periods=1).median()
+            repair_variants = build_repair_variants(
+                input_df.to_numpy(dtype=float),
+                reference.to_numpy(dtype=float),
+                anomaly_mask=anomalies[:original_length],
+                candidate_feature_indices=candidate_feature_indices,
+                lookback=min(20, len(input_df)),
+            )
+            repaired_scores: dict[str, np.ndarray] = {}
+            for hypothesis in FAILURE_MODES:
+                set_seed(DEFAULT_SEED)
+                repaired_result = inference_ad_tesseract2_mp(
+                    data=pd.DataFrame(repair_variants[hypothesis], columns=input_df.columns),
+                    model_path=resolved_model,
+                    config_path=resolved_config,
+                    nsample=nsample,
+                    preprocess_model_dir=None,
+                    seed=DEFAULT_SEED,
+                )
+                repaired_scores[hypothesis] = np.asarray(repaired_result["residual"], dtype=float)[:original_length]
+
+            diagnoses = summarize_repair_diagnostics(
+                residual_scores[:original_length],
+                repaired_scores,
+                anomaly_mask=anomalies[:original_length],
+            )
+            for column in diagnoses.columns:
+                result_df[column] = diagnoses[column].to_numpy()
     if cfg.report_path is not None:
         generate_anomaly_detection_report(
             result_df,

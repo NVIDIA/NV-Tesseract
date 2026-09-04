@@ -18,6 +18,7 @@ from sdk.reporting import (
     _aggregate_explanation_contributions,
     _create_contribution_graph_page,
     _create_mae_note_page,
+    _resolve_diagnosis_rows,
     _resolve_explanation_rows,
     _resolve_x_axis,
     generate_anomaly_detection_report,
@@ -141,6 +142,36 @@ def test_mae_note_page_omits_row_number_note_for_timestamped_data() -> None:
     assert not any("zero-based DataFrame row numbers" in text.get_text() for text in figure.axes[0].texts)
 
 
+def test_overview_page_explains_anomaly_score_direction() -> None:
+    """The first report page should state what lower and higher MAE mean."""
+    figure = reporting._create_overview_page(
+        np.arange(3),
+        np.array([0.1, 0.2, 0.3]),
+        np.array([False, False, True]),
+        None,
+        title="Anomaly report",
+        x_label="Row number",
+        is_datetime=False,
+    )
+
+    page_text = [text.get_text() for axis in figure.axes for text in axis.texts]
+    assert "How to read the anomaly score" in page_text
+    assert reporting.SCORE_DIRECTION_NOTE in page_text
+
+
+def test_diagnosis_note_page_explains_metrics_and_likely_issue_values() -> None:
+    """Question 2 reports should explain every end-user metric and issue label."""
+    figure = _create_mae_note_page(page_number=3, include_diagnosis=True)
+
+    page_text = "\n".join(text.get_text() for text in figure.axes[0].texts)
+    assert "Likely issue" in page_text
+    assert "Repair impact" in page_text
+    assert "Diagnostic confidence" in page_text
+    assert "Explanation consistency" in page_text
+    for issue in ["Level shift", "Trend change", "Transient spike", "Variance burst", "No supported repair"]:
+        assert issue in page_text
+
+
 def test_generate_report_includes_explainability_metrics(tmp_path: Path) -> None:
     """Explainability output should add anomaly-detail metrics to the PDF."""
     frame = _report_frame()
@@ -185,6 +216,56 @@ def test_generate_report_includes_explainability_metrics(tmp_path: Path) -> None
     assert exported.loc[0, "Top contributors"] == '["temperature","pressure"]'
     assert exported.loc[0, "Contribution shares"] == "[0.75,0.25]"
     assert exported.loc[0, "Explanation coverage"] == 1.0
+
+
+def test_report_adds_simplified_reconstruction_diagnosis_without_raw_scores(tmp_path: Path) -> None:
+    frame = _report_frame()
+    frame["TopContributors"] = ["[]"] * len(frame)
+    frame["ContributionShares"] = ["[]"] * len(frame)
+    frame["ExplanationCoverage"] = 0.0
+    frame["LikelyReconstructionIssue"] = ""
+    frame["RepairImpact"] = 0.0
+    frame["DiagnosticConfidence"] = ""
+    frame["ExplanationConsistency"] = ""
+    frame.loc[3, ["TopContributors", "ContributionShares", "ExplanationCoverage"]] = [
+        '["temperature","pressure"]',
+        "[0.75,0.25]",
+        1.0,
+    ]
+    frame.loc[7, ["TopContributors", "ContributionShares", "ExplanationCoverage"]] = [
+        '["pressure"]',
+        "[0.6]",
+        0.6,
+    ]
+    frame.loc[3, ["LikelyReconstructionIssue", "RepairImpact", "DiagnosticConfidence", "ExplanationConsistency"]] = [
+        "Level shift",
+        0.63,
+        "High",
+        "Not evaluated",
+    ]
+    frame.loc[7, ["LikelyReconstructionIssue", "RepairImpact", "DiagnosticConfidence", "ExplanationConsistency"]] = [
+        "Transient spike",
+        0.31,
+        "Moderate",
+        "75%",
+    ]
+
+    destination = tmp_path / "diagnosis_report.pdf"
+    generate_anomaly_detection_report(frame, destination)
+
+    assert _resolve_diagnosis_rows(frame, frame["Anomaly"].to_numpy(dtype=bool)) == [
+        ("Level shift", "63.0%", "High", "Not evaluated"),
+        ("Transient spike", "31.0%", "Moderate", "75%"),
+    ]
+    exported = pd.read_csv(tmp_path / "diagnosis_report_explanations.csv")
+    assert list(exported.columns[-4:]) == [
+        "Likely reconstruction issue",
+        "Repair impact",
+        "Diagnostic confidence",
+        "Explanation consistency",
+    ]
+    assert not any(column.startswith(("effect_", "score_after_")) for column in exported.columns)
+    assert destination.read_bytes().startswith(b"%PDF")
 
 
 def test_generate_report_without_explanations_keeps_metrics_optional() -> None:
