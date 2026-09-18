@@ -58,6 +58,7 @@ def main():
     preprocess_model_dir = args["preprocess_model_dir"]
     use_dpm_solver = args.get("use_dpm_solver", False)  # NEW: Extract DPM parameters
     dpm_steps = args.get("dpm_steps", 20)  # NEW: Extract DPM parameters
+    valid_feature_mask = args.get("valid_feature_mask")
 
     try:
         # NOW import torch - after CUDA_VISIBLE_DEVICES is already set
@@ -145,6 +146,7 @@ def main():
                 nsample=nsample,
                 use_dpm_solver=use_dpm_solver,  # NEW: Pass DPM parameters
                 dpm_steps=dpm_steps,  # NEW: Pass DPM parameters
+                valid_feature_mask=valid_feature_mask,
             )
         finally:
             if shm is not None:

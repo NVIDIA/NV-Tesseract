@@ -87,6 +87,7 @@ def build_worker_args(tmp_path: Path) -> tuple[Path, Path]:
         "preprocess_model_dir": None,
         "use_dpm_solver": False,
         "dpm_steps": 20,
+        "valid_feature_mask": [True, True, True, False],
     }
     args_path.write_text(json.dumps(args))
     return args_path, result_path
@@ -107,8 +108,19 @@ def test_worker_keeps_shared_memory_open_until_after_evaluate(monkeypatch, tmp_p
 
     fake_shm = FakeSharedMemory("fake-shm")
 
-    def fake_evaluate(model, loader1, loader2, nsample, use_dpm_solver, dpm_steps):
-        events.append(("evaluate", fake_shm.closed, loader1, loader2, nsample, use_dpm_solver, dpm_steps))
+    def fake_evaluate(model, loader1, loader2, nsample, use_dpm_solver, dpm_steps, valid_feature_mask):
+        events.append(
+            (
+                "evaluate",
+                fake_shm.closed,
+                loader1,
+                loader2,
+                nsample,
+                use_dpm_solver,
+                dpm_steps,
+                valid_feature_mask,
+            )
+        )
         return {
             "residual": np.array([1.0]),
             "residual_l2": np.array([2.0]),
@@ -135,7 +147,7 @@ def test_worker_keeps_shared_memory_open_until_after_evaluate(monkeypatch, tmp_p
     assert saved["results"]["residual"] == [1.0]
     assert events == [
         ("loaders", False, (2, 3, 4), 4, (0, 1)),
-        ("evaluate", False, ["loader1"], ["loader2"], 5, False, 20),
+        ("evaluate", False, ["loader1"], ["loader2"], 5, False, 20, [True, True, True, False]),
         "close",
     ]
     assert fake_shm.closed is True
@@ -156,7 +168,7 @@ def test_worker_closes_shared_memory_when_evaluate_fails(monkeypatch, tmp_path):
 
     fake_shm = FakeSharedMemory("fake-shm")
 
-    def fake_evaluate(model, loader1, loader2, nsample, use_dpm_solver, dpm_steps):
+    def fake_evaluate(model, loader1, loader2, nsample, use_dpm_solver, dpm_steps, valid_feature_mask):
         events.append(("evaluate", fake_shm.closed))
         raise RuntimeError("boom")
 

@@ -27,7 +27,7 @@ uv sync
 ### Standard inference
 
 ```python
-from sdk.forecasting import perform_forecasting
+from sdk.forecasting import ForecastingConfig, perform_forecasting
 import pandas as pd
 import numpy as np
 
@@ -38,14 +38,40 @@ df = pd.DataFrame({
     "feature_b": np.random.randn(600),
 })
 
-forecasts = perform_forecasting(
-    df=df,
+config = ForecastingConfig(
     seq_len=512,
     forecast_horizon=72,
 )
+forecasts = perform_forecasting(df=df, config=config)
 
 # Result contains a `target_forecast` column with `forecast_horizon` rows
 ```
+
+### YAML-backed inference config
+
+When repeated calls need the same inference knobs, put them in YAML and pass the
+file path instead of expanding a long argument list. A fully commented template
+is available at `sdk/forecasting_inference_config.yaml`.
+
+```yaml
+inference:
+  # Number of historical rows consumed for the input context window.
+  seq_len: 512
+  # Number of future rows to predict.
+  forecast_horizon: 72
+  # Native horizon used when training the checkpoint.
+  model_horizon: 72
+  # Enable cross-channel attention for multivariate forecasting.
+  use_cross_channel: true
+```
+
+```python
+forecasts = perform_forecasting(df=df, config="forecasting_inference_config.yaml")
+```
+
+The YAML may be either a flat mapping of `ForecastingConfig` fields or an
+`inference:` section inside a larger spec. Unknown config keys raise
+`ValueError` so misspellings do not silently fall back to defaults.
 
 ### DARR (context-enhanced) inference
 
@@ -56,15 +82,14 @@ context = pd.DataFrame({
     "feature_a": historical_feature_a,
 })
 
-darr_result = perform_forecasting(
-    df=df,
-    context_df=context,
+darr_config = ForecastingConfig(
     seq_len=512,
     forecast_horizon=72,
     alpha=0.2,  # 20% direct, 80% kNN
     k=64,
     temperature=0.05,
 )
+darr_result = perform_forecasting(df=df, config=darr_config, context_df=context)
 
 # DARR output includes hybrid, direct, and kNN forecast columns
 ```
@@ -113,8 +138,7 @@ Setting `interpretability=True` runs the loaded model on the trailing `seq_len` 
 ```python
 from pathlib import Path
 
-interp_result = perform_forecasting(
-    df=df,
+interp_config = ForecastingConfig(
     seq_len=512,
     forecast_horizon=100,
     interpretability=True,
@@ -125,6 +149,7 @@ interp_result = perform_forecasting(
     softmax_tau=1.0,
     integrated_gradients=True,
 )
+interp_result = perform_forecasting(df=df, config=interp_config)
 ```
 
 `interpretability_output` selects which artifacts are written:
@@ -143,57 +168,10 @@ If the input DataFrame has more than one numeric column, the feature-axis decomp
 
 ```python
 perform_forecasting(
-    # Input data
     df: pd.DataFrame,
-    timestamp_column: str = "timestamp",
-    target_column: str = "target",
-    context_df: Optional[pd.DataFrame] = None,
-    
-    # Model configuration
-    standardizer_pkl: str = "standardizer.pkl",
-    ckpt: str = "moment_head_512_6hr.pt",
-    seq_len: int = 512,
-    forecast_horizon: int = 72,
-    model_horizon: int = 72,
-    
-    # Output configuration
-    save_preds: Optional[str] = None,
-    
-    # DARR mode configuration
-    alpha: float = 0.01,
-    k: int = 64,
-    temperature: float = 0.05,
-    
-    # Additional parameters
-    model_name: str = "configured pretrained backbone identifier",
-    batch_size: int = 8,
-    num_workers: int = 2,
-    stride: Optional[int] = None,
-    context_stride: Optional[int] = None,
-    seed: int = 13,
-    device: Optional[str] = None,
-    local_files_only: bool = False,
-
-    # Interpretability
-    interpretability: bool = False,
-    interpretability_output: Optional[str] = None,            # "json" | "pdf" | None
-    interpretability_out_dir: Union[str, Path] = "interpretability_output",
-    interpretability_run_name: Optional[str] = None,
-    interpretability_top_k: int = 5,
-    interpretability_dataset_name: Optional[str] = None,
-    n_lags: int = 128,
-    softmax_tau: float = 1.0,
-    channel_output_aware: bool = False,
-    integrated_gradients: bool = False,
-    integrated_gradients_baseline: Any = "noise",
-    integrated_gradients_steps: int = 64,
-    integrated_gradients_n_baselines: int = 1,
-    integrated_gradients_internal_batch_size: Optional[int] = None,
-    integrated_gradients_reduce: str = "l2",
-    integrated_gradients_grad_through_norm: bool = True,
-
-    # Multichannel output
-    return_all_channels: bool = False,
+    *,
+    config: ForecastingConfig | str | Path | None = None,
+    context_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame
 ```
 
@@ -202,18 +180,14 @@ perform_forecasting(
 | Parameter | Description |
 |-----------|-------------|
 | `df` | Input DataFrame containing time series data |
-| `timestamp_column` / `target_column` | Alias your columns when they differ from the defaults |
-| `standardizer_pkl`, `ckpt` | Paths to the training artifacts |
-| `seq_len` | Number of rows consumed for a single inference window (must exist in the provided `df`) |
-| `forecast_horizon` | How many future steps to return (max: 512). If this exceeds `model_horizon`, the SDK repeats predictions autoregressively |
-| `model_horizon` | Native horizon the model was trained on (default: 72). Override if using different weights |
+| `config` | `ForecastingConfig`, YAML path, or `None` for defaults. The YAML can be flat or use a top-level `inference` section |
 | `context_df` | Enables DARR mode when supplied |
-| `alpha` | Blending factor for DARR hybrid output (`alpha * direct + (1 - alpha) * kNN`) |
-| `k` / `temperature` | Configure kNN retrieval (number of neighbors and softmax temperature) |
-| `stride` / `context_stride` | Stride for windowing; defaults to `model_horizon` |
-| `save_preds` | Optional CSV export location |
-| `device` | Override device selection (defaults to auto-detected CUDA/MPS/CPU) |
-| `local_files_only` | Load model from local cache without network access |
+
+All model, data-column, DARR, output, and interpretability settings are fields
+on `ForecastingConfig` and are documented in the commented YAML template.
+
+| Parameter | Description |
+|-----------|-------------|
 | `interpretability` | Master switch. When `True`, the SDK skips the standard / DARR inference path and runs the interpretability explanation pipeline against the loaded model |
 | `interpretability_output` | `"json"` for explanation JSON only, `"pdf"` for the heatmap + PDF bundle, `None` for both. Invalid values raise `ValueError` |
 | `interpretability_out_dir` | Parent directory for the run subfolder; created if missing |
@@ -314,7 +288,7 @@ Warning: Column mismatch detected between input and context datasets
 | `ValueError: DataFrame has X rows but seq_len requires at least Y rows` | Insufficient data points | Provide more data or reduce `seq_len` |
 | `ValueError: Context DataFrame has X rows but requires at least Y rows` | Context dataset too small | Context needs `seq_len + max(model_horizon, forecast_horizon)` rows minimum |
 | `ValueError: forecast_horizon must be <= 512` | Forecast horizon too large | Reduce `forecast_horizon` or make multiple calls |
-| `ValueError: Target column 'X' not found in DataFrame` | Missing target column | Verify column name or use `target_column` parameter |
+| `ValueError: Target column 'X' not found in DataFrame` | Missing target column | Verify column name or set `target_column` on `ForecastingConfig` |
 | `ValueError: interpretability_output must be one of None, 'json', 'pdf'` | Bad value for the artifact selector | Use `None`, `"json"`, or `"pdf"` |
 | `Interpretability PDF report skipped: matplotlib is not installed.` | PDF/heatmap path attempted without matplotlib | `uv add matplotlib`, or set `interpretability_output="json"` |
 

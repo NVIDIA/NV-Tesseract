@@ -53,6 +53,16 @@ results = perform_anomaly_analysis_with_diffusion(
 print(f"Detected {results['Anomaly'].sum()} anomalies")
 ```
 
+
+The returned DataFrame preserves the input columns and adds `Anomaly`
+(`int64`: `0` = normal, `1` = anomaly) and `MAE` (floating-point anomaly score).
+JSON output uses numeric `0`/`1`. For boolean masking, use
+`results["Anomaly"].eq(1)`; use `.eq(0)` to select normal rows.
+
+Right-padded model dimensions are excluded from MAE, L2, and thresholding because
+they do not represent caller-provided sensors. Low-level inference results expose
+`valid_feature_mask` and `score_feature_count`; `target` and `recon` retain the
+full model width for compatibility.
 Generate a PDF report with the original signals, detected anomalies, MAE, and
 ground truth when a conventional label column such as `GT` is present. Report
 settings live on `ADDiffusionConfig`, which can also be loaded from a YAML
@@ -181,6 +191,7 @@ ad_diffusion/
 │   └── utils.py               # Model evaluation utilities
 ├── utils/                      # Utility functions and tools
 │   ├── tsb_ad_preprocessor.py # Data preprocessing
+│   ├── adaptive_normalizer.py # Distribution-aware normalization
 │   ├── json_utils.py          # Model loading/saving
 │   ├── adaptive_threshold.py  # SCS and MACS implementations
 │   └── dpm_solver_pytorch.py  # DPM-Solver for fast inference

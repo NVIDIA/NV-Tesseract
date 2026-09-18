@@ -9,6 +9,7 @@ import sys
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -114,7 +115,8 @@ def perform_anomaly_analysis_with_diffusion(
             See `ADDiffusionConfig` for the field reference.
 
     Returns:
-        DataFrame with original data and anomaly detection results
+        DataFrame with original columns, Anomaly (int64: 0 = normal, 1 = anomaly),
+        and MAE (floating-point anomaly score).
     """
     cfg = _resolve_sdk_config(sdk_config)
 
@@ -203,13 +205,22 @@ def perform_anomaly_analysis_with_diffusion(
     if len(target_data) != original_length:
         target_data = target_data[:original_length]
 
+    valid_feature_mask = results.get("valid_feature_mask")
+    if valid_feature_mask is None:
+        threshold_target_data = target_data
+    else:
+        valid_feature_mask = np.asarray(valid_feature_mask, dtype=bool).reshape(-1)
+        if target_data.ndim != 2 or len(valid_feature_mask) != target_data.shape[1]:
+            raise ValueError("valid_feature_mask must match the model target feature dimension.")
+        threshold_target_data = target_data[:, valid_feature_mask]
+
     # Apply thresholding strategy
     if threshold_strategy == "scs":
         # Use actual target data from the model results
-        anomalies = SCSThresholdStrategy().scs_thresholder.detect_anomalies(residual_scores, target_data)
+        anomalies = SCSThresholdStrategy().scs_thresholder.detect_anomalies(residual_scores, threshold_target_data)
     elif threshold_strategy == "macs":
         # Use actual target data from the model results
-        anomalies = MACSThresholdStrategy().macs_thresholder.detect_anomalies(residual_scores, target_data)
+        anomalies = MACSThresholdStrategy().macs_thresholder.detect_anomalies(residual_scores, threshold_target_data)
     else:
         raise ValueError(f"Unknown threshold strategy: {threshold_strategy}")
 

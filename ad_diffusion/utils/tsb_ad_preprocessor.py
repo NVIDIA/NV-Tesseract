@@ -21,12 +21,10 @@ from sklearn.decomposition import PCA
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import utilities from utils directory
+from utils.adaptive_normalizer import AdaptiveNormalizer
 from utils.json_utils import load_preprocessing_models
 
 logger = logging.getLogger(__name__)
-
-ORIGINAL_NORMALIZER_AVAILABLE = True
 
 # Constants from original merger
 TARGET_FEATURES = 38
@@ -48,23 +46,9 @@ SENSOR_DOMAINS = ["Sensor", "Medical", "Facility"]
 BOUNDED_DOMAINS = ["Synthetic", "HumanActivity", "Environment"]
 
 
-class AdaptiveNormalizerCompat:
-    """Compatibility class for deserialized AdaptiveNormalizer objects"""
-
-    def __init__(self):
-        self.target_range = 100
-        self.method = None
-        self.params = {}
-
-    def transform(self, data):
-        """Use SimpleAdaptiveNormalizer for transform"""
-        normalizer = SimpleAdaptiveNormalizer({"method": self.method, "target_range": self.target_range, **self.params})
-        return normalizer.transform(data)
-
-
 def _load_normalizers(filepath):
-    """Load normalizers from JSON file using the inference-only compat class."""
-    return load_preprocessing_models(filepath, normalizer_class=AdaptiveNormalizerCompat)
+    """Load normalizers from a JSON preprocessing artifact."""
+    return load_preprocessing_models(filepath, normalizer_class=AdaptiveNormalizer)
 
 
 def detect_domain(data):

@@ -28,7 +28,7 @@ The model weights are published on Hugging Face (`nvidia/nv-tesseract-forecastin
 
 ```python
 import pandas as pd
-from sdk.forecasting import perform_forecasting, DEVICE
+from sdk.forecasting import ForecastingConfig, perform_forecasting, DEVICE
 
 # Check device being used
 print(f"Using device: {DEVICE}")
@@ -37,15 +37,27 @@ print(f"Using device: {DEVICE}")
 df = pd.read_csv("your_data.csv")  # Must have 'timestamp' and 'target' columns
 
 # Perform forecasting - weights auto-downloaded if needed
-results = perform_forecasting(
-    df=df,
+config = ForecastingConfig(
     timestamp_column="timestamp",
     target_column="target",
     forecast_horizon=72,  # Forecast 72 steps ahead
 )
+results = perform_forecasting(df=df, config=config)
 
 print(results)
 ```
+
+Forecasting options can also be moved into a YAML file and passed as the typed
+configuration source — a fully commented template is packaged at
+`sdk/forecasting_inference_config.yaml`:
+
+```python
+results = perform_forecasting(df=df, config="sdk/forecasting_inference_config.yaml")
+```
+
+The YAML may be flat or use a top-level `inference:` section. Unknown keys
+raise `ValueError`, so misspelled config values do not silently fall back to
+defaults.
 
 Or run the example:
 
@@ -95,8 +107,7 @@ The output directory contains:
 Use the fine-tuned artifacts with the SDK:
 
 ```python
-results = perform_forecasting(
-    df=df,
+config = ForecastingConfig(
     timestamp_column="timestamp",
     target_column="target",
     seq_len=512,
@@ -104,8 +115,9 @@ results = perform_forecasting(
     model_horizon=72,
     standardizer_pkl="artifacts/finetune_my_data/standardizer.pkl",
     ckpt="artifacts/finetune_my_data/best_model.pt",
-    use_cross_channel=False,  # set True if trained with --use-cross-channel
+    # use_cross_channel is inferred automatically from the checkpoint contents
 )
+results = perform_forecasting(df=df, config=config)
 ```
 
 ## UV Commands Reference
@@ -217,13 +229,13 @@ The estimator batches channel probes and transitions on the selected device. See
 
 ### What the SDK gives you
 
-When you call `perform_forecasting(..., interpretability=True)` the SDK runs the same loaded model on the trailing window and writes a self-contained explanation bundle: the K×H matrix as wide and long CSVs, a heatmap PNG, a per-transition `semantic_flow.csv` with a `history`/`forecast` segment label, a full `explanation.json` (baseline forecast, lag×horizon scores and attributions, latent trajectory, semantic-flow magnitudes, diagnostic ratios that flag whether the forecast segment is volatile relative to history, and trajectory-stability metrics), and a multi-page PDF report. Multivariate inputs also receive channel-by-horizon feature attribution. Optional embedding Integrated Gradients can be enabled with `integrated_gradients=True`. See the **Interpretability (Lag x Horizon Explanations)** example below for the call shape and `sdk/README.md` for the full parameter reference and on-disk artifact catalogue.
+When you call `perform_forecasting(df, config=ForecastingConfig(interpretability=True))` the SDK runs the same loaded model on the trailing window and writes a self-contained explanation bundle: the K×H matrix as wide and long CSVs, a heatmap PNG, a per-transition `semantic_flow.csv` with a `history`/`forecast` segment label, a full `explanation.json` (baseline forecast, lag×horizon scores and attributions, latent trajectory, semantic-flow magnitudes, diagnostic ratios that flag whether the forecast segment is volatile relative to history, and trajectory-stability metrics), and a multi-page PDF report. Multivariate inputs also receive channel-by-horizon feature attribution. Optional embedding Integrated Gradients can be enabled with `integrated_gradients=True`. See the **Interpretability (Lag x Horizon Explanations)** example below for the call shape and `sdk/README.md` for the full parameter reference and on-disk artifact catalogue.
 
 ## Usage Examples
 
 ### Basic Forecasting
 ```python
-from sdk.forecasting import perform_forecasting, DEVICE
+from sdk.forecasting import ForecastingConfig, perform_forecasting, DEVICE
 import pandas as pd
 import numpy as np
 
@@ -234,42 +246,44 @@ df = pd.DataFrame({
 })
 
 # Perform forecasting - model weights auto-downloaded on first run
-results = perform_forecasting(
-    df=df, 
+config = ForecastingConfig(
     forecast_horizon=24,
     timestamp_column="timestamp",
-    target_column="target"
+    target_column="target",
 )
+results = perform_forecasting(df=df, config=config)
 ```
 
 ### Context-Enhanced Forecasting (DARR Mode)
 ```python
-from sdk.forecasting import perform_forecasting
+from sdk.forecasting import ForecastingConfig, perform_forecasting
 
 # With additional context data for improved accuracy
 context_df = pd.read_csv("historical_data.csv")
 
-results = perform_forecasting(
-    df=df,
-    context_df=context_df,  # Additional context for better predictions
+darr_config = ForecastingConfig(
     forecast_horizon=72,
     alpha=0.01,  # Blending parameter for DARR mode
     timestamp_column="timestamp",
-    target_column="target"
+    target_column="target",
+)
+results = perform_forecasting(
+    df=df,
+    config=darr_config,
+    context_df=context_df,  # Additional context for better predictions
 )
 ```
 
 ### Interpretability (Lag x Horizon Explanations)
 ```python
-from sdk.forecasting import perform_forecasting
+from sdk.forecasting import ForecastingConfig, perform_forecasting
 
 # Set interpretability=True to also produce an explanation bundle on disk.
 # `interpretability_output` selects what to materialize:
 #   - "json" -> forecast.csv + explanation.json
 #   - "pdf"  -> forecast.csv + lag_horizon_*.csv/png + explanation_report.pdf
 #   - None   -> both bundles
-results = perform_forecasting(
-    df=df,
+interp_config = ForecastingConfig(
     forecast_horizon=72,
     timestamp_column="timestamp",
     target_column="target",
@@ -280,20 +294,21 @@ results = perform_forecasting(
     n_lags=128,
     softmax_tau=1.0,
 )
+results = perform_forecasting(df=df, config=interp_config)
 # Bundle is written under <interpretability_out_dir>/run_<UTC-timestamp>/
 ```
 
 ### Manual Weight Paths (Optional)
 ```python
-from sdk.forecasting import perform_forecasting
+from sdk.forecasting import ForecastingConfig, perform_forecasting
 
 # If you want to specify custom paths for model weights
-results = perform_forecasting(
-    df=df,
+config = ForecastingConfig(
     forecast_horizon=72,
     standardizer_pkl="custom/path/standardizer.pkl",  # Default: "standardizer.pkl"
-    ckpt="custom/path/model_checkpoint.pt"            # Default: packaged forecast checkpoint path
+    ckpt="custom/path/model_checkpoint.pt",            # Default: packaged forecast checkpoint path
 )
+results = perform_forecasting(df=df, config=config)
 ```
 
 ## Development

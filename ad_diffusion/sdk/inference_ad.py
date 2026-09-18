@@ -32,6 +32,8 @@ model_path, config_path = download_model_weights(
 # "target": target_flat, # The target/original data after preprocessing
 # "recon": recon_flat, # The reconstructed data after imputation
 # "target_dim": target_dim, # The target dimension used by the model
+# "valid_feature_mask": valid_feature_mask, # Model dimensions included in scores
+# "score_feature_count": score_feature_count, # Number of dimensions included in scores
 
 # For reproducible results, call set_seed() before inference:
 from sdk.inference_ad import set_seed
@@ -212,6 +214,34 @@ def match_target_dim(data, target_dim, random_state=DEFAULT_SEED):
     return pca_features(data, target_dim, random_state=random_state)
 
 
+def _build_score_feature_mask(feature_count: int, target_dim: int, *, transformed: bool = False) -> np.ndarray:
+    """Identify model dimensions backed by real or transformed input features.
+
+    Raw inputs narrower than ``target_dim`` are right-padded by this module, so
+    only their leading ``feature_count`` dimensions should contribute to
+    reconstruction scores. External preprocessing produces a transformed model
+    feature space whose components cannot be classified as padding here.
+    """
+    if feature_count < 1:
+        raise ValueError("Anomaly detection requires at least one numeric feature.")
+    valid_count = target_dim if transformed or feature_count >= target_dim else feature_count
+    return np.arange(target_dim) < valid_count
+
+
+def _score_feature_mask_for_dataframe(
+    data: pd.DataFrame,
+    target_dim: int,
+    *,
+    model_dir: str | None,
+) -> np.ndarray:
+    numeric_feature_count = data.select_dtypes(exclude=["object"]).shape[1]
+    return _build_score_feature_mask(
+        numeric_feature_count,
+        target_dim,
+        transformed=model_dir is not None,
+    )
+
+
 class InferenceData(Dataset):
     """
     Dataset class for inferencing on time series data with consistent masking strategies.
@@ -274,6 +304,11 @@ class InferenceData(Dataset):
         df = df.select_dtypes(exclude=["object"])
         # Use all numeric columns as features
         self.data = df.values
+        self.valid_feature_mask = _build_score_feature_mask(
+            self.data.shape[1],
+            target_dim,
+            transformed=model_dir is not None,
+        )
 
         # Apply TSB-AD preprocessing
         if requires_preprocessing:
@@ -659,7 +694,11 @@ def _cleanup_shared_memory(shm_info: dict) -> None:
         pass
 
 
-def _merge_chunked_results(results_per_chunk: list[dict | None], target_dim: int) -> dict:
+def _merge_chunked_results(
+    results_per_chunk: list[dict | None],
+    target_dim: int,
+    valid_feature_mask: np.ndarray,
+) -> dict:
     all_residuals = []
     all_residuals_l2 = []
     all_targets = []
@@ -679,6 +718,8 @@ def _merge_chunked_results(results_per_chunk: list[dict | None], target_dim: int
         "target": np.concatenate(all_targets),
         "recon": np.concatenate(all_recons),
         "target_dim": target_dim,
+        "valid_feature_mask": valid_feature_mask,
+        "score_feature_count": int(valid_feature_mask.sum()),
     }
 
 
@@ -730,13 +771,39 @@ def evaluate_ad_raw_samples(model, test_loader1, test_loader2, nsample=30, use_d
     }
 
 
-def combine_samples_and_compute_residuals(samples_list: list, target) -> dict:
+def _resolve_score_feature_mask(valid_feature_mask, feature_count: int) -> np.ndarray:
+    if valid_feature_mask is None:
+        return np.ones(feature_count, dtype=bool)
+    mask = np.asarray(valid_feature_mask, dtype=bool).reshape(-1)
+    if len(mask) != feature_count:
+        raise ValueError(
+            f"valid_feature_mask has {len(mask)} entries, but reconstruction has {feature_count} features."
+        )
+    if not mask.any():
+        raise ValueError("valid_feature_mask must select at least one feature.")
+    return mask
+
+
+def _compute_reconstruction_residuals(
+    recon, target, valid_feature_mask=None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute MAE/L2 over model dimensions backed by real input features."""
+    mask = _resolve_score_feature_mask(valid_feature_mask, recon.shape[1])
+    error = recon[:, mask] - target[:, mask]
+    residual_l2 = np.linalg.norm(error, axis=1)
+    residual_mae = np.mean(np.abs(error), axis=1)
+    return residual_mae, residual_l2, mask
+
+
+def combine_samples_and_compute_residuals(samples_list: list, target, valid_feature_mask=None) -> dict:
     """
     Combine samples from multiple GPUs and compute residuals.
 
     Args:
         samples_list: List of sample tensors from different GPUs, each (batch, partial_nsample, window, dim)
         target: Target tensor (batch, window, dim)
+        valid_feature_mask: Optional boolean mask selecting dimensions that
+            represent real input features.
 
     Returns:
         dict with residual, residual_l2, target, recon keys
@@ -764,8 +831,11 @@ def combine_samples_and_compute_residuals(samples_list: list, target) -> dict:
     recon_clipped = np.nan_to_num(recon_clipped, nan=0.0, posinf=MAX_VALUE, neginf=-MAX_VALUE)
     target_clipped = np.nan_to_num(target_clipped, nan=0.0, posinf=MAX_VALUE, neginf=-MAX_VALUE)
 
-    residual_l2 = np.linalg.norm(recon_clipped - target_clipped, axis=1)
-    residual_mae = np.mean(np.abs(recon_clipped - target_clipped), axis=1)
+    residual_mae, residual_l2, valid_feature_mask = _compute_reconstruction_residuals(
+        recon_clipped,
+        target_clipped,
+        valid_feature_mask,
+    )
     residual_l2 = np.clip(residual_l2, 0, MAX_VALUE)
     residual_mae = np.clip(residual_mae, 0, MAX_VALUE)
 
@@ -774,10 +844,20 @@ def combine_samples_and_compute_residuals(samples_list: list, target) -> dict:
         "residual_l2": residual_l2,
         "target": target_flat,
         "recon": recon_flat,
+        "valid_feature_mask": valid_feature_mask,
+        "score_feature_count": int(valid_feature_mask.sum()),
     }
 
 
-def evaluate_ad_tesseract2(model, test_loader1, test_loader2, nsample=30, use_dpm_solver=False, dpm_steps=20):
+def evaluate_ad_tesseract2(
+    model,
+    test_loader1,
+    test_loader2,
+    nsample=30,
+    use_dpm_solver=False,
+    dpm_steps=20,
+    valid_feature_mask=None,
+):
     """
     Evaluate the model on the test data with optional DPM-Solver support.
 
@@ -788,6 +868,9 @@ def evaluate_ad_tesseract2(model, test_loader1, test_loader2, nsample=30, use_dp
         nsample: Number of samples to generate
         use_dpm_solver: If True, use DPM-Solver for 50-100x faster inference
         dpm_steps: Number of DPM-Solver steps (10-50, default: 20)
+        valid_feature_mask: Boolean model-dimension mask. When omitted, the
+            mask recorded by ``InferenceData`` is used, or all dimensions if
+            the loader has no mask metadata.
 
     If TESSERACT_PROFILE_RESIDUALS=1 environment variable is set, logs detailed
     timing information for each step of residual calculation.
@@ -848,8 +931,13 @@ def evaluate_ad_tesseract2(model, test_loader1, test_loader2, nsample=30, use_dp
 
     # Step 7: Compute residuals
     t0 = time.perf_counter()
-    residual_l2 = np.linalg.norm(recon_clipped - target_clipped, axis=1)
-    residual_mae = np.mean(np.abs(recon_clipped - target_clipped), axis=1)
+    if valid_feature_mask is None:
+        valid_feature_mask = getattr(getattr(test_loader1, "dataset", None), "valid_feature_mask", None)
+    residual_mae, residual_l2, valid_feature_mask = _compute_reconstruction_residuals(
+        recon_clipped,
+        target_clipped,
+        valid_feature_mask,
+    )
 
     # Additional clipping for residuals
     residual_l2 = np.clip(residual_l2, 0, MAX_VALUE)
@@ -875,6 +963,8 @@ def evaluate_ad_tesseract2(model, test_loader1, test_loader2, nsample=30, use_dp
         "residual_l2": residual_l2,  # The L2 norm of the difference between the reconstructed and target data
         "target": target_flat,  # The target/original data after preprocessing
         "recon": recon_flat,  # The reconstructed data after imputation
+        "valid_feature_mask": valid_feature_mask,
+        "score_feature_count": int(valid_feature_mask.sum()),
     }
 
     return return_results
@@ -946,7 +1036,20 @@ def download_model_weights(
                     token=token,
                     library_name="nv-tesseract",
                 )
-                logger.info("Downloaded: %s", file_path.name)
+                # snapshot_download() can return normally even when the file wasn't
+                # actually fetched (e.g. a 429 during the HEAD/metadata call causes
+                # huggingface_hub to silently fall back to a stale/incomplete local
+                # file instead of raising). Verify the artifact actually landed
+                # before reporting success.
+                if not file_path.exists() or file_path.stat().st_size == 0:
+                    raise RuntimeError(
+                        f"snapshot_download() returned without error but {file_path.name} is "
+                        f"missing or empty at {file_path}. This can happen when Hugging Face "
+                        "rate-limits the request (HTTP 429); retry with force_download=True, "
+                        "set HUGGINGFACE_HUB_TOKEN to use an authenticated (higher-limit) "
+                        "request, or avoid issuing concurrent downloads (e.g. one per DDP rank)."
+                    )
+                logger.info("Downloaded: %s (%d bytes)", file_path.name, file_path.stat().st_size)
 
     except Exception as e:
         error_msg = f"Failed to download model weights from {repo_id}: {e}"
@@ -1062,6 +1165,8 @@ def inference_ad_tesseract2(
             - target: Original data after preprocessing
             - recon: Reconstructed data after imputation
             - target_dim: Target dimension used by the model
+            - valid_feature_mask: Model dimensions included in residual scores
+            - score_feature_count: Number of dimensions included in scores
 
     Note:
         For reproducible results, call set_seed() before this function.
@@ -1150,7 +1255,8 @@ def inference_ad_tesseract2_mp(
         dpm_steps: Number of DPM-Solver steps (10-50, default: 20)
 
     Returns:
-        dict with residual, residual_l2, target, recon, target_dim keys.
+        dict with residual, residual_l2, target, recon, target_dim,
+        valid_feature_mask, and score_feature_count keys.
 
     Note:
         Combining multiprocessing with DPM-Solver provides massive speedup!
@@ -1215,6 +1321,11 @@ def inference_ad_tesseract2_mp(
         scale_factor=scale_factor,
         model_dir=preprocess_model_dir,
     )
+    valid_feature_mask = _score_feature_mask_for_dataframe(
+        data,
+        target_dim,
+        model_dir=preprocess_model_dir,
+    )
     num_rows = len(preprocessed)
     begin_indexes = _build_window_indexes(num_rows, window_length, window_split)
     window_tensor = _build_window_tensor(preprocessed.cpu().numpy(), begin_indexes, window_length)
@@ -1258,6 +1369,7 @@ def inference_ad_tesseract2_mp(
                     "preprocess_model_dir": preprocess_model_dir,
                     "use_dpm_solver": use_dpm_solver,
                     "dpm_steps": dpm_steps,
+                    "valid_feature_mask": valid_feature_mask.tolist(),
                 }
                 with open(args_file, "w") as f:
                     json.dump(args, f)
@@ -1289,7 +1401,7 @@ def inference_ad_tesseract2_mp(
                     k: np.array(v) if isinstance(v, list) else v for k, v in data["results"].items()
                 }
 
-        return _merge_chunked_results(results_per_chunk, target_dim)
+        return _merge_chunked_results(results_per_chunk, target_dim, valid_feature_mask)
     finally:
         _cleanup_shared_memory(shm_info)
 

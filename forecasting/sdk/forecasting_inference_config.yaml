@@ -1,0 +1,81 @@
+# Forecasting inference settings for sdk.forecasting.perform_forecasting.
+# Copy this file and pass it with config="path/to/your_config.yaml".
+inference:
+  # Name of the datetime column in the input and optional context DataFrames.
+  timestamp_column: timestamp
+  # Name of the primary numeric column to forecast.
+  target_column: target
+  # Path to the standardizer pickle; auto-downloaded when the default file is missing.
+  standardizer_pkl: standardizer.pkl
+  # Path to the forecasting checkpoint; defaults to cross-channel weights when use_cross_channel is true.
+  ckpt: run8_best_model_cr.pt
+  # Number of historical rows consumed for the input context window.
+  seq_len: 512
+  # Number of future rows to predict; values above model_horizon use autoregressive rollout.
+  forecast_horizon: 72
+  # Native forecast horizon used when training the checkpoint; set null to reuse forecast_horizon.
+  model_horizon: 72
+  # Optional CSV path for writing forecast outputs; set null to skip writing predictions.
+  save_preds: null
+  # DARR blend weight: alpha * direct forecast + (1 - alpha) * kNN forecast.
+  alpha: 0.01
+  # Hugging Face backbone identifier used to build the forecasting model.
+  model_name: AutonLab/MOMENT-1-large
+  # Number of windows processed per inference batch.
+  batch_size: 8
+  # DataLoader worker count for local CSV inference.
+  num_workers: 2
+  # Sliding-window stride for the input data; null defaults to model_horizon.
+  stride: null
+  # Sliding-window stride for DARR context memory; null defaults to model_horizon.
+  context_stride: null
+  # Random seed used for reproducible model setup and interpretability sampling.
+  seed: 13
+  # Number of nearest neighbors retrieved in DARR mode.
+  k: 64
+  # Softmax temperature applied to DARR neighbor distances.
+  temperature: 0.05
+  # Device override such as "cuda", "mps", or "cpu"; null uses auto-detection.
+  device: null
+  # When true, only load model assets already present in the local Hugging Face cache.
+  local_files_only: false
+  # Enable cross-channel attention for multivariate forecasting.
+  use_cross_channel: true
+  # Attention head count for the cross-channel layer.
+  cross_channel_heads: 8
+  # Dropout probability for the cross-channel layer.
+  cross_channel_dropout: 0.1
+  # Emit one forecast column per numeric channel instead of only the target forecast.
+  return_all_channels: false
+  # Run the interpretability pipeline instead of the standard/DARR inference path.
+  interpretability: false
+  # Interpretability artifact mode: "json", "pdf", or null for both.
+  interpretability_output: null
+  # Parent directory where interpretability run artifacts are written.
+  interpretability_out_dir: interpretability_output
+  # Optional interpretability run folder name; null creates a UTC-stamped folder.
+  interpretability_run_name: null
+  # Number of top lag contributors to show in the interpretability PDF table.
+  interpretability_top_k: 5
+  # Optional dataset label stored in interpretability JSON/PDF metadata.
+  interpretability_dataset_name: null
+  # Number of historical lag steps resolved by lag-horizon attribution.
+  n_lags: 128
+  # Temperature used when converting interpretability scores into attribution weights.
+  softmax_tau: 1.0
+  # Attribute feature-axis effects on the target forecast instead of latent embeddings.
+  channel_output_aware: false
+  # Add embedding integrated-gradients artifacts to interpretability output.
+  integrated_gradients: false
+  # Integrated-gradients baseline; "noise" enables noise baseline sampling.
+  integrated_gradients_baseline: noise
+  # Number of midpoint integration steps for integrated gradients.
+  integrated_gradients_steps: 64
+  # Number of independent baselines averaged when using the "noise" baseline.
+  integrated_gradients_n_baselines: 1
+  # Optional chunk size for integrated-gradients interpolation points; null processes all.
+  integrated_gradients_internal_batch_size: null
+  # Embedding objective reduction for integrated gradients: "l2", "sum", or "mean".
+  integrated_gradients_reduce: l2
+  # Let integrated-gradient attribution flow through model normalization statistics.
+  integrated_gradients_grad_through_norm: true

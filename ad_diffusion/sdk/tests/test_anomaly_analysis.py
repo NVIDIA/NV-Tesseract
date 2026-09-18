@@ -91,6 +91,49 @@ def test_perform_anomaly_analysis_with_scs_strategy(monkeypatch, numeric_df, inf
     )
 
 
+def test_threshold_excludes_padded_dimensions(monkeypatch):
+    input_df = pd.DataFrame(
+        {
+            "temperature": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "pressure": [2.0, 3.0, 4.0, 5.0, 6.0],
+        }
+    )
+    target = np.zeros((5, 4))
+    reconstruction = np.zeros_like(target)
+    reconstruction[0] = [4.0, 3.0, 20.0, 10.0]
+    padded_results = {
+        "residual": np.array([3.5, 0.0, 0.0, 0.0, 0.0]),
+        "residual_l2": np.array([5.0, 0.0, 0.0, 0.0, 0.0]),
+        "target": target,
+        "recon": reconstruction,
+        "target_dim": 4,
+        "valid_feature_mask": np.array([True, True, False, False]),
+        "score_feature_count": 2,
+    }
+    monkeypatch.setattr(anomaly_analysis, "get_model_target_dim", lambda *_args: 4)
+    monkeypatch.setattr(
+        anomaly_analysis,
+        "inference_ad_tesseract2_mp",
+        Mock(return_value=padded_results),
+    )
+    mock_thresholder = Mock()
+    mock_thresholder.detect_anomalies.return_value = np.array([True, False, False, False, False])
+    mock_strategy = Mock()
+    mock_strategy.scs_thresholder = mock_thresholder
+    monkeypatch.setattr(anomaly_analysis, "SCSThresholdStrategy", Mock(return_value=mock_strategy))
+
+    result = anomaly_analysis.perform_anomaly_analysis_with_diffusion(
+        input_df,
+        threshold_strategy="scs",
+        model_path="model.pth",
+        model_config_path="config.yaml",
+    )
+
+    threshold_target = mock_thresholder.detect_anomalies.call_args.args[1]
+    np.testing.assert_array_equal(threshold_target, target[:, :2])
+    np.testing.assert_array_equal(result["MAE"], padded_results["residual"])
+
+
 def test_perform_anomaly_analysis_rejects_non_numeric_columns(numeric_df):
     mixed_df = numeric_df.copy()
     mixed_df["machine_id"] = ["a", "b", "c", "d", "e"]

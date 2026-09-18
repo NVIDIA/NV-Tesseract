@@ -2535,7 +2535,7 @@ wheels = [
 
 [[package]]
 name = "tesseract-forecasting"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "datasetsforecast" },
@@ -2544,6 +2544,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "pytest-xdist" },
+    { name = "pyyaml" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -2558,11 +2559,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "datasetsforecast", specifier = ">=1.0.0" },
-    { name = "huggingface-hub", specifier = ">=0.17.0" },
+    { name = "huggingface-hub", specifier = ">=0.22.0" },
     { name = "joblib", specifier = ">=1.5.2" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "pandas", specifier = ">=2.1.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0" },
+    { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "torch", specifier = ">=2.7.0" },
     { name = "tqdm", specifier = ">=4.65.0" },
     { name = "transformers", specifier = ">=4.36.0" },
